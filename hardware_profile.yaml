@@ -1,0 +1,13 @@
+avoid:
+- Docker-heavy pipelines
+- local GPU-required models
+- Neo4j
+cpu: Intel i5
+gpu: null
+os: Windows 11
+preferred_stack:
+- Python
+- LangGraph
+- SQLite
+- Groq API
+ram_gb: 8
