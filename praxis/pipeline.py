@@ -49,11 +49,12 @@ def run_pipeline(
     source: str,
     topic: str,
     config: HardwareProfile | None = None,
+    limit: int = 20,
     retries: int = DEFAULT_RETRIES,
 ) -> Any:
     """Run Scout -> Analyst -> Architect -> Coder on a topic."""
     config = config or load_config()
-    candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, config=config)
+    candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
     result = candidates
     for step in (agents.analyze, agents.architect, agents.coder):
         result = run_with_retry(step, retries, result, config)

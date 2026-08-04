@@ -46,3 +46,17 @@ def db_engine(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
     return engine
+
+
+@pytest.fixture
+def db_session(db_engine, monkeypatch):
+    """A session bound to the test engine, injected into scout's get_session."""
+    import importlib
+
+    from sqlalchemy.orm import Session
+
+    scout_module = importlib.import_module("praxis.agents.scout")
+    session = Session(bind=db_engine)
+    monkeypatch.setattr(scout_module, "get_session", lambda: session)
+    yield session
+    session.close()

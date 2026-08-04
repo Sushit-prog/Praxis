@@ -19,9 +19,9 @@ Praxis runs four agents sequentially, with retry/backoff between steps:
    feasibility score, and a prototype path calibrated to your `HardwareProfile`.
 4. **Coder** — drafts a prototype from the blueprint.
 
-> v1 status: agents are stubs (`NotImplementedError`). Only scaffolding,
-> storage, LLM wiring, and the CLI exist right now. Evaluator/Critic agents are
-> explicitly deferred to v2.
+> v1 status: **Scout is implemented** (fetch + dedupe against SQLite). Analyst,
+> Architect, and Coder remain stubs (`NotImplementedError`). Evaluator/Critic
+> agents are explicitly deferred to v2.
 
 ## Install
 

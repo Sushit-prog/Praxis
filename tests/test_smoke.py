@@ -62,10 +62,10 @@ def test_db_models_roundtrip(db_engine):
 
 
 def test_agent_stubs_raise():
-    from praxis.agents import scout
+    from praxis.agents import analyze
 
     with pytest.raises(NotImplementedError):
-        scout(source="arxiv", topic="llm agents")
+        analyze(candidate=None)
 
 
 def test_run_with_retry_recovers(monkeypatch):
