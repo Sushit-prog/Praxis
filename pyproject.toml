@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "praxis"
+version = "0.1.0"
+description = "Multi-agent system that watches arXiv/GitHub/HN and turns techniques into hardware-calibrated engineering blueprints."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "litellm>=1.0",
+    "PyYAML>=6.0",
+    "SQLAlchemy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+praxis = "praxis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["praxis*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
