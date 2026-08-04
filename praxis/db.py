@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Integer,
     String,
     Text,
     create_engine,
@@ -41,6 +42,9 @@ class Candidate(Base):
     raw_text: Mapped[str] = mapped_column(Text, default="")
     discovered_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    technique_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feasibility_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    feasibility_reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     blueprints: Mapped[list[Blueprint]] = relationship(back_populates="candidate")
 

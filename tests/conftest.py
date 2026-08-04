@@ -50,13 +50,18 @@ def db_engine(tmp_path):
 
 @pytest.fixture
 def db_session(db_engine, monkeypatch):
-    """A session bound to the test engine, injected into scout's get_session."""
+    """A persistent test session; agents' get_session() gets fresh sessions on the same engine."""
     import importlib
 
     from sqlalchemy.orm import Session
 
-    scout_module = importlib.import_module("praxis.agents.scout")
     session = Session(bind=db_engine)
-    monkeypatch.setattr(scout_module, "get_session", lambda: session)
+
+    def fresh_session():
+        return Session(bind=db_engine)
+
+    for module_name in ("praxis.agents.scout", "praxis.agents.analyst"):
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, "get_session", fresh_session)
     yield session
     session.close()

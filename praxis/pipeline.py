@@ -19,15 +19,15 @@ BACKOFF_BASE_S = 1.0
 def run_with_retry(
     fn: Callable[..., Any],
     retries: int = DEFAULT_RETRIES,
+    *,
     base_backoff: float = BACKOFF_BASE_S,
-    *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Call fn, retrying on transient errors with exponential backoff."""
+    """Call fn(*args, **kwargs), retrying on transient errors with backoff."""
     last_error: Exception | None = None
     for attempt in range(retries):
         try:
-            return fn(*args, **kwargs)
+            return fn(**kwargs)
         except NotImplementedError:
             raise
         except Exception as exc:  # noqa: BLE001 - retry on any transient failure
@@ -55,7 +55,14 @@ def run_pipeline(
     """Run Scout -> Analyst -> Architect -> Coder on a topic."""
     config = config or load_config()
     candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
-    result = candidates
-    for step in (agents.analyze, agents.architect, agents.coder):
-        result = run_with_retry(step, retries, result, config)
+
+    accepted = []
+    for candidate in candidates:
+        result = run_with_retry(agents.analyze, retries, candidate=candidate, profile=config)
+        if not result.rejected:
+            accepted.append(candidate)
+
+    result = accepted
+    for step in (agents.architect, agents.coder):
+        result = run_with_retry(step, retries, blueprint=result, config=config)
     return result
