@@ -60,9 +60,17 @@ def run_pipeline(
     for candidate in candidates:
         result = run_with_retry(agents.analyze, retries, candidate=candidate, profile=config)
         if not result.rejected:
-            accepted.append(candidate)
+            accepted.append((candidate, result))
 
-    result = accepted
-    for step in (agents.architect, agents.coder):
-        result = run_with_retry(step, retries, blueprint=result, config=config)
-    return result
+    blueprints = []
+    for candidate, analysis in accepted:
+        md = run_with_retry(
+            agents.architect,
+            retries,
+            candidate=candidate,
+            analysis=analysis,
+            profile=config,
+        )
+        blueprints.append(md)
+
+    return run_with_retry(agents.coder, retries, blueprint=blueprints, config=config)

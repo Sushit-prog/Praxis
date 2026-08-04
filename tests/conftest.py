@@ -60,7 +60,11 @@ def db_session(db_engine, monkeypatch):
     def fresh_session():
         return Session(bind=db_engine)
 
-    for module_name in ("praxis.agents.scout", "praxis.agents.analyst"):
+    for module_name in (
+        "praxis.agents.scout",
+        "praxis.agents.analyst",
+        "praxis.agents.architect",
+    ):
         module = importlib.import_module(module_name)
         monkeypatch.setattr(module, "get_session", fresh_session)
     yield session

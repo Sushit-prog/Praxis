@@ -19,9 +19,10 @@ Praxis runs four agents sequentially, with retry/backoff between steps:
    feasibility score, and a prototype path calibrated to your `HardwareProfile`.
 4. **Coder** — drafts a prototype from the blueprint.
 
-> v1 status: **Scout** (fetch + dedupe) and **Analyst** (LLM technique
-> extraction + feasibility scoring) are implemented. Architect and Coder remain
-> stubs (`NotImplementedError`). Evaluator/Critic agents are explicitly deferred
+> v1 status: **Scout** (fetch + dedupe), **Analyst** (LLM technique
+> extraction + feasibility scoring), and **Architect** (hardware-calibrated
+> `Blueprint` generation) are implemented. Coder remains a stub
+> (`NotImplementedError`). Evaluator/Critic agents are explicitly deferred
 > to v2.
 
 ## Install
