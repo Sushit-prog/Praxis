@@ -70,8 +70,8 @@ def draft_blueprint(
     candidate: Candidate,
     analysis: AnalysisResult,
     profile: HardwareProfile,
-) -> str:
-    """Draft a hardware-calibrated blueprint and persist it."""
+) -> Blueprint:
+    """Draft a hardware-calibrated blueprint, persist it, and return the row."""
     md = call_llm(_build_prompt(candidate, analysis, profile), system=_system_prompt())
     if not (md or "").strip():
         logger.warning(
@@ -79,6 +79,7 @@ def draft_blueprint(
             candidate.url,
         )
 
+    blueprint: Blueprint | None = None
     session = get_session()
     try:
         stored = session.get(Candidate, candidate.id) if candidate.id is not None else None
@@ -87,18 +88,17 @@ def draft_blueprint(
             session.add(stored)
         stored.status = "blueprinted"
         session.flush()
-        session.add(
-            Blueprint(
-                candidate_id=stored.id,
-                feasibility_score=float(analysis.feasibility_score),
-                blueprint_md=md,
-            )
+        blueprint = Blueprint(
+            candidate_id=stored.id,
+            feasibility_score=float(analysis.feasibility_score),
+            blueprint_md=md,
         )
+        session.add(blueprint)
         session.commit()
     finally:
         session.close()
 
-    return md
+    return blueprint
 
 
 architect = draft_blueprint

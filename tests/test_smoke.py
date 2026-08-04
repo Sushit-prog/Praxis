@@ -61,13 +61,6 @@ def test_db_models_roundtrip(db_engine):
         assert cand.blueprints[0].feasibility_score == 0.9
 
 
-def test_agent_stubs_raise():
-    from praxis.agents import coder
-
-    with pytest.raises(NotImplementedError):
-        coder(blueprint=None)
-
-
 def test_run_with_retry_recovers(monkeypatch):
     from praxis.pipeline import run_with_retry
 

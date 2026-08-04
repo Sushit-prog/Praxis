@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from praxis import agents
@@ -51,6 +52,8 @@ def run_pipeline(
     config: HardwareProfile | None = None,
     limit: int = 20,
     retries: int = DEFAULT_RETRIES,
+    scratch_root: Path | None = None,
+    timeout: float | None = None,
 ) -> Any:
     """Run Scout -> Analyst -> Architect -> Coder on a topic."""
     config = config or load_config()
@@ -64,13 +67,23 @@ def run_pipeline(
 
     blueprints = []
     for candidate, analysis in accepted:
-        md = run_with_retry(
+        bp = run_with_retry(
             agents.architect,
             retries,
             candidate=candidate,
             analysis=analysis,
             profile=config,
         )
-        blueprints.append(md)
+        blueprints.append(bp)
 
-    return run_with_retry(agents.coder, retries, blueprint=blueprints, config=config)
+    prototypes = []
+    for bp in blueprints:
+        path = run_with_retry(
+            agents.coder,
+            retries,
+            blueprint=bp,
+            scratch_root=scratch_root,
+            timeout=timeout,
+        )
+        prototypes.append(path)
+    return prototypes

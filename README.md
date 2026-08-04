@@ -17,13 +17,14 @@ Praxis runs four agents sequentially, with retry/backoff between steps:
    and judges novelty and feasibility.
 3. **Architect** — turns the analysis into a `Blueprint`: modules, milestones,
    feasibility score, and a prototype path calibrated to your `HardwareProfile`.
-4. **Coder** — drafts a prototype from the blueprint.
+4. **Coder** — drafts a prototype from the blueprint's first phase by running
+   the OpenCode CLI (`opencode run`) in a fresh scratch directory and stores
+   the result path on the `Blueprint`.
 
-> v1 status: **Scout** (fetch + dedupe), **Analyst** (LLM technique
-> extraction + feasibility scoring), and **Architect** (hardware-calibrated
-> `Blueprint` generation) are implemented. Coder remains a stub
-> (`NotImplementedError`). Evaluator/Critic agents are explicitly deferred
-> to v2.
+> v1 status: all four agents are implemented — **Scout** (fetch + dedupe),
+> **Analyst** (LLM technique extraction + feasibility scoring), **Architect**
+> (hardware-calibrated `Blueprint` generation), and **Coder** (OpenCode CLI
+> prototype drafting). Evaluator/Critic agents are explicitly deferred to v2.
 
 ## Install
 
@@ -45,6 +46,8 @@ a `.env` file or your shell. See `.env.example`:
 | `PRAXIS_DB_URL` | Full SQLAlchemy URL (overrides path) | — |
 | `PRAXIS_CONFIG` | Hardware profile YAML | `./hardware_profile.yaml` |
 | `PRAXIS_CPU_ONLY` / `PRAXIS_RAM_GB` / `PRAXIS_GPU` / `PRAXIS_MONTHLY_BUDGET_USD` | Hardware overrides | `true` / `8` / `false` / `15` |
+| `PRAXIS_SCRATCH_ROOT` | Where the Coder creates prototype directories | `./scratch` |
+| `PRAXIS_CODER_TIMEOUT_S` | OpenCode subprocess timeout | `600` |
 
 The hardware profile (YAML or env) drives the Architect so blueprints match
 your machine: `cpu_only`, `ram_gb`, `gpu`, `monthly_budget_usd`.
@@ -55,6 +58,10 @@ your machine: `cpu_only`, `ram_gb`, `gpu`, `monthly_budget_usd`.
 praxis --help
 praxis run --source arxiv --topic "..."      # 4-agent pipeline
 ```
+
+The Coder stage shells out to the OpenCode CLI, so `opencode` must be on your
+PATH and authenticated (`opencode auth login`). The exact invocation lives in
+`praxis/agents/coder.py:_invoke_opencode`.
 
 ## Tests & lint
 

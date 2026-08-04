@@ -73,7 +73,7 @@ def test_run_pipeline_passes_analysis_to_architect(monkeypatch, hardware_profile
     assert seen["analysis"] is analysis
 
 
-def test_run_pipeline_all_rejected_gives_empty_blueprints(monkeypatch, hardware_profile):
+def test_run_pipeline_all_rejected_skips_coder(monkeypatch, hardware_profile):
     cand = _FakeCandidate("https://a-no")
 
     def fake_scout(**kwargs):
@@ -95,4 +95,4 @@ def test_run_pipeline_all_rejected_gives_empty_blueprints(monkeypatch, hardware_
     out = run_pipeline("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
 
     assert out == []
-    assert coder_calls["blueprint"] == []
+    assert coder_calls == {}

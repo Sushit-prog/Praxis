@@ -6,7 +6,7 @@ import importlib
 
 from praxis.agents.analyst import AnalysisResult
 from praxis.agents.architect import draft_blueprint
-from praxis.db import Candidate
+from praxis.db import Blueprint, Candidate
 
 architect_module = importlib.import_module("praxis.agents.architect")
 
@@ -57,9 +57,11 @@ def test_architect_persists_blueprint(db_session, hardware_profile, monkeypatch)
     analysis = make_analysis()
     calls = mock_call_llm(monkeypatch, BLUEPRINT_MD)
 
-    md = draft_blueprint(cand, analysis, hardware_profile)
+    bp = draft_blueprint(cand, analysis, hardware_profile)
 
-    assert md == BLUEPRINT_MD
+    assert isinstance(bp, Blueprint)
+    assert bp.blueprint_md == BLUEPRINT_MD
+    assert bp.candidate_id == cand.id
     assert calls["prompt"]
     assert calls["system"]
 
@@ -93,9 +95,9 @@ def test_architect_empty_output_persists(db_session, hardware_profile, monkeypat
     monkeypatch.setattr(architect_module, "call_llm", lambda prompt, system=None: "   ")
 
     with caplog.at_level("WARNING"):
-        md = draft_blueprint(cand, analysis, hardware_profile)
+        bp = draft_blueprint(cand, analysis, hardware_profile)
 
-    assert md == "   "
+    assert bp.blueprint_md == "   "
     assert "empty LLM response" in caplog.text
     db_session.expire_all()
     assert db_session.get(Candidate, cand.id).status == "blueprinted"
