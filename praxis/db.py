@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     func,
+    select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -85,3 +86,29 @@ def init_db(engine=None) -> None:
     """Create all tables if they do not yet exist."""
     engine = engine or get_engine()
     Base.metadata.create_all(engine)
+
+
+def status_counts() -> dict[str, int]:
+    """Return counts of candidates grouped by status."""
+    session = get_session()
+    try:
+        rows = session.execute(
+            select(Candidate.status, func.count(Candidate.id)).group_by(Candidate.status)
+        ).all()
+        return {status: count for status, count in rows}
+    finally:
+        session.close()
+
+
+def latest_blueprint(candidate_id: int) -> Blueprint | None:
+    """Return the most recent blueprint for a candidate, or None."""
+    session = get_session()
+    try:
+        return session.scalars(
+            select(Blueprint)
+            .where(Blueprint.candidate_id == candidate_id)
+            .order_by(Blueprint.id.desc())
+            .limit(1)
+        ).first()
+    finally:
+        session.close()

@@ -1,20 +1,29 @@
-"""Orchestrates the 4 agents sequentially with retry/backoff."""
+"""Orchestrates the 4 agents sequentially with retry/backoff.
+
+The pipeline runs Scout -> Analyst -> Architect -> Coder over a batch of
+candidates. Individual candidates that are rejected or fail at any stage are
+skipped; a single bad candidate never aborts the rest of the batch.
+"""
 
 from __future__ import annotations
 
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from praxis import agents
 from praxis.config import HardwareProfile, load_config
+from praxis.db import Candidate, get_session
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RETRIES = 3
 BACKOFF_BASE_S = 1.0
+
+FAILED_STATUS = "failed"
 
 
 def run_with_retry(
@@ -24,7 +33,7 @@ def run_with_retry(
     base_backoff: float = BACKOFF_BASE_S,
     **kwargs: Any,
 ) -> Any:
-    """Call fn(*args, **kwargs), retrying on transient errors with backoff."""
+    """Call fn(**kwargs), retrying on transient errors with backoff."""
     last_error: Exception | None = None
     for attempt in range(retries):
         try:
@@ -46,44 +55,169 @@ def run_with_retry(
     raise RuntimeError(f"All {retries} attempts failed") from last_error
 
 
-def run_pipeline(
+@dataclass
+class CandidateOutcome:
+    """Final outcome for a single candidate in a pipeline run."""
+
+    title: str
+    url: str
+    status: str
+    prototype_path: str | None = None
+
+
+@dataclass
+class PipelineResult:
+    """Batch summary of a pipeline run."""
+
+    source: str
+    topic: str
+    discovered: int = 0
+    analyzed: int = 0
+    rejected: int = 0
+    blueprinted: int = 0
+    prototyped: int = 0
+    failed: int = 0
+    candidates: list[CandidateOutcome] = field(default_factory=list)
+
+
+def _mark_failed(candidate_id: int | None) -> None:
+    """Persist a generic failure status for a candidate."""
+    if candidate_id is None:
+        return
+    session = get_session()
+    try:
+        stored = session.get(Candidate, candidate_id)
+        if stored is not None:
+            stored.status = FAILED_STATUS
+            session.commit()
+    finally:
+        session.close()
+
+
+def run(
     source: str,
     topic: str,
-    config: HardwareProfile | None = None,
     limit: int = 20,
+    *,
+    config: HardwareProfile | None = None,
     retries: int = DEFAULT_RETRIES,
     scratch_root: Path | None = None,
     timeout: float | None = None,
-) -> Any:
-    """Run Scout -> Analyst -> Architect -> Coder on a topic."""
+) -> PipelineResult:
+    """Run Scout -> Analyst -> Architect -> Coder over a batch of candidates."""
     config = config or load_config()
-    candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
+    result = PipelineResult(source=source, topic=topic)
 
-    accepted = []
+    try:
+        candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
+    except NotImplementedError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - scout failure aborts the batch
+        logger.warning("scout failed for topic=%r: %s", topic, exc)
+        return result
+
+    result.discovered = len(candidates)
+    logger.info("scout: discovered %d candidates", len(candidates))
+
     for candidate in candidates:
-        result = run_with_retry(agents.analyze, retries, candidate=candidate, profile=config)
-        if not result.rejected:
-            accepted.append((candidate, result))
+        url = getattr(candidate, "url", "")
+        title = getattr(candidate, "title", "") or url
+        candidate_id = getattr(candidate, "id", None)
 
-    blueprints = []
-    for candidate, analysis in accepted:
-        bp = run_with_retry(
-            agents.architect,
-            retries,
-            candidate=candidate,
-            analysis=analysis,
-            profile=config,
-        )
-        blueprints.append(bp)
+        try:
+            analysis = run_with_retry(agents.analyze, retries, candidate=candidate, profile=config)
+        except NotImplementedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+            logger.warning("analyst failed for %s: %s", url, exc)
+            _mark_failed(candidate_id)
+            result.failed += 1
+            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
+            continue
 
-    prototypes = []
-    for bp in blueprints:
-        path = run_with_retry(
-            agents.coder,
-            retries,
-            blueprint=bp,
-            scratch_root=scratch_root,
-            timeout=timeout,
+        if analysis.rejected:
+            logger.info("analyst rejected %s", url)
+            result.rejected += 1
+            result.candidates.append(CandidateOutcome(title=title, url=url, status="rejected"))
+            continue
+
+        result.analyzed += 1
+        logger.info("analyst accepted %s", url)
+
+        try:
+            blueprint = run_with_retry(
+                agents.architect,
+                retries,
+                candidate=candidate,
+                analysis=analysis,
+                profile=config,
+            )
+        except NotImplementedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+            logger.warning("architect failed for %s: %s", url, exc)
+            _mark_failed(candidate_id)
+            result.failed += 1
+            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
+            continue
+
+        result.blueprinted += 1
+        logger.info("architect blueprinted %s", url)
+
+        try:
+            path = run_with_retry(
+                agents.coder,
+                retries,
+                blueprint=blueprint,
+                scratch_root=scratch_root,
+                timeout=timeout,
+            )
+        except NotImplementedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+            logger.warning("coder failed for %s: %s", url, exc)
+            _mark_failed(candidate_id)
+            result.failed += 1
+            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
+            continue
+
+        if path is None:
+            logger.warning("coder failed for %s (opencode non-zero or timeout)", url)
+            result.failed += 1
+            result.candidates.append(
+                CandidateOutcome(title=title, url=url, status="prototype_failed")
+            )
+            continue
+
+        result.prototyped += 1
+        logger.info("coder prototyped %s -> %s", url, path)
+        result.candidates.append(
+            CandidateOutcome(
+                title=title,
+                url=url,
+                status="prototyped",
+                prototype_path=str(path),
+            )
         )
-        prototypes.append(path)
-    return prototypes
+
+    return result
+
+
+def format_summary(result: PipelineResult) -> str:
+    """Render a human-readable pipeline summary."""
+    rows = [
+        ("discovered", result.discovered),
+        ("analyzed", result.analyzed),
+        ("rejected", result.rejected),
+        ("blueprinted", result.blueprinted),
+        ("prototyped", result.prototyped),
+        ("failed", result.failed),
+    ]
+    lines = [f"Summary for topic={result.topic!r} source={result.source}"]
+    lines.extend(f"  {label}: {value}" for label, value in rows)
+    if result.candidates:
+        lines.append("Candidates:")
+        for outcome in result.candidates:
+            suffix = f" ({outcome.prototype_path})" if outcome.prototype_path else ""
+            lines.append(f"  - {outcome.title} [{outcome.status}]{suffix}")
+    return "\n".join(lines)
