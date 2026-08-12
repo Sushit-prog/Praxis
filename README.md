@@ -1,67 +1,95 @@
 # Praxis
 
-A multi-agent system that watches **arXiv / GitHub / Hacker News**, extracts
-implementable techniques, produces **hardware-calibrated engineering
-blueprints**, and drafts prototypes.
+A multi-agent system that watches arXiv / GitHub / Hacker News, extracts implementable techniques, produces hardware-calibrated engineering blueprints, and drafts prototypes via OpenCode.
 
-The heavy lifting (LLM calls, code generation) happens remotely via API, so
-Praxis runs fine on an 8 GB CPU-only machine.
+Praxis runs a four-stage agent pipeline over a batch of research candidates, persists every stage's result to a single SQLite file, and keeps each prototype in an isolated scratch directory. All model inference happens over the API, so Praxis itself runs comfortably on an 8 GB CPU-only machine.
 
-## Pipeline
+## Architecture
 
-Praxis runs four agents sequentially, with retry/backoff between steps:
+```
+ arXiv / GitHub / HN
+           |
+           v
+   +-------------+          Scout: fetch + dedupe candidates for a topic.
+   |    Scout    |          (HTTP only; no LLM call here.)
+   +-------------+
+           |
+           | candidate
+           v
+   +-------------+          LLM API (litellm)     Analyst: extract the single
+   |   Analyst   | -----------------------------> implementable technique and
+   +-------------+                                score feasibility 0-10
+           |                                      against the hardware profile.
+           | accepted analysis
+           v
+   +-------------+          LLM API (litellm)     Architect: emit a hardware-
+   |  Architect  | -----------------------------> calibrated blueprint in
+   +-------------+                                markdown, with a phased
+           |                                      build plan.
+           | blueprint
+           v
+   +-------------+          external subprocess   Coder: scoped to the first
+   |    Coder    | -----------------------------> milestone only, runs
+   +-------------+                                `opencode run --auto <phase>`
+           |                                      in a fresh scratch directory.
+           | prototype path
+           v
+   +---------------------+
+   | SQLite              |
+   | candidates ·        |
+   | blueprints ·        |
+   | prototype paths     |
+   +---------------------+
+```
 
-1. **Scout** — watches a source (`arxiv`, `github`, `hn`) for items matching a
-   topic and stores promising ones as `Candidate`s.
-2. **Analyst** — reads each candidate, extracts the implementable technique(s),
-   and judges novelty and feasibility.
-3. **Architect** — turns the analysis into a `Blueprint`: modules, milestones,
-   feasibility score, and a prototype path calibrated to your `HardwareProfile`.
-4. **Coder** — drafts a prototype from the blueprint's first phase by running
-   the OpenCode CLI (`opencode run`) in a fresh scratch directory and stores
-   the result path on the `Blueprint`.
+Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder delegates code generation to the OpenCode CLI as a separate subprocess rather than making an LLM call of its own.
 
-> v1 status: all four agents are implemented — **Scout** (fetch + dedupe),
-> **Analyst** (LLM technique extraction + feasibility scoring), **Architect**
-> (hardware-calibrated `Blueprint` generation), and **Coder** (OpenCode CLI
-> prototype drafting). Evaluator/Critic agents are explicitly deferred to v2.
+## How it works
 
-## Install
+The pipeline is orchestrated in `praxis/pipeline.py` as Scout -> Analyst -> Architect -> Coder. Stages are wrapped in `run_with_retry` with exponential backoff, and each candidate is processed in isolation: a candidate that is rejected or fails at any stage is marked and skipped, and the batch continues.
+
+- **Scout** — fetches items matching the topic from one of `arxiv`, `github`, or `hn`, deduplicates them, and persists promising ones as `Candidate` rows (`status="new"`).
+- **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on.
+- **Architect** — turns the accepted analysis into a `Blueprint`: a markdown engineering plan with modules, milestones, and a phased build plan, calibrated to the same hardware profile. The first phase of that plan is what the Coder will build.
+- **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run.
+
+## Design decisions
+
+Praxis is scoped deliberately. Each choice below is a judgment about what the system needs today, not a limitation deferred out of sight.
+
+| Decision | Trade-off accepted | Rationale |
+|---|---|---|
+| **SQLite, not Neo4j/Postgres** | No graph queries, no concurrent writers | A single-machine research assistant needs zero-ops, portable storage; the data model is a simple pipeline ledger. SQLAlchemy already abstracts the engine, so swapping to Postgres is a configuration change if concurrent writes ever become necessary. |
+| **No Temporal/Redis/worker queues** | No durable workflows, no parallelism | At batch sizes in the tens, a plain retry/backoff loop in `run_with_retry` is sufficient and far simpler to reason about. A real queue is added only if Praxis is run against a large scheduled backlog. |
+| **Four agents, not six** | No Evaluator/Critic in v1 | The original plan called for six agents. Cutting evaluation to v2 let the core discovery-to-prototype loop ship and get tested first, instead of bolting speculative machinery onto an unproven core. |
+| **Coder invokes OpenCode** | Praxis does not generate code itself | Code generation is treated as a distinct, swappable capability with its own agent loop, tooling, and iteration strategy. Isolating it in `_invoke_opencode` means the coding approach can evolve without touching the rest of the system. |
+
+## Installation
+
+Requires Python 3.11+.
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
 pip install -e ".[dev]"
 ```
 
-## Configure
-
-Set `PRAXIS_MODEL` (default `groq/llama-3.1-8b-instant`) and any other vars in
-a `.env` file or your shell. See `.env.example`:
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `PRAXIS_MODEL` | litellm model id | `groq/llama-3.1-8b-instant` |
-| `PRAXIS_DB_PATH` | SQLite file | `./praxis.db` |
-| `PRAXIS_DB_URL` | Full SQLAlchemy URL (overrides path) | — |
-| `PRAXIS_CONFIG` | Hardware profile YAML | `./hardware_profile.yaml` |
-| `PRAXIS_CPU_ONLY` / `PRAXIS_RAM_GB` / `PRAXIS_GPU` / `PRAXIS_MONTHLY_BUDGET_USD` | Hardware overrides | `true` / `8` / `false` / `15` |
-| `PRAXIS_SCRATCH_ROOT` | Where the Coder creates prototype directories | `./scratch` |
-| `PRAXIS_CODER_TIMEOUT_S` | OpenCode subprocess timeout | `600` |
-
-The hardware profile (YAML or env) drives the Architect so blueprints match
-your machine: `cpu_only`, `ram_gb`, `gpu`, `monthly_budget_usd`.
-
 ## Usage
+
+All three commands are installed as the `praxis` entrypoint.
+
+Run the full pipeline for a topic (defaults to `arxiv`, up to 20 candidates):
 
 ```bash
 praxis run --source arxiv --topic "retrieval augmented generation" --limit 20
-praxis status
-praxis show 42
+praxis run --source github --topic "local vector search on CPU"
 ```
 
-`praxis run` runs the full four-agent pipeline and prints a summary with the
-candidate titles:
+`--limit` caps how many candidates the Scout keeps; `-v`/`--verbose` enables DEBUG logging. A run prints a per-batch summary:
 
 ```
 Summary for topic='retrieval augmented generation' source=arxiv
@@ -77,10 +105,11 @@ Candidates:
   - Local reranker [prototype_failed]
 ```
 
-A candidate that is rejected or fails at any stage is skipped, and the batch
-continues — one bad candidate never aborts the run.
+Inspect the ledger by status:
 
-`praxis status` shows how many candidates are in each state:
+```bash
+praxis status
+```
 
 ```
 Candidate counts by status:
@@ -92,60 +121,64 @@ Candidate counts by status:
   rejected: 3
 ```
 
-`praxis show <id>` prints the full blueprint markdown for a candidate.
-
-The Coder stage shells out to the OpenCode CLI, so `opencode` must be on your
-PATH and authenticated (`opencode auth login`). The exact invocation lives in
-`praxis/agents/coder.py:_invoke_opencode`.
-
-## Why these tradeoffs
-
-Praxis is scoped the way it is on purpose; each choice keeps the system honest
-about the 8 GB CPU-only machine it targets.
-
-- **SQLite, not Postgres/Neo4j.** The data model is a simple pipeline ledger:
-  candidates, blueprints, prototypes. SQLite is zero-ops, runs anywhere, and
-  keeps every run auditable in a single file. A graph database only pays off
-  when you want multi-hop queries across many runs (e.g. "which blueprints
-  share a technique") — a v2 concern, not a v1 blocker.
-- **No Temporal/worker queues.** The pipeline is four strictly sequential
-  stages with per-candidate isolation. `run_with_retry` plus exponential
-  backoff covers transient LLM/API failures, and a batch continues past
-  individual candidate failures. A durable workflow engine earns its weight
-  once stages become long-running, parallel, or resumable mid-batch — none of
-  which is true today.
-- **Four agents, deliberately.** Scout → Analyst → Architect → Coder is the
-  smallest loop that turns a research item into a working prototype.
-  Evaluator/Critic agents were cut from v1 on purpose: automated evaluation
-  needs a prototype-quality bar and metrics that don't exist yet, so adding
-  them now would be speculative. When v2 adds evaluation, it slots in after
-  Coder without changing the earlier stages.
-- **Delegate code generation to OpenCode.** Praxis doesn't reimplement an
-  agent loop for writing code; it hands the blueprint's first milestone to a
-  purpose-built coding agent running in an isolated scratch directory. The
-  invocation is isolated in `_invoke_opencode` so the exact CLI flags can
-  evolve without touching the rest of the system.
-- **Only the LLM calls are heavy.** All model inference happens remotely via
-  litellm/API. Praxis itself stays small and CPU/RAM-light, matching the
-  hardware it is calibrated for.
-
-## Tests & lint
+Print a candidate's blueprint markdown:
 
 ```bash
-pytest
-ruff check .
+praxis show 42
 ```
 
-## Layout
+The Coder stage requires `opencode` on your PATH and authenticated (`opencode auth login`). The exact invocation lives in `praxis/agents/coder.py:_invoke_opencode`.
 
+## Configuration
+
+Praxis reads environment variables directly from the process (there is no bundled `.env` loader). `.env.example` is a reference template for the full set; export them in your shell or source them through your own dotenv tooling.
+
+### Hardware profile
+
+The `HardwareProfile` constrains feasibility scoring and blueprint generation. Fields resolve in order: **environment variable -> YAML file (`PRAXIS_CONFIG`) -> default**.
+
+| Field | Type | Default | Env override |
+|---|---|---|---|
+| `cpu_only` | bool | `true` | `PRAXIS_CPU_ONLY` |
+| `ram_gb` | int | `8` | `PRAXIS_RAM_GB` |
+| `gpu` | bool | `false` | `PRAXIS_GPU` |
+| `monthly_budget_usd` | float | `15.0` | `PRAXIS_MONTHLY_BUDGET_USD` |
+
+Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.yaml`.
+
+### Model and pipeline
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PRAXIS_MODEL` | litellm model id used by the Analyst/Architect | `groq/llama-3.1-8b-instant` |
+| `PRAXIS_FEASIBILITY_THRESHOLD` | minimum feasibility score (0-10) for a candidate to be accepted | `4` |
+| `PRAXIS_DB_PATH` | SQLite file path | `./praxis.db` |
+| `PRAXIS_DB_URL` | full SQLAlchemy URL; overrides `PRAXIS_DB_PATH` | — |
+| `PRAXIS_CONFIG` | path to the hardware profile YAML | `./hardware_profile.yaml` |
+| `PRAXIS_SCRATCH_ROOT` | where the Coder creates prototype directories | `./scratch` |
+| `PRAXIS_CODER_TIMEOUT_S` | timeout for the OpenCode subprocess | `600` |
+
+## Testing & CI
+
+```bash
+pytest        # 54 tests
+ruff check .  # lint
 ```
-praxis/
-  config.py     # HardwareProfile + budget from YAML/env
-  db.py         # SQLAlchemy models + SQLite engine
-  llm.py        # litellm wrapper (mockable completion)
-  agents/       # scout, analyst, architect, coder
-  pipeline.py   # sequential orchestration with retry/backoff
-  cli.py        # `praxis run --source ... --topic "..."`
-tests/
-  conftest.py   # fixtures incl. fake LLM client
-```
+
+CI (`.github/workflows/ci.yml`) installs the package with dev extras and runs `ruff check .` then `pytest` on both Python 3.11 and 3.12. Tests mock the LLM client, HTTP fetches, and the OpenCode subprocess, so the suite runs offline and deterministically.
+
+## Roadmap
+
+Praxis is a working v1, and these are the intentional next phases:
+
+- **Coder guardrails** — structural isolation on the OpenCode invocation plus a circuit-breaker on its tool calls, so a runaway prototype draft cannot burn unbounded time or tokens.
+- **Human-in-the-loop review gate** — an approval step between Architect and Coder so no code is generated until a person signs off on the plan.
+- **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
+- **Cost/token observability** — per-run and per-candidate spend accounting against `monthly_budget_usd`.
+- **Confidence-aware routing** — treat borderline feasibility scores (near the threshold) as a separate routing decision rather than a binary accept/reject.
+- **Pipeline resumability** — allow a run to resume from the last completed stage instead of restarting from Scout.
+- **Minimal frontend** — a thin read-only view over the ledger and prototypes; the CLI stays the source of truth.
+
+## License
+
+MIT, as declared in `pyproject.toml`. A `LICENSE` file should be added to the repo to match.
