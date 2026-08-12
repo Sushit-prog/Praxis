@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 
-from praxis.agents.analyst import AnalysisResult
+from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START, AnalysisResult
 from praxis.agents.architect import draft_blueprint
 from praxis.db import Blueprint, Candidate
 
@@ -91,6 +91,24 @@ def test_architect_prompt_includes_hardware_and_analysis(db_session, hardware_pr
     assert "Fine-tune a small transformer on CPU." in prompt
     assert "feasibility_score: 8" in prompt
     assert "attention is all you need" in prompt
+
+
+def test_architect_prompt_wraps_untrusted_text(db_session, hardware_profile, monkeypatch):
+    """The Architect also receives candidate raw text as delimited untrusted data."""
+    cand = make_candidate(db_session, raw_text="benign abstract")
+    analysis = make_analysis()
+    calls = mock_call_llm(monkeypatch, BLUEPRINT_MD)
+
+    draft_blueprint(cand, analysis, hardware_profile)
+
+    prompt = calls["prompt"]
+    assert UNTRUSTED_START in prompt
+    assert UNTRUSTED_END in prompt
+    inside = prompt.split(UNTRUSTED_START)[1].split(UNTRUSTED_END)[0]
+    assert "title: A Paper" in inside
+    assert "raw text:" in inside
+    assert inside.strip().endswith("benign abstract")
+    assert "UNTRUSTED" in calls["system"]
 
 
 def test_architect_empty_output_persists(db_session, hardware_profile, monkeypatch, caplog):
