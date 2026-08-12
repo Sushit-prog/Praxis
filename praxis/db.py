@@ -91,6 +91,24 @@ class LLMUsage(Base):
     cached: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class BuildMemory(Base):
+    """A human review decision and its build outcome (agent memory).
+
+    Recorded when a person approves or rejects a borderline candidate and fed
+    back into future Analyst scoring, so the system learns which techniques are
+    actually buildable on the target hardware.
+    """
+
+    __tablename__ = "build_memory"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
+    technique: Mapped[str] = mapped_column(Text)
+    decision: Mapped[str] = mapped_column(String(16))  # approved | rejected
+    outcome: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class LLMCache(Base):
     """Cached LLM responses keyed by a hash of model + system + prompt.
 
@@ -263,6 +281,33 @@ def usage_summary(*, session=None, days: int = 30) -> UsageSummary:
             by_model=_usage_grouped(session, LLMUsage.model),
             days=days,
         )
+    finally:
+        if owns_session:
+            session.close()
+
+
+def recent_build_memory(limit: int = 5, *, session=None) -> list[BuildMemory]:
+    """Most recent build-memory entries, newest first, one per candidate.
+
+    Dedupes by candidate so a candidate that somehow accrued multiple memory
+    rows never floods the prompt with stale duplicates; the newest row wins.
+    """
+    owns_session = session is None
+    session = session or get_session()
+    try:
+        entries = session.scalars(
+            select(BuildMemory).order_by(BuildMemory.id.desc())
+        ).all()
+        seen: set[int] = set()
+        deduped: list[BuildMemory] = []
+        for entry in entries:
+            if entry.candidate_id in seen:
+                continue
+            seen.add(entry.candidate_id)
+            deduped.append(entry)
+            if len(deduped) >= limit:
+                break
+        return deduped
     finally:
         if owns_session:
             session.close()

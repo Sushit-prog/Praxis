@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,90 @@ DEFAULT_TIMEOUT_S = 600
 TIMEOUT_ENV = "PRAXIS_CODER_TIMEOUT_S"
 SCRATCH_ROOT_ENV = "PRAXIS_SCRATCH_ROOT"
 DEFAULT_SCRATCH_ROOT = Path("./scratch")
+
+DEFAULT_MAX_FAILURES = 2
+MAX_FAILURES_ENV = "PRAXIS_CODER_MAX_FAILURES"
+DEFAULT_COOLDOWN_S = 300.0
+COOLDOWN_ENV = "PRAXIS_CODER_COOLDOWN_S"
+
+
+class _CircuitBreaker:
+    """Fail-fast guard around the OpenCode subprocess.
+
+    After ``max_failures`` consecutive failures the circuit opens and further
+    calls return without touching the subprocess until ``cooldown_s`` elapses,
+    at which point one trial attempt is allowed (half-open). This stops a
+    runaway or persistently-broken OpenCode from burning time on every
+    candidate in a batch.
+    """
+
+    def __init__(self, max_failures: int, cooldown_s: float) -> None:
+        self.max_failures = max_failures
+        self.cooldown_s = cooldown_s
+        self._failures = 0
+        self._open_until = 0.0
+        self._trial = False  # True while a half-open trial attempt is in flight
+
+    def allow(self) -> bool:
+        if self._failures >= self.max_failures:
+            if time.monotonic() >= self._open_until:
+                self._failures = 0  # half-open: permit one trial attempt
+                self._trial = True
+                return True
+            return False
+        # Closed path: clear any stale trial flag left by an exception that
+        # escaped between allow() and record_* (e.g. opencode missing), so a
+        # later normal failure cannot be misclassified as a trial failure.
+        self._trial = False
+        return True
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._trial = False
+
+    def record_failure(self) -> None:
+        if self._trial:
+            # A half-open trial failed: re-open the circuit immediately with a
+            # fresh cooldown instead of quietly closing it (one more failure
+            # must not be needed to re-trip).
+            self._trial = False
+            self._failures = self.max_failures
+            self._open_until = time.monotonic() + self.cooldown_s
+            return
+        self._failures += 1
+        if self._failures >= self.max_failures:
+            self._open_until = time.monotonic() + self.cooldown_s
+
+
+def _resolve_max_failures() -> int:
+    raw = os.environ.get(MAX_FAILURES_ENV)
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("invalid %s=%r; using default", MAX_FAILURES_ENV, raw)
+    return DEFAULT_MAX_FAILURES
+
+
+def _resolve_cooldown() -> float:
+    raw = os.environ.get(COOLDOWN_ENV)
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("invalid %s=%r; using default", COOLDOWN_ENV, raw)
+    return DEFAULT_COOLDOWN_S
+
+
+_breaker: _CircuitBreaker | None = None
+
+
+def _get_breaker() -> _CircuitBreaker:
+    """Return the module-level circuit breaker (lazily built from env)."""
+    global _breaker
+    if _breaker is None:
+        _breaker = _CircuitBreaker(_resolve_max_failures(), _resolve_cooldown())
+    return _breaker
 
 PHASED_PLAN_HEADING = "phased build plan"
 MILESTONE_RE = re.compile(r"^\s*\d+[.)]\s")
@@ -166,9 +251,22 @@ def draft_prototype(
     scratch.mkdir(parents=True, exist_ok=True)
 
     prompt = _build_coder_prompt(blueprint)
+    breaker = _get_breaker()
+    if not breaker.allow():
+        logger.warning(
+            "coder: circuit open; skipping opencode for blueprint %s (max %d failures, "
+            "cooldown %ss)",
+            blueprint.id,
+            breaker.max_failures,
+            breaker.cooldown_s,
+        )
+        _persist_status(blueprint, "prototype_failed", None)
+        return None
+
     try:
         proc = _invoke_opencode(prompt, scratch, timeout)
     except subprocess.TimeoutExpired as exc:
+        breaker.record_failure()
         logger.warning(
             "coder: opencode timed out after %ss for blueprint %s: %s",
             timeout,
@@ -179,6 +277,7 @@ def draft_prototype(
         return None
 
     if proc.returncode != 0:
+        breaker.record_failure()
         logger.warning(
             "coder: opencode failed for blueprint %s (rc=%s): %s",
             blueprint.id,
@@ -188,6 +287,7 @@ def draft_prototype(
         _persist_status(blueprint, "prototype_failed", None)
         return None
 
+    breaker.record_success()
     _persist_status(blueprint, "prototyped", str(scratch))
     return scratch
 

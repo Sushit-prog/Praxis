@@ -5,10 +5,21 @@ from __future__ import annotations
 import importlib
 import subprocess
 
-from praxis.agents.coder import _extract_first_phase, draft_prototype
+import pytest
+
+from praxis.agents.coder import _CircuitBreaker, _extract_first_phase, draft_prototype
 from praxis.db import Blueprint, Candidate
 
 coder_module = importlib.import_module("praxis.agents.coder")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_breaker(monkeypatch):
+    """Reset the module-level circuit breaker before every test so failure state
+    never leaks between tests; default envs keep it permissive (never trips)."""
+    monkeypatch.setattr(coder_module, "_breaker", None)
+    monkeypatch.setenv("PRAXIS_CODER_MAX_FAILURES", "1000")
+    monkeypatch.setenv("PRAXIS_CODER_COOLDOWN_S", "0")
 
 PHASED_PLAN_MD = (
     "# Build a Fine-Tuner \u2014 Blueprint\n\n"
@@ -181,6 +192,105 @@ def test_extract_first_phase_no_items_returns_section_prose():
 def test_extract_first_phase_blank():
     assert _extract_first_phase("") == ""
     assert _extract_first_phase("   \n  ") == ""
+
+
+def test_circuit_breaker_opens_after_max_failures():
+    cb = _CircuitBreaker(max_failures=2, cooldown_s=1000)
+
+    assert cb.allow() is True
+    cb.record_failure()
+    assert cb.allow() is True
+    cb.record_failure()
+    assert cb.allow() is False  # open
+
+
+def test_circuit_breaker_reopens_after_cooldown(monkeypatch):
+    cb = _CircuitBreaker(max_failures=1, cooldown_s=10)
+    now = {"t": 0.0}
+    monkeypatch.setattr(coder_module.time, "monotonic", lambda: now["t"])
+
+    cb.record_failure()
+    assert cb.allow() is False  # open
+    now["t"] = 11.0
+    assert cb.allow() is True  # half-open trial attempt
+
+
+def test_circuit_breaker_success_resets():
+    cb = _CircuitBreaker(max_failures=2, cooldown_s=10)
+
+    cb.record_failure()
+    cb.record_success()
+    assert cb.allow() is True
+    cb.record_failure()
+    cb.record_failure()
+    assert cb.allow() is False
+
+
+def test_circuit_breaker_failed_trial_reopens(monkeypatch):
+    """A half-open trial that fails re-opens the circuit with a fresh cooldown."""
+    cb = _CircuitBreaker(max_failures=2, cooldown_s=10)
+    now = {"t": 0.0}
+    monkeypatch.setattr(coder_module.time, "monotonic", lambda: now["t"])
+
+    cb.record_failure()
+    cb.record_failure()
+    assert cb.allow() is False  # open
+    now["t"] = 11.0
+    assert cb.allow() is True  # half-open trial permitted
+    cb.record_failure()  # trial fails -> must re-open, not quietly close
+    assert cb.allow() is False  # still open (fresh cooldown)
+    now["t"] = 22.0
+    assert cb.allow() is True  # next trial after the fresh cooldown
+
+
+def test_draft_prototype_circuit_open_skips_subprocess(db_session, monkeypatch, tmp_path, caplog):
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = {"n": 0}
+
+    def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None):
+        calls["n"] += 1
+        return fake_completed()
+
+    monkeypatch.setattr(coder_module.subprocess, "run", fake_run)
+
+    class _BlockingBreaker:
+        max_failures = 2
+        cooldown_s = 300.0
+
+        def allow(self):
+            return False
+
+    monkeypatch.setattr(coder_module, "_get_breaker", lambda: _BlockingBreaker())
+
+    with caplog.at_level("WARNING"):
+        path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is None
+    assert calls["n"] == 0
+    assert "circuit open" in caplog.text
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "prototype_failed"
+
+
+def test_draft_prototype_failures_trip_breaker(db_session, monkeypatch, tmp_path):
+    """Consecutive subprocess failures open the env-configured circuit."""
+    monkeypatch.setenv("PRAXIS_CODER_MAX_FAILURES", "1")
+    monkeypatch.setenv("PRAXIS_CODER_COOLDOWN_S", "1000")
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = {"n": 0}
+
+    def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None):
+        calls["n"] += 1
+        return fake_completed(returncode=1)
+
+    monkeypatch.setattr(coder_module.subprocess, "run", fake_run)
+
+    assert draft_prototype(bp, scratch_root=tmp_path) is None  # fails, circuit opens
+    assert draft_prototype(bp, scratch_root=tmp_path) is None  # skipped, no subprocess
+
+    assert calls["n"] == 1
 
 
 def test_coder_alias():

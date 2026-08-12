@@ -50,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--threshold", type=int, help="Feasibility threshold override for the Analyst."
     )
 
+    memory_parser = sub.add_parser(
+        "memory", help="Show recent human review decisions (agent memory)."
+    )
+    memory_parser.add_argument(
+        "--limit", type=int, default=10, help="Max entries to show (default: 10)."
+    )
+
     review = sub.add_parser(
         "review", help="Review borderline candidates (human-in-the-loop gate)."
     )
@@ -169,6 +176,19 @@ def _cmd_usage(args) -> int:
     return 0
 
 
+def _cmd_memory(args) -> int:
+    from praxis.db import recent_build_memory
+
+    entries = recent_build_memory(args.limit)
+    if not entries:
+        print("No build memory recorded yet.")
+        return 0
+    print("Recent build memory:")
+    for entry in entries:
+        print(f"  [{entry.id}] {entry.decision} ({entry.outcome}): {entry.technique}")
+    return 0
+
+
 def _cmd_review(args) -> int:
     from praxis.review import approve, pending_candidates, reject
 
@@ -251,6 +271,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_usage(args)
     if args.command == "review":
         return _cmd_review(args)
+    if args.command == "memory":
+        return _cmd_memory(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "eval":

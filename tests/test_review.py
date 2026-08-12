@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy import select
+
 import praxis.agents as agents_module
-from praxis.db import Blueprint, Candidate
+from praxis.db import Blueprint, BuildMemory, Candidate
 
 
 def _borderline_candidate(db_session, *, url="https://x", score=5):
@@ -79,6 +81,11 @@ def test_approve_builds_candidate(db_session, monkeypatch, hardware_profile):
     assert result.prototype_path == str(Path("/tmp/proto"))
     db_session.expire_all()
     assert db_session.get(Candidate, cand.id).status == "prototyped"
+    memory = db_session.scalars(select(BuildMemory)).all()
+    assert len(memory) == 1
+    assert memory[0].decision == "approved"
+    assert memory[0].outcome == "prototyped"
+    assert memory[0].technique == "t"
 
 
 def test_approve_non_borderline_errors(db_session, monkeypatch, hardware_profile):
@@ -136,6 +143,10 @@ def test_reject_marks_candidate_rejected(db_session):
     assert result.status == "rejected"
     db_session.expire_all()
     assert db_session.get(Candidate, cand.id).status == "rejected"
+    memory = db_session.scalars(select(BuildMemory)).all()
+    assert len(memory) == 1
+    assert memory[0].decision == "rejected"
+    assert memory[0].outcome == "rejected"
 
 
 def test_reject_non_borderline_errors(db_session):

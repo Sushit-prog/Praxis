@@ -11,10 +11,10 @@ from praxis.cli import main
 
 @pytest.fixture
 def seeded_db(tmp_path, monkeypatch):
-    """A temp SQLite DB with one prototyped, one rejected, and usage rows."""
+    """A temp SQLite DB with one prototyped, one rejected, usage, and memory rows."""
     from sqlalchemy.orm import Session
 
-    from praxis.db import Base, Blueprint, Candidate, LLMUsage, get_engine
+    from praxis.db import Base, Blueprint, BuildMemory, Candidate, LLMUsage, get_engine
 
     db_path = tmp_path / "cli.db"
     monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
@@ -36,6 +36,14 @@ def seeded_db(tmp_path, monkeypatch):
         session.add(
             Candidate(
                 source="github", url="https://b", title="Beta", raw_text="y", status="rejected"
+            )
+        )
+        session.add(
+            BuildMemory(
+                candidate_id=alpha.id,
+                technique="LoRA fine-tuning on CPU",
+                decision="approved",
+                outcome="prototyped",
             )
         )
         session.add_all(
@@ -97,6 +105,30 @@ def test_cli_show_candidate_without_blueprint(seeded_db, capsys):
 
     assert rc == 1
     assert "no blueprint" in capsys.readouterr().err
+
+
+def test_cli_memory_lists_entries(seeded_db, capsys):
+    rc = main(["memory"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Recent build memory:" in out
+    assert "approved (prototyped): LoRA fine-tuning on CPU" in out
+
+
+def test_cli_memory_empty(tmp_path, monkeypatch, capsys):
+    from sqlalchemy import create_engine
+
+    from praxis.db import Base
+
+    db_path = tmp_path / "empty.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    Base.metadata.create_all(create_engine(f"sqlite:///{db_path}"))
+
+    rc = main(["memory"])
+
+    assert rc == 0
+    assert "No build memory recorded yet." in capsys.readouterr().out
 
 
 def test_cli_usage_prints_report(seeded_db, capsys):

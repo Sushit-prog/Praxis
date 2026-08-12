@@ -18,7 +18,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from praxis.config import HardwareProfile, load_config
-from praxis.db import Candidate, get_session
+from praxis.db import BuildMemory, Candidate, get_session
 from praxis.pipeline import (
     DEFAULT_RETRIES,
     REVIEWED_STATUS,
@@ -48,6 +48,23 @@ def _load_candidate(candidate_id: int) -> Candidate | None:
     session = get_session()
     try:
         return session.get(Candidate, candidate_id)
+    finally:
+        session.close()
+
+
+def _record_memory(candidate: Candidate, decision: str, outcome: str) -> None:
+    """Persist a human review decision so future Analyst scoring can learn from it."""
+    session = get_session()
+    try:
+        session.add(
+            BuildMemory(
+                candidate_id=candidate.id,
+                technique=candidate.technique_summary or "",
+                decision=decision,
+                outcome=outcome,
+            )
+        )
+        session.commit()
     finally:
         session.close()
 
@@ -113,6 +130,7 @@ def approve(
         scratch_root=scratch_root,
         timeout=timeout,
     )
+    _record_memory(candidate, "approved", outcome.status)
 
     return ReviewResult(
         candidate_id,
@@ -150,4 +168,5 @@ def reject(candidate_id: int) -> ReviewResult:
         session.commit()
     finally:
         session.close()
+    _record_memory(candidate, "rejected", "rejected")
     return ReviewResult(candidate_id, title, url, "rejected", "rejected")

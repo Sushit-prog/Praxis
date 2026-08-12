@@ -149,7 +149,13 @@ praxis review approve 42            # approve and build it
 praxis review reject 42             # reject it; it will not be built
 ```
 
-Candidates the Analyst flags as `borderline` (score inside the threshold band) are held for review instead of being auto-built. `praxis review` lists them with their score and reasoning; `approve` records the decision and builds the candidate through the normal Architect -> Coder path (a `reviewed` candidate left unbuilt by an interrupted approval is picked up by `praxis run --resume`, which continues from the Architect using the persisted analysis); `reject` marks it `rejected`.
+Candidates the Analyst flags as `borderline` (score inside the threshold band) are held for review instead of being auto-built. `praxis review` lists them with their score and reasoning; `approve` records the decision and builds the candidate through the normal Architect -> Coder path (a `reviewed` candidate left unbuilt by an interrupted approval is picked up by `praxis run --resume`, which continues from the Architect using the persisted analysis); `reject` marks it `rejected`. Every decision is stored as **agent memory** and fed back into future Analyst scoring:
+
+```bash
+praxis memory        # recent human review decisions and their outcomes
+```
+
+Each `review approve`/`reject` records a `build_memory` entry (technique, decision, outcome). The Analyst's next prompts include a `Build history` section listing those outcomes, and the system prompt instructs it to treat past failures as ground truth — a technique similar to one that previously failed to build is scored lower, so the system learns which techniques are actually buildable on the target hardware.
 
 Track LLM token spend against the budget:
 
@@ -188,6 +194,8 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CONFIG` | path to the hardware profile YAML | `./hardware_profile.yaml` |
 | `PRAXIS_SCRATCH_ROOT` | where the Coder creates prototype directories | `./scratch` |
 | `PRAXIS_CODER_TIMEOUT_S` | timeout for the OpenCode subprocess | `600` |
+| `PRAXIS_CODER_MAX_FAILURES` | consecutive OpenCode failures before the circuit breaker opens | `2` |
+| `PRAXIS_CODER_COOLDOWN_S` | how long the circuit stays open before one trial attempt | `300` |
 | `PRAXIS_LLM_CACHE` | disable the LLM response cache with `0`/`false` (enabled by default) | `1` |
 | `PRAXIS_FALLBACK_MODELS` | comma-separated models tried after the primary when it fails (rate limit, outage) | — |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
@@ -207,9 +215,9 @@ Praxis is a working v1, and these are the intentional next phases:
 
 - **Golden-set evaluation (implemented)** — `praxis eval` regression-checks the Analyst and Architect against hand-labeled fixtures — including adversarial prompt-injection candidates — with a deterministic rubric; LLM-as-judge scoring is future work.
 - **Prompt-injection hardening (implemented)** — candidate raw text is delimited and framed as untrusted data in the Analyst and Architect prompts, with adversarial fixtures in the golden set proving injections cannot override verdicts.
-- **Coder guardrails** — structural isolation on the OpenCode invocation plus a circuit-breaker on its tool calls, so a runaway prototype draft cannot burn unbounded time or tokens.
+- **Coder guardrails (implemented)** — a circuit breaker around the OpenCode subprocess: after `PRAXIS_CODER_MAX_FAILURES` consecutive failures (default 2) further calls fail fast without touching the subprocess until `PRAXIS_CODER_COOLDOWN_S` elapses, so a runaway or broken OpenCode cannot burn time on every candidate in a batch.
 - **Human-in-the-loop review gate (implemented)** — `praxis review` lists `borderline` candidates; `approve` builds them through the normal Architect -> Coder path and `reject` discards them, so uncertain candidates are never auto-built without a person signing off.
-- **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
+- **Agent memory (implemented)** — every human review decision is stored in the `build_memory` table and surfaced in future Analyst prompts as a `Build history` section, so the system learns which techniques are actually buildable on the target hardware.
 - **Cost/token observability (implemented)** — every Analyst/Architect call is recorded with tokens, estimated USD cost, latency, stage, and candidate; `praxis usage` reports totals, a recent window, and per-stage/per-model breakdowns, and `praxis run` prints a spend footer.
 - **LLM response caching (implemented)** — identical calls (same model + system + prompt) are served from the `llm_cache` table, so re-processing the same candidate costs nothing; any prompt or model change is a miss by construction. Disable with `PRAXIS_LLM_CACHE=0`.
 - **Model fallback (implemented)** — if the primary model fails (rate limit, outage), calls retry through the comma-separated `PRAXIS_FALLBACK_MODELS`; every failed attempt is recorded in the usage ledger.
