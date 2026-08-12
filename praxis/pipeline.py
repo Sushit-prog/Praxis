@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+
 from praxis import agents
 from praxis.config import HardwareProfile, load_config
 from praxis.db import Candidate, UsageTotals, get_session, usage_totals
@@ -77,9 +79,11 @@ class PipelineResult:
     blueprinted: int = 0
     prototyped: int = 0
     failed: int = 0
+    resumed: int = 0
     usage_calls: int = 0
     usage_total_tokens: int = 0
     usage_cost_usd: float = 0.0
+    usage_cached_hits: int = 0
     candidates: list[CandidateOutcome] = field(default_factory=list)
 
 
@@ -93,6 +97,19 @@ def _mark_failed(candidate_id: int | None) -> None:
         if stored is not None:
             stored.status = FAILED_STATUS
             session.commit()
+    finally:
+        session.close()
+
+
+def _unfinished_candidates() -> list[Candidate]:
+    """Candidates from earlier runs that never finished: status `new` or `failed`."""
+    session = get_session()
+    try:
+        return list(
+            session.scalars(
+                select(Candidate).where(Candidate.status.in_(("new", FAILED_STATUS)))
+            ).all()
+        )
     finally:
         session.close()
 
@@ -118,22 +135,40 @@ def run(
     retries: int = DEFAULT_RETRIES,
     scratch_root: Path | None = None,
     timeout: float | None = None,
+    resume: bool = False,
 ) -> PipelineResult:
-    """Run Scout -> Analyst -> Architect -> Coder over a batch of candidates."""
+    """Run Scout -> Analyst -> Architect -> Coder over a batch of candidates.
+
+    With ``resume=True``, candidates left in status ``new`` or ``failed`` by
+    earlier runs are processed alongside the freshly scouted ones, so an
+    interrupted batch can continue instead of restarting from scratch. Scout
+    failures degrade to the resumed candidates rather than aborting.
+    """
     config = config or load_config()
     result = PipelineResult(source=source, topic=topic)
     usage_before = _snapshot_usage()
 
+    candidates: list[Any] = []
+    if resume:
+        candidates = _unfinished_candidates()
+        result.resumed = len(candidates)
+        logger.info("resume: picked up %d unfinished candidate(s)", len(candidates))
+
     try:
-        candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
+        new_candidates = run_with_retry(
+            agents.scout, retries, source=source, topic=topic, limit=limit
+        )
     except NotImplementedError:
         raise
-    except Exception as exc:  # noqa: BLE001 - scout failure aborts the batch
+    except Exception as exc:  # noqa: BLE001 - scout failure aborts, unless there is work to resume
         logger.warning("scout failed for topic=%r: %s", topic, exc)
-        return result
-
-    result.discovered = len(candidates)
-    logger.info("scout: discovered %d candidates", len(candidates))
+        if not candidates:
+            return result
+        logger.warning("scout failed; continuing with %d resumed candidate(s)", len(candidates))
+    else:
+        candidates.extend(new_candidates)
+        result.discovered = len(new_candidates)
+        logger.info("scout: discovered %d new candidate(s)", len(new_candidates))
 
     for candidate in candidates:
         url = getattr(candidate, "url", "")
@@ -221,6 +256,7 @@ def run(
         result.usage_calls = usage_after.calls - usage_before.calls
         result.usage_total_tokens = usage_after.total_tokens - usage_before.total_tokens
         result.usage_cost_usd = max(0.0, usage_after.cost_usd - usage_before.cost_usd)
+        result.usage_cached_hits = max(0, usage_after.cached_hits - usage_before.cached_hits)
     elif usage_before is not None or usage_after is not None:
         logger.warning(
             "usage snapshot incomplete (before=%s after=%s); spend footer skipped",
@@ -243,10 +279,13 @@ def format_summary(result: PipelineResult) -> str:
     ]
     lines = [f"Summary for topic={result.topic!r} source={result.source}"]
     lines.extend(f"  {label}: {value}" for label, value in rows)
+    if result.resumed:
+        lines.append(f"  resumed: {result.resumed}")
     if result.usage_calls:
+        cache_note = f" ({result.usage_cached_hits} from cache)" if result.usage_cached_hits else ""
         lines.append(
             f"  LLM spend: ${result.usage_cost_usd:.4f} across {result.usage_calls} calls"
-            f" ({result.usage_total_tokens:,} tokens)"
+            f"{cache_note} ({result.usage_total_tokens:,} tokens)"
         )
     if result.candidates:
         lines.append("Candidates:")

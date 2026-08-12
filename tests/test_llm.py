@@ -73,6 +73,116 @@ def test_call_llm_records_failed_attempt(db_session):
     assert isinstance(row.latency_ms, int) and row.latency_ms >= 0
 
 
+def _counting_completion(calls):
+    """A completion that counts invocations and returns a canned usage response."""
+    def fake(**kwargs):
+        calls["n"] += 1
+        return {
+            "choices": [{"message": {"content": "cached answer"}}],
+            "model": "groq/llama-3.1-8b-instant",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "_hidden_params": {"response_cost": 0.0001},
+        }
+
+    return fake
+
+
+def test_llm_cache_hit_skips_completion(db_session):
+    from praxis.llm import call_llm
+
+    calls = {"n": 0}
+    completion = _counting_completion(calls)
+
+    first = call_llm("same prompt", system="same system", completion=completion)
+    second = call_llm("same prompt", system="same system", completion=completion)
+
+    assert first == second == "cached answer"
+    assert calls["n"] == 1  # second call served from the cache
+    rows = db_session.scalars(select(LLMUsage)).all()
+    assert len(rows) == 2
+    miss, hit = rows
+    assert miss.cached is False
+    assert miss.cost_usd == pytest.approx(0.0001)
+    assert hit.cached is True
+    assert hit.cost_usd is None
+    assert hit.total_tokens is None
+
+
+def test_llm_cache_distinct_inputs_miss(db_session):
+    from praxis.llm import call_llm
+
+    calls = {"n": 0}
+    completion = _counting_completion(calls)
+
+    call_llm("prompt one", completion=completion)
+    call_llm("prompt two", completion=completion)
+
+    assert calls["n"] == 2
+
+
+def test_llm_cache_disabled_by_env(db_session, monkeypatch):
+    from praxis.llm import call_llm
+
+    monkeypatch.setenv("PRAXIS_LLM_CACHE", "0")
+    calls = {"n": 0}
+    completion = _counting_completion(calls)
+
+    call_llm("same prompt", completion=completion)
+    call_llm("same prompt", completion=completion)
+
+    assert calls["n"] == 2
+
+
+def test_llm_cache_seeded_row_served_without_completion(db_session):
+    from praxis.db import LLMCache
+    from praxis.llm import _cache_key, _resolve_model, call_llm
+
+    model = _resolve_model(None)
+    key = _cache_key(model, "sys", "prompt")
+    db_session.add(LLMCache(key=key, model=model, response="stored"))
+    db_session.commit()
+
+    calls = {"n": 0}
+    completion = _counting_completion(calls)
+
+    result = call_llm("prompt", system="sys", completion=completion)
+
+    assert result == "stored"
+    assert calls["n"] == 0
+
+
+def test_llm_cache_miss_persists_row(db_session):
+    from praxis.db import LLMCache
+    from praxis.llm import call_llm
+
+    call_llm("prompt", system="sys", completion=_counting_completion({"n": 0}))
+
+    rows = db_session.scalars(select(LLMCache)).all()
+    assert len(rows) == 1
+    assert rows[0].response == "cached answer"
+    assert rows[0].model == "groq/llama-3.1-8b-instant"
+
+
+def test_llm_cache_key_differs_on_system_change(db_session):
+    from praxis.llm import _cache_key, _resolve_model
+
+    model = _resolve_model(None)
+    assert _cache_key(model, "system A", "prompt") != _cache_key(model, "system B", "prompt")
+    assert _cache_key(model, "sys", "prompt A") != _cache_key(model, "sys", "prompt B")
+
+
+def test_invalidate_llm_cache_deletes_row(db_session):
+    from praxis.db import LLMCache
+    from praxis.llm import call_llm, invalidate_llm_cache
+
+    call_llm("prompt", system="sys", completion=_counting_completion({"n": 0}))
+    assert len(db_session.scalars(select(LLMCache)).all()) == 1
+
+    invalidate_llm_cache("prompt", system="sys")
+
+    assert db_session.scalars(select(LLMCache)).all() == []
+
+
 def test_recording_failure_does_not_break_call(db_session, monkeypatch):
     from praxis.llm import call_llm
 
@@ -163,18 +273,21 @@ def test_usage_summary_aggregates(db_session):
                 cost_usd=0.003,
                 latency_ms=30,
             ),
+            LLMUsage(model="m1", stage="analyst", cached=True),
         ]
     )
     db_session.commit()
 
     summary = usage_summary(session=db_session)
 
-    assert summary.totals.calls == 3
+    assert summary.totals.calls == 3  # cached hit excluded from real-call counts
+    assert summary.totals.cached_hits == 1
     assert summary.totals.total_tokens == 800
     assert summary.totals.prompt_tokens == 600
     assert summary.totals.completion_tokens == 200
     assert summary.totals.cost_usd == pytest.approx(0.006)
     assert summary.recent.calls == 3
+    assert summary.recent.cached_hits == 1
     assert summary.by_stage["analyst"].calls == 2
     assert summary.by_stage["analyst"].total_tokens == 400
     assert summary.by_stage["architect"].cost_usd == pytest.approx(0.003)

@@ -90,7 +90,7 @@ praxis run --source arxiv --topic "retrieval augmented generation" --limit 20
 praxis run --source github --topic "local vector search on CPU"
 ```
 
-`--limit` caps how many candidates the Scout keeps; `-v`/`--verbose` enables DEBUG logging. A run prints a per-batch summary:
+`--limit` caps how many candidates the Scout keeps; `-v`/`--verbose` enables DEBUG logging; `--resume` also picks up candidates left in status `new` or `failed` by earlier runs (interrupted batches continue instead of restarting, and a failed Scout degrades to the resumed candidates rather than aborting). A run prints a per-batch summary:
 
 ```
 Summary for topic='retrieval augmented generation' source=arxiv
@@ -147,7 +147,7 @@ praxis usage              # all time + last 30 days, by stage, by model
 praxis usage --days 7
 ```
 
-`praxis usage` reads the `llm_usage` ledger that every Analyst and Architect call writes to: token counts from litellm's `usage` block, estimated USD cost from litellm's auto-injected `_hidden_params["response_cost"]` (falling back to litellm pricing when absent), wall-clock latency, plus the stage and candidate the call belonged to. Failed calls (rate limits, network errors) are recorded too, so the ledger reflects attempted spend, not just successful calls. Recording is best-effort — a failed usage write logs a warning and never breaks an LLM call or a run. Every `praxis run` also prints a one-line `LLM spend:` footer so a batch's cost is visible in its summary.
+`praxis usage` reads the `llm_usage` ledger that every Analyst and Architect call writes to: token counts from litellm's `usage` block, estimated USD cost from litellm's auto-injected `_hidden_params["response_cost"]` (falling back to litellm pricing when absent), wall-clock latency, plus the stage and candidate the call belonged to. Failed calls (rate limits, network errors) are recorded too, so the ledger reflects attempted spend, not just successful calls; cache hits are recorded as zero-token rows so the report shows what the cache saved (`2 calls (1 from cache)`). Recording is best-effort — a failed usage write logs a warning and never breaks an LLM call or a run. Every `praxis run` also prints a one-line `LLM spend:` footer so a batch's cost is visible in its summary.
 
 ## Configuration
 
@@ -177,6 +177,7 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CONFIG` | path to the hardware profile YAML | `./hardware_profile.yaml` |
 | `PRAXIS_SCRATCH_ROOT` | where the Coder creates prototype directories | `./scratch` |
 | `PRAXIS_CODER_TIMEOUT_S` | timeout for the OpenCode subprocess | `600` |
+| `PRAXIS_LLM_CACHE` | disable the LLM response cache with `0`/`false` (enabled by default) | `1` |
 
 ## Testing & CI
 
@@ -197,8 +198,9 @@ Praxis is a working v1, and these are the intentional next phases:
 - **Human-in-the-loop review gate** — an approval step between Architect and Coder so no code is generated until a person signs off on the plan.
 - **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
 - **Cost/token observability (implemented)** — every Analyst/Architect call is recorded with tokens, estimated USD cost, latency, stage, and candidate; `praxis usage` reports totals, a recent window, and per-stage/per-model breakdowns, and `praxis run` prints a spend footer.
+- **LLM response caching (implemented)** — identical calls (same model + system + prompt) are served from the `llm_cache` table, so re-processing the same candidate costs nothing; any prompt or model change is a miss by construction. Disable with `PRAXIS_LLM_CACHE=0`.
+- **Pipeline resumability (implemented)** — `praxis run --resume` processes candidates left in status `new`/`failed` by earlier runs alongside new scouting, so an interrupted batch continues instead of restarting from Scout; a Scout failure degrades to the resumed candidates rather than aborting.
 - **Confidence-aware routing** — treat borderline feasibility scores (near the threshold) as a separate routing decision rather than a binary accept/reject.
-- **Pipeline resumability** — allow a run to resume from the last completed stage instead of restarting from Scout.
 - **Minimal frontend** — a thin read-only view over the ledger and prototypes; the CLI stays the source of truth.
 
 ## License

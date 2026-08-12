@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from praxis.config import HardwareProfile
 from praxis.db import Candidate, get_session
-from praxis.llm import call_llm
+from praxis.llm import call_llm, invalidate_llm_cache
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +177,9 @@ def analyze(
             "analyst: malformed LLM response for candidate %r; requesting strict JSON repair",
             candidate.url,
         )
+        # Do not let a transiently bad response freeze in the LLM cache: drop
+        # the entry so a later run gets a fresh call instead of the same junk.
+        invalidate_llm_cache(prompt, system=_system_prompt())
         response = call_llm(
             _repair_prompt(first_response),
             system=_system_prompt(),
@@ -184,6 +187,8 @@ def analyze(
             candidate_id=candidate.id,
         )
         result = _parse_response(response, threshold)
+        if result is None:
+            invalidate_llm_cache(_repair_prompt(first_response), system=_system_prompt())
 
     if result is None:
         logger.warning(

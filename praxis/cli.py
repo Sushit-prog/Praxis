@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--source", choices=["arxiv", "github", "hn"], default="arxiv")
     run.add_argument("--topic", required=True, help="Topic to scout for candidates.")
     run.add_argument("--limit", type=int, default=20, help="Max candidates to scout (default: 20).")
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Also process candidates left in status new/failed by earlier runs.",
+    )
 
     sub.add_parser("status", help="Show candidate counts by status from the database.")
 
@@ -51,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_run(args) -> int:
     from praxis.pipeline import format_summary, run
 
-    result = run(source=args.source, topic=args.topic, limit=args.limit)
+    result = run(source=args.source, topic=args.topic, limit=args.limit, resume=args.resume)
     print(format_summary(result))
     return 0
 
@@ -109,10 +114,12 @@ def _format_usage_report(summary) -> str:
     totals = summary.totals
     lines = [
         "LLM usage",
-        f"  all time: {totals.calls} calls, {totals.total_tokens:,} tokens "
+        f"  all time: {totals.calls} calls ({totals.cached_hits} from cache), "
+        f"{totals.total_tokens:,} tokens "
         f"(prompt {totals.prompt_tokens:,} / completion {totals.completion_tokens:,}), "
         f"${totals.cost_usd:.4f}",
-        f"  last {summary.days} days: {summary.recent.calls} calls, "
+        f"  last {summary.days} days: {summary.recent.calls} calls "
+        f"({summary.recent.cached_hits} from cache), "
         f"{summary.recent.total_tokens:,} tokens, ${summary.recent.cost_usd:.4f}",
         "  by stage:",
     ]

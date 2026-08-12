@@ -58,6 +58,7 @@ def seeded_db(tmp_path, monkeypatch):
                     cost_usd=0.002,
                     latency_ms=400,
                 ),
+                LLMUsage(model="groq/llama-3.1-8b-instant", stage="analyst", cached=True),
             ]
         )
         session.commit()
@@ -104,7 +105,7 @@ def test_cli_usage_prints_report(seeded_db, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "LLM usage" in out
-    assert "all time: 2 calls" in out
+    assert "all time: 2 calls (1 from cache)" in out
     assert "550 tokens" in out
     assert "$0.0030" in out
     assert "by stage:" in out

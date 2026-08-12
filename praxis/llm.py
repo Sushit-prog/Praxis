@@ -8,6 +8,7 @@ write logs a warning and never breaks the call itself.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -17,11 +18,14 @@ from typing import Any
 from litellm import completion as _default_completion
 from litellm import completion_cost as _completion_cost
 
-from praxis.db import LLMUsage, get_session
+from praxis.db import LLMCache, LLMUsage, get_session
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "groq/llama-3.1-8b-instant"
+
+# Env toggle for the response cache; caching is on unless set to 0/false/no/off.
+CACHE_ENV = "PRAXIS_LLM_CACHE"
 
 
 def _resolve_model(model: str | None) -> str:
@@ -56,6 +60,15 @@ class LLMClient:
                 {"role": "user", "content": prompt},
             ],
         }
+        cache_enabled = _cache_enabled()
+        cache_key = _cache_key(model, system, prompt) if cache_enabled else None
+        if cache_key is not None:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                logger.debug("llm: cache hit for model=%s", model)
+                _record_cache_hit(model=model, stage=stage, candidate_id=candidate_id)
+                return cached
+
         started = time.monotonic()
         try:
             response = self._completion(**kwargs)
@@ -76,7 +89,10 @@ class LLMClient:
             candidate_id=candidate_id,
             latency_ms=latency_ms,
         )
-        return response["choices"][0]["message"]["content"]
+        content = response["choices"][0]["message"]["content"]
+        if cache_key is not None:
+            _cache_put(cache_key, model=model, response=content)
+        return content
 
 
 _client: LLMClient | None = None
@@ -109,6 +125,92 @@ def call_llm(
     return client.call(
         prompt, system=system, model=model, stage=stage, candidate_id=candidate_id
     )
+
+
+# ---------------------------------------------------------------------------
+# Response cache
+# ---------------------------------------------------------------------------
+
+
+def _cache_enabled() -> bool:
+    """Response caching is on unless PRAXIS_LLM_CACHE is 0/false/no/off."""
+    raw = os.environ.get(CACHE_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _cache_key(model: str, system: str | None, prompt: str) -> str:
+    """sha256 over model + system + prompt: any change is a fresh key."""
+    material = f"{model}\0{system or ''}\0{prompt}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str) -> str | None:
+    """Return the cached response for a key, or None on miss/error."""
+    try:
+        session = get_session()
+        try:
+            row = session.get(LLMCache, key)
+            return row.response if row is not None else None
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - a cache failure is a miss, never an error
+        logger.debug("llm: cache read failed: %s", exc)
+        return None
+
+
+def _cache_put(key: str, *, model: str, response: str) -> None:
+    """Store a response, upserting on the primary key; best-effort only."""
+    try:
+        session = get_session()
+        try:
+            session.merge(LLMCache(key=key, model=model, response=response))
+            session.commit()
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - observability/caching must never break a call
+        logger.debug("llm: cache write failed: %s", exc)
+
+
+def invalidate_llm_cache(
+    prompt: str,
+    system: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Delete the cached response for an input, if one exists.
+
+    Callers that determine the cached content is unusable (e.g. the Analyst
+    failing to parse its JSON) use this so a transiently bad response is not
+    frozen in the cache and re-served on every later run.
+    """
+    key = _cache_key(_resolve_model(model), system, prompt)
+    try:
+        session = get_session()
+        try:
+            row = session.get(LLMCache, key)
+            if row is not None:
+                session.delete(row)
+                session.commit()
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - best-effort invalidation
+        logger.debug("llm: cache invalidation failed: %s", exc)
+
+
+def _record_cache_hit(*, model: str, stage: str | None, candidate_id: int | None) -> None:
+    """Record a cache hit as a zero-token usage row so savings are visible."""
+    try:
+        session = get_session()
+        try:
+            session.add(
+                LLMUsage(model=model, stage=stage, candidate_id=candidate_id, cached=True)
+            )
+            session.commit()
+        finally:
+            session.close()
+    except Exception as exc:  # noqa: BLE001 - observability must never break a call
+        logger.debug("llm: failed to record cache hit: %s", exc)
 
 
 # ---------------------------------------------------------------------------

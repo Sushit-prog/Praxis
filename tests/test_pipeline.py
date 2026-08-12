@@ -163,6 +163,170 @@ def test_run_continues_past_coder_failure(monkeypatch, hardware_profile):
     assert result.candidates[0].status == "prototype_failed"
 
 
+def test_run_resume_processes_unfinished_candidates(db_session, monkeypatch, hardware_profile):
+    """--resume reprocesses status `new`/`failed` candidates and skips finished ones."""
+    unfinished = Candidate(
+        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
+    )
+    failed = Candidate(
+        source="arxiv", url="https://failed", title="Failed", raw_text="y", status="failed"
+    )
+    done = Candidate(
+        source="arxiv", url="https://done", title="Done", raw_text="z", status="prototyped"
+    )
+    db_session.add_all([unfinished, failed, done])
+    db_session.commit()
+    for cand in (unfinished, failed, done):
+        db_session.refresh(cand)
+
+    processed = []
+
+    def fake_scout(**kwargs):
+        return []
+
+    def fake_analyze(**kwargs):
+        processed.append(kwargs["candidate"].url)
+        return _analysis_for("https://a")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run(
+        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
+    )
+
+    assert result.resumed == 2
+    assert result.discovered == 0  # scout found nothing new
+    assert set(processed) == {"https://old", "https://failed"}
+    assert "https://done" not in processed
+    assert result.analyzed == 2
+    assert result.prototyped == 2
+
+
+def test_run_resume_combines_with_new_scouting(db_session, monkeypatch, hardware_profile):
+    """Resumed and freshly scouted candidates are processed in one batch."""
+    old = Candidate(
+        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
+    )
+    db_session.add(old)
+    db_session.commit()
+    db_session.refresh(old)
+
+    fresh = _FakeCandidate("https://fresh", "Fresh")
+    processed = []
+
+    def fake_scout(**kwargs):
+        return [fresh]
+
+    def fake_analyze(**kwargs):
+        processed.append(kwargs["candidate"].url)
+        return _analysis_for("https://a")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run(
+        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
+    )
+
+    assert result.resumed == 1
+    assert result.discovered == 1
+    assert set(processed) == {"https://old", "https://fresh"}
+    assert result.analyzed == 2
+
+
+def test_run_resume_failed_again_stays_failed(db_session, monkeypatch, hardware_profile):
+    """A resumed candidate that fails again is re-marked failed, not dropped."""
+    cand = Candidate(
+        source="arxiv", url="https://boom", title="Boom", raw_text="x", status="failed"
+    )
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        return []
+
+    def fake_analyze(**kwargs):
+        raise RuntimeError("analyst boom again")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run(
+        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
+    )
+
+    assert result.resumed == 1
+    assert result.failed == 1
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "failed"
+
+
+def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_profile):
+    """With resume, a scout failure still processes the unfinished candidates."""
+    cand = Candidate(
+        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
+    )
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        raise RuntimeError("network down")
+
+    def fake_analyze(**kwargs):
+        return _analysis_for("https://a")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run(
+        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
+    )
+
+    assert result.resumed == 1
+    assert result.analyzed == 1
+    assert result.prototyped == 1
+
+
+def test_run_without_resume_ignores_existing_candidates(db_session, monkeypatch, hardware_profile):
+    """Default run leaves pre-existing candidates untouched."""
+    cand = Candidate(
+        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
+    )
+    db_session.add(cand)
+    db_session.commit()
+
+    def fake_scout(**kwargs):
+        return []
+
+    seen = {}
+
+    def fake_analyze(**kwargs):
+        seen["called"] = True
+        return _analysis_for("https://a")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    assert result.discovered == 0
+    assert result.resumed == 0
+    assert "called" not in seen
+
+
 def test_run_reports_usage_delta(db_session, monkeypatch, hardware_profile):
     """Usage rows written during a run show up in the result and summary."""
     cand = _FakeCandidate("https://a", "A")

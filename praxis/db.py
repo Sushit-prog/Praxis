@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -87,6 +88,23 @@ class LLMUsage(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class LLMCache(Base):
+    """Cached LLM responses keyed by a hash of model + system + prompt.
+
+    Re-processing the same candidate with identical inputs is served from here
+    instead of spending another LLM call; the key is a full sha256 of the input
+    material, so any prompt or model change is a cache miss by construction.
+    """
+
+    __tablename__ = "llm_cache"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128))
+    response: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 def _db_url() -> str:
@@ -152,6 +170,7 @@ class UsageTotals:
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    cached_hits: int = 0
 
 
 @dataclass
@@ -166,7 +185,11 @@ class UsageSummary:
 
 
 def usage_totals(*, session=None, since: datetime | None = None) -> UsageTotals:
-    """Aggregate token/cost totals over recorded LLM calls, optionally since a date."""
+    """Aggregate token/cost totals over recorded LLM calls, optionally since a date.
+
+    Cached hits carry zero tokens/cost and are counted separately so the spend
+    figures stay accurate while still surfacing what the cache saved.
+    """
     owns_session = session is None
     session = session or get_session()
     try:
@@ -176,16 +199,23 @@ def usage_totals(*, session=None, since: datetime | None = None) -> UsageTotals:
             func.coalesce(func.sum(LLMUsage.completion_tokens), 0),
             func.coalesce(func.sum(LLMUsage.total_tokens), 0),
             func.coalesce(func.sum(LLMUsage.cost_usd), 0.0),
-        )
+        ).where(LLMUsage.cached.is_(False))
         if since is not None:
             stmt = stmt.where(LLMUsage.created_at >= since)
         count, prompt, completion, total, cost = session.execute(stmt).one()
+
+        hits_stmt = select(func.count(LLMUsage.id)).where(LLMUsage.cached.is_(True))
+        if since is not None:
+            hits_stmt = hits_stmt.where(LLMUsage.created_at >= since)
+        cached_hits = session.execute(hits_stmt).scalar_one()
+
         return UsageTotals(
             calls=count,
             prompt_tokens=prompt,
             completion_tokens=completion,
             total_tokens=total,
             cost_usd=float(cost),
+            cached_hits=cached_hits,
         )
     finally:
         if owns_session:
@@ -193,7 +223,7 @@ def usage_totals(*, session=None, since: datetime | None = None) -> UsageTotals:
 
 
 def _usage_grouped(session, column) -> dict[str | None, UsageTotals]:
-    """Group usage totals by a column (stage or model)."""
+    """Group usage totals by a column (stage or model); cache hits excluded."""
     rows = session.execute(
         select(
             column,
@@ -202,7 +232,9 @@ def _usage_grouped(session, column) -> dict[str | None, UsageTotals]:
             func.coalesce(func.sum(LLMUsage.completion_tokens), 0),
             func.coalesce(func.sum(LLMUsage.total_tokens), 0),
             func.coalesce(func.sum(LLMUsage.cost_usd), 0.0),
-        ).group_by(column)
+        )
+        .where(LLMUsage.cached.is_(False))
+        .group_by(column)
     ).all()
     return {
         key: UsageTotals(
