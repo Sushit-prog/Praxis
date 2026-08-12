@@ -76,6 +76,7 @@ class PipelineResult:
     discovered: int = 0
     analyzed: int = 0
     rejected: int = 0
+    borderline: int = 0
     blueprinted: int = 0
     prototyped: int = 0
     failed: int = 0
@@ -192,6 +193,14 @@ def run(
             result.candidates.append(CandidateOutcome(title=title, url=url, status="rejected"))
             continue
 
+        if analysis.borderline:
+            # Confidence-aware routing: scores inside the threshold band are
+            # held for review rather than auto-built or silently rejected.
+            logger.info("analyst flagged %s as borderline", url)
+            result.borderline += 1
+            result.candidates.append(CandidateOutcome(title=title, url=url, status="borderline"))
+            continue
+
         result.analyzed += 1
         logger.info("analyst accepted %s", url)
 
@@ -273,6 +282,7 @@ def format_summary(result: PipelineResult) -> str:
         ("discovered", result.discovered),
         ("analyzed", result.analyzed),
         ("rejected", result.rejected),
+        ("borderline", result.borderline),
         ("blueprinted", result.blueprinted),
         ("prototyped", result.prototyped),
         ("failed", result.failed),

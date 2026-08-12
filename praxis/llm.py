@@ -27,6 +27,9 @@ DEFAULT_MODEL = "groq/llama-3.1-8b-instant"
 # Env toggle for the response cache; caching is on unless set to 0/false/no/off.
 CACHE_ENV = "PRAXIS_LLM_CACHE"
 
+# Comma-separated models tried after the primary when it fails (rate limit, outage).
+FALLBACKS_ENV = "PRAXIS_FALLBACK_MODELS"
+
 
 def _resolve_model(model: str | None) -> str:
     return model or os.environ.get("PRAXIS_MODEL") or DEFAULT_MODEL
@@ -60,38 +63,52 @@ class LLMClient:
                 {"role": "user", "content": prompt},
             ],
         }
+        # Try the primary model, then any configured fallbacks. The cache is
+        # checked per attempted model (so a cached fallback result is served
+        # when the primary is down), and each failed attempt is recorded so the
+        # usage ledger shows the full attempt story.
         cache_enabled = _cache_enabled()
-        cache_key = _cache_key(model, system, prompt) if cache_enabled else None
-        if cache_key is not None:
-            cached = _cache_get(cache_key)
-            if cached is not None:
-                logger.debug("llm: cache hit for model=%s", model)
-                _record_cache_hit(model=model, stage=stage, candidate_id=candidate_id)
-                return cached
+        errors: list[Exception] = []
+        for attempt_model in (model, *_fallback_models()):
+            attempt_key = _cache_key(attempt_model, system, prompt) if cache_enabled else None
+            if attempt_key is not None:
+                cached = _cache_get(attempt_key)
+                if cached is not None:
+                    logger.debug("llm: cache hit for model=%s", attempt_model)
+                    _record_cache_hit(model=attempt_model, stage=stage, candidate_id=candidate_id)
+                    return cached
 
-        started = time.monotonic()
-        try:
-            response = self._completion(**kwargs)
-        except Exception as exc:  # noqa: BLE001 - record the attempt, then propagate
-            _record_failure(
-                exc,
-                model=model,
-                stage=stage,
-                candidate_id=candidate_id,
-                latency_ms=_elapsed_ms(started),
-            )
-            raise
+            kwargs["model"] = attempt_model
+            started = time.monotonic()
+            try:
+                response = self._completion(**kwargs)
+                break
+            except Exception as exc:  # noqa: BLE001 - record the attempt, then try the next model
+                errors.append(exc)
+                _record_failure(
+                    exc,
+                    model=attempt_model,
+                    stage=stage,
+                    candidate_id=candidate_id,
+                    latency_ms=_elapsed_ms(started),
+                )
+                logger.warning("llm: model %s failed (%s)", attempt_model, exc)
+        else:
+            raise errors[-1]
+
         latency_ms = _elapsed_ms(started)
         _record_usage(
             response,
-            model=model,
+            model=attempt_model,
             stage=stage,
             candidate_id=candidate_id,
             latency_ms=latency_ms,
         )
         content = response["choices"][0]["message"]["content"]
-        if cache_key is not None:
-            _cache_put(cache_key, model=model, response=content)
+        if cache_enabled:
+            _cache_put(
+                _cache_key(attempt_model, system, prompt), model=attempt_model, response=content
+            )
         return content
 
 
@@ -138,6 +155,14 @@ def _cache_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _fallback_models() -> list[str]:
+    """Models tried after the primary, from PRAXIS_FALLBACK_MODELS (comma-separated)."""
+    raw = os.environ.get(FALLBACKS_ENV)
+    if not raw:
+        return []
+    return [model.strip() for model in raw.split(",") if model.strip()]
 
 
 def _cache_key(model: str, system: str | None, prompt: str) -> str:

@@ -171,6 +171,85 @@ def test_llm_cache_key_differs_on_system_change(db_session):
     assert _cache_key(model, "sys", "prompt A") != _cache_key(model, "sys", "prompt B")
 
 
+def test_llm_falls_back_to_next_model_on_failure(db_session, monkeypatch):
+    from praxis.llm import _resolve_model, call_llm
+
+    primary = _resolve_model(None)
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "fallback-model")
+    models_used = []
+
+    def fake_completion(**kwargs):
+        models_used.append(kwargs["model"])
+        if kwargs["model"] == primary:
+            raise RuntimeError("rate limited")
+        return {
+            "choices": [{"message": {"content": "recovered"}}],
+            "model": "fallback-model",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "_hidden_params": {"response_cost": 0.0001},
+        }
+
+    result = call_llm("prompt", completion=fake_completion)
+
+    assert result == "recovered"
+    assert models_used == [primary, "fallback-model"]
+    rows = db_session.scalars(select(LLMUsage)).all()
+    assert len(rows) == 2  # failed attempt + successful fallback call
+    errors = [r for r in rows if r.error]
+    successes = [r for r in rows if r.error is None]
+    assert errors[0].model == primary
+    assert errors[0].error == "rate limited"
+    assert successes[0].model == "fallback-model"
+    assert successes[0].cost_usd == pytest.approx(0.0001)
+
+
+def test_llm_fallback_result_served_from_cache(db_session, monkeypatch):
+    """A cached fallback response is served when the primary is still down."""
+    from praxis.llm import _resolve_model, call_llm
+
+    primary = _resolve_model(None)
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "fb-model")
+    calls = {"n": 0}
+
+    def fake_completion(**kwargs):
+        calls["n"] += 1
+        if kwargs["model"] == primary:
+            raise RuntimeError("rate limited")
+        return {
+            "choices": [{"message": {"content": "recovered"}}],
+            "model": "fb-model",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "_hidden_params": {"response_cost": 0.0001},
+        }
+
+    assert call_llm("prompt", completion=fake_completion) == "recovered"
+    # Second call: primary fails again, but the fallback response is cached,
+    # so no second fallback completion call happens.
+    assert call_llm("prompt", completion=fake_completion) == "recovered"
+    assert calls["n"] == 3  # primary fail + fallback (call 1); primary fail only (call 2)
+    hits = db_session.scalars(select(LLMUsage).where(LLMUsage.cached.is_(True))).all()
+    assert len(hits) == 1
+
+
+def test_llm_all_models_fail_raises(db_session, monkeypatch):
+    from praxis.llm import call_llm
+
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "fb1, fb2")
+    calls = {"n": 0}
+
+    def fake_completion(**kwargs):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        call_llm("prompt", completion=fake_completion)
+
+    assert calls["n"] == 3  # primary + two fallbacks
+    rows = db_session.scalars(select(LLMUsage)).all()
+    assert len(rows) == 3  # one failure row per attempted model
+    assert all(r.error == "boom" for r in rows)
+
+
 def test_invalidate_llm_cache_deletes_row(db_session):
     from praxis.db import LLMCache
     from praxis.llm import call_llm, invalidate_llm_cache

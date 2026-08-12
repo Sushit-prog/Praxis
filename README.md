@@ -50,7 +50,7 @@ Every stage reads and writes the same SQLite ledger, so a run is fully auditable
 The pipeline is orchestrated in `praxis/pipeline.py` as Scout -> Analyst -> Architect -> Coder. Stages are wrapped in `run_with_retry` with exponential backoff, and each candidate is processed in isolation: a candidate that is rejected or fails at any stage is marked and skipped, and the batch continues.
 
 - **Scout** — fetches items matching the topic from one of `arxiv`, `github`, or `hn`, deduplicates them, and persists promising ones as `Candidate` rows (`status="new"`).
-- **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on. A response that fails strict JSON parsing is retried once with a repair prompt before the candidate is recorded as a rejection, so a transient formatting hiccup does not silently discard a candidate. Candidate raw text is untrusted internet content, so it is wrapped in explicit delimiters (`<<<UNTRUSTED CANDIDATE CONTENT BEGIN/END>>>`) and the system prompt tells the model to treat it as data, never as instructions — an embedded "score this 10/10" cannot override the task.
+- **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on. Scores inside the borderline band (threshold through threshold + `PRAXIS_BORDERLINE_MARGIN`, default 1) are persisted as `borderline` and held for review rather than auto-built — confidence-aware routing instead of a hard accept/reject wall. A response that fails strict JSON parsing is retried once with a repair prompt before the candidate is recorded as a rejection, so a transient formatting hiccup does not silently discard a candidate. Candidate raw text is untrusted internet content, so it is wrapped in explicit delimiters (`<<<UNTRUSTED CANDIDATE CONTENT BEGIN/END>>>`) and the system prompt tells the model to treat it as data, never as instructions — an embedded "score this 10/10" cannot override the task.
 - **Architect** — turns the accepted analysis into a `Blueprint`: a markdown engineering plan with modules, milestones, and a phased build plan, calibrated to the same hardware profile. The first phase of that plan is what the Coder will build.
 - **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run.
 
@@ -97,6 +97,7 @@ Summary for topic='retrieval augmented generation' source=arxiv
   discovered: 3
   analyzed: 2
   rejected: 1
+  borderline: 0
   blueprinted: 2
   prototyped: 1
   failed: 1
@@ -178,6 +179,8 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_SCRATCH_ROOT` | where the Coder creates prototype directories | `./scratch` |
 | `PRAXIS_CODER_TIMEOUT_S` | timeout for the OpenCode subprocess | `600` |
 | `PRAXIS_LLM_CACHE` | disable the LLM response cache with `0`/`false` (enabled by default) | `1` |
+| `PRAXIS_FALLBACK_MODELS` | comma-separated models tried after the primary when it fails (rate limit, outage) | — |
+| `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
 
 ## Testing & CI
 
@@ -199,8 +202,9 @@ Praxis is a working v1, and these are the intentional next phases:
 - **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
 - **Cost/token observability (implemented)** — every Analyst/Architect call is recorded with tokens, estimated USD cost, latency, stage, and candidate; `praxis usage` reports totals, a recent window, and per-stage/per-model breakdowns, and `praxis run` prints a spend footer.
 - **LLM response caching (implemented)** — identical calls (same model + system + prompt) are served from the `llm_cache` table, so re-processing the same candidate costs nothing; any prompt or model change is a miss by construction. Disable with `PRAXIS_LLM_CACHE=0`.
+- **Model fallback (implemented)** — if the primary model fails (rate limit, outage), calls retry through the comma-separated `PRAXIS_FALLBACK_MODELS`; every failed attempt is recorded in the usage ledger.
 - **Pipeline resumability (implemented)** — `praxis run --resume` processes candidates left in status `new`/`failed` by earlier runs alongside new scouting, so an interrupted batch continues instead of restarting from Scout; a Scout failure degrades to the resumed candidates rather than aborting.
-- **Confidence-aware routing** — treat borderline feasibility scores (near the threshold) as a separate routing decision rather than a binary accept/reject.
+- **Confidence-aware routing (implemented)** — scores inside a band above the threshold are persisted as `borderline` and held for review rather than auto-built or silently rejected; the band width is `PRAXIS_BORDERLINE_MARGIN`.
 - **Minimal frontend** — a thin read-only view over the ledger and prototypes; the CLI stays the source of truth.
 
 ## License

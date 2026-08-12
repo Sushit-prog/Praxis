@@ -322,6 +322,90 @@ def test_analyze_injection_stays_inside_delimiter(db_session, hardware_profile, 
     assert result.feasibility_score == 2
 
 
+def _analyze_with_score(
+    db_session, hardware_profile, monkeypatch, score, *, rejected=False, margin=None
+):
+    cand = make_candidate(db_session)
+    mock_call_llm(
+        monkeypatch,
+        {
+            "technique_summary": "x",
+            "feasibility_score": score,
+            "feasibility_reasoning": "y",
+            "rejected": rejected,
+        },
+    )
+    return analyze(cand, hardware_profile, margin=margin)
+
+
+def test_analyze_score_at_threshold_is_borderline(db_session, hardware_profile, monkeypatch):
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 4)
+
+    assert result.borderline is True
+    assert result.rejected is False
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "borderline"
+
+
+def test_analyze_score_within_margin_is_borderline(db_session, hardware_profile, monkeypatch):
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 5)
+
+    assert result.borderline is True
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "borderline"
+
+
+def test_analyze_score_clear_of_threshold_is_not_borderline(
+    db_session, hardware_profile, monkeypatch
+):
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 7)
+
+    assert result.borderline is False
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "analyzed"
+
+
+def test_analyze_explicit_reject_never_borderline(db_session, hardware_profile, monkeypatch):
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 9, rejected=True)
+
+    assert result.rejected is True
+    assert result.borderline is False
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "rejected"
+
+
+def test_analyze_score_below_threshold_rejected_not_borderline(
+    db_session, hardware_profile, monkeypatch
+):
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 3)
+
+    assert result.rejected is True
+    assert result.borderline is False
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "rejected"
+
+
+def test_analyze_borderline_margin_via_env(db_session, hardware_profile, monkeypatch):
+    monkeypatch.setenv("PRAXIS_BORDERLINE_MARGIN", "2")
+
+    result = _analyze_with_score(db_session, hardware_profile, monkeypatch, 6)
+
+    assert result.borderline is True  # within threshold 4 + margin 2
+
+
+def test_analyze_borderline_margin_explicit_param(db_session, hardware_profile, monkeypatch):
+    """margin=0 narrows the band to exactly the threshold."""
+    at_threshold = _analyze_with_score(db_session, hardware_profile, monkeypatch, 4, margin=0)
+    assert at_threshold.borderline is True
+
+    clear = _analyze_with_score(db_session, hardware_profile, monkeypatch, 5, margin=0)
+    assert clear.borderline is False
+
+    db_session.expire_all()
+    assert db_session.get(Candidate, 1).status == "borderline"
+    assert db_session.get(Candidate, 2).status == "analyzed"
+
+
 def test_analyze_invalidates_cache_on_parse_failure(db_session, hardware_profile, monkeypatch):
     """Malformed responses drop their cache entries so they cannot freeze."""
     cand = make_candidate(db_session)

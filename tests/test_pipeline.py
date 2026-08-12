@@ -18,9 +18,11 @@ class _FakeCandidate:
 
 
 def _analysis_for(url):
+    # Score 6: clear of the default threshold (4) plus the borderline margin (1),
+    # so the standard flow tests are never accidentally routed as borderline.
     return AnalysisResult(
         technique_summary="t",
-        feasibility_score=5,
+        feasibility_score=6,
         feasibility_reasoning="r",
         rejected=url.endswith("-no"),
     )
@@ -109,6 +111,42 @@ def test_run_all_rejected_skips_coder(monkeypatch, hardware_profile):
     assert result.rejected == 1
     assert result.prototyped == 0
     assert coder_calls == {}
+
+
+def test_run_borderline_routes_separately(db_session, monkeypatch, hardware_profile):
+    """A borderline analysis is held for review, not built or rejected."""
+    cand = _FakeCandidate("https://a", "A")
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        return AnalysisResult(
+            technique_summary="t",
+            feasibility_score=5,
+            feasibility_reasoning="r",
+            rejected=False,
+            borderline=True,
+        )
+
+    architect_calls = {"n": 0}
+
+    def fake_architect(**kwargs):
+        architect_calls["n"] += 1
+        return "# ok"
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    assert result.borderline == 1
+    assert result.analyzed == 0
+    assert result.blueprinted == 0
+    assert result.candidates[0].status == "borderline"
+    assert architect_calls["n"] == 0
 
 
 def test_run_continues_past_analyst_failure(monkeypatch, hardware_profile):

@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FEASIBILITY_THRESHOLD = 4
 THRESHOLD_ENV = "PRAXIS_FEASIBILITY_THRESHOLD"
+DEFAULT_BORDERLINE_MARGIN = 1
+MARGIN_ENV = "PRAXIS_BORDERLINE_MARGIN"
 MAX_RAW_TEXT_CHARS = 6000
 
 # Delimiters marking candidate raw text as untrusted data. Anything between
@@ -31,6 +33,7 @@ class AnalysisResult:
     feasibility_score: int
     feasibility_reasoning: str
     rejected: bool
+    borderline: bool = False
 
 
 def _resolve_threshold(threshold: int | None) -> int:
@@ -43,6 +46,19 @@ def _resolve_threshold(threshold: int | None) -> int:
         except ValueError:
             logger.warning("invalid %s=%r; using default", THRESHOLD_ENV, raw)
     return DEFAULT_FEASIBILITY_THRESHOLD
+
+
+def _resolve_margin(margin: int | None) -> int:
+    """Resolve the borderline band width around the threshold (clamped >= 0)."""
+    if margin is not None:
+        return max(0, margin)
+    raw = os.environ.get(MARGIN_ENV)
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("invalid %s=%r; using default", MARGIN_ENV, raw)
+    return DEFAULT_BORDERLINE_MARGIN
 
 
 def _system_prompt() -> str:
@@ -125,7 +141,9 @@ def _extract_json(text: str) -> str:
     return stripped.strip()
 
 
-def _parse_response(text: str, threshold: int) -> AnalysisResult | None:
+def _parse_response(
+    text: str, threshold: int, margin: int = DEFAULT_BORDERLINE_MARGIN
+) -> AnalysisResult | None:
     """Parse the LLM reply into an AnalysisResult, or None if malformed."""
     try:
         data = json.loads(_extract_json(text))
@@ -140,12 +158,17 @@ def _parse_response(text: str, threshold: int) -> AnalysisResult | None:
         return None
     score = max(0, min(10, score))
 
-    rejected = bool(data.get("rejected", score < threshold))
+    rejected = bool(data.get("rejected", score < threshold)) or score < threshold
+    # Borderline: accepted but close enough to the threshold that it is routed
+    # for review rather than built outright or silently rejected. The band is
+    # clamped to the score ceiling (0-10) so a wide margin cannot misclassify.
+    borderline = not rejected and threshold <= score <= min(threshold + margin, 10)
     return AnalysisResult(
         technique_summary=str(data.get("technique_summary", "")).strip(),
         feasibility_score=score,
         feasibility_reasoning=str(data.get("feasibility_reasoning", "")).strip(),
-        rejected=rejected or score < threshold,
+        rejected=rejected,
+        borderline=borderline,
     )
 
 
@@ -162,16 +185,18 @@ def analyze(
     candidate: Candidate,
     profile: HardwareProfile,
     threshold: int | None = None,
+    margin: int | None = None,
 ) -> AnalysisResult:
     """Extract and score a candidate's technique, persisting status + analysis."""
     threshold = _resolve_threshold(threshold)
+    margin = _resolve_margin(margin)
     prompt = _build_prompt(candidate, profile)
     response = call_llm(
         prompt, system=_system_prompt(), stage="analyst", candidate_id=candidate.id
     )
     first_response = response
 
-    result = _parse_response(response, threshold)
+    result = _parse_response(response, threshold, margin)
     if result is None:
         logger.warning(
             "analyst: malformed LLM response for candidate %r; requesting strict JSON repair",
@@ -186,7 +211,7 @@ def analyze(
             stage="analyst",
             candidate_id=candidate.id,
         )
-        result = _parse_response(response, threshold)
+        result = _parse_response(response, threshold, margin)
         if result is None:
             invalidate_llm_cache(_repair_prompt(first_response), system=_system_prompt())
 
@@ -204,7 +229,12 @@ def analyze(
         if stored is None:
             stored = candidate
             session.add(stored)
-        stored.status = "rejected" if result.rejected else "analyzed"
+        if result.rejected:
+            stored.status = "rejected"
+        elif result.borderline:
+            stored.status = "borderline"
+        else:
+            stored.status = "analyzed"
         stored.technique_summary = result.technique_summary
         stored.feasibility_score = result.feasibility_score
         stored.feasibility_reasoning = result.feasibility_reasoning
