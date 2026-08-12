@@ -38,18 +38,19 @@ Praxis runs a four-stage agent pipeline over a batch of research candidates, per
    | SQLite              |
    | candidates ·        |
    | blueprints ·        |
+   | llm usage ·         |
    | prototype paths     |
    +---------------------+
 ```
 
-Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder delegates code generation to the OpenCode CLI as a separate subprocess rather than making an LLM call of its own.
+Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder delegates code generation to the OpenCode CLI as a separate subprocess rather than making an LLM call of its own. Every LLM call is also recorded to the `llm_usage` table (tokens, estimated cost, latency, stage, candidate), so spend is measurable against the `monthly_budget_usd` constraint.
 
 ## How it works
 
 The pipeline is orchestrated in `praxis/pipeline.py` as Scout -> Analyst -> Architect -> Coder. Stages are wrapped in `run_with_retry` with exponential backoff, and each candidate is processed in isolation: a candidate that is rejected or fails at any stage is marked and skipped, and the batch continues.
 
 - **Scout** — fetches items matching the topic from one of `arxiv`, `github`, or `hn`, deduplicates them, and persists promising ones as `Candidate` rows (`status="new"`).
-- **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on.
+- **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on. A response that fails strict JSON parsing is retried once with a repair prompt before the candidate is recorded as a rejection, so a transient formatting hiccup does not silently discard a candidate.
 - **Architect** — turns the accepted analysis into a `Blueprint`: a markdown engineering plan with modules, milestones, and a phased build plan, calibrated to the same hardware profile. The first phase of that plan is what the Coder will build.
 - **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run.
 
@@ -80,7 +81,7 @@ pip install -e ".[dev]"
 
 ## Usage
 
-All three commands are installed as the `praxis` entrypoint.
+All five commands are installed as the `praxis` entrypoint.
 
 Run the full pipeline for a topic (defaults to `arxiv`, up to 20 candidates):
 
@@ -99,6 +100,7 @@ Summary for topic='retrieval augmented generation' source=arxiv
   blueprinted: 2
   prototyped: 1
   failed: 1
+  LLM spend: $0.0042 across 5 calls (13,120 tokens)
 Candidates:
   - Realtime RAG with an index cache [prototyped] (scratch/proto-7-20260805-120000)
   - Compact embeddings on CPU [rejected]
@@ -127,7 +129,25 @@ Print a candidate's blueprint markdown:
 praxis show 42
 ```
 
+Evaluate the Analyst and Architect against the hand-labeled golden set:
+
+```bash
+praxis eval                     # uses the bundled tests/fixtures/golden_candidates.json
+praxis eval --golden my_set.json --threshold 5
+```
+
+`praxis eval` runs every Agent call against a throwaway SQLite database, so it never touches your real ledger. It exits 0 when every fixture matches its expected verdict and score band and every blueprint passes the deterministic rubric (required sections, hardware-scoped architecture, no GPU/CUDA on a CPU-only profile, RAM within profile, phased milestones); it exits 1 otherwise. Eval runs are **manual by design** — CI stays free and deterministic, and you run `praxis eval` when you change prompts, models, or the golden set itself. The default golden path assumes a repo checkout; pass `--golden` to point at your own set.
+
 The Coder stage requires `opencode` on your PATH and authenticated (`opencode auth login`). The exact invocation lives in `praxis/agents/coder.py:_invoke_opencode`.
+
+Track LLM token spend against the budget:
+
+```bash
+praxis usage              # all time + last 30 days, by stage, by model
+praxis usage --days 7
+```
+
+`praxis usage` reads the `llm_usage` ledger that every Analyst and Architect call writes to: token counts from litellm's `usage` block, estimated USD cost from litellm's auto-injected `_hidden_params["response_cost"]` (falling back to litellm pricing when absent), wall-clock latency, plus the stage and candidate the call belonged to. Failed calls (rate limits, network errors) are recorded too, so the ledger reflects attempted spend, not just successful calls. Recording is best-effort — a failed usage write logs a warning and never breaks an LLM call or a run. Every `praxis run` also prints a one-line `LLM spend:` footer so a batch's cost is visible in its summary.
 
 ## Configuration
 
@@ -161,20 +181,21 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 ## Testing & CI
 
 ```bash
-pytest        # 54 tests
+pytest        # full suite
 ruff check .  # lint
 ```
 
-CI (`.github/workflows/ci.yml`) installs the package with dev extras and runs `ruff check .` then `pytest` on both Python 3.11 and 3.12. Tests mock the LLM client, HTTP fetches, and the OpenCode subprocess, so the suite runs offline and deterministically.
+CI (`.github/workflows/ci.yml`) installs the package with dev extras and runs `ruff check .` then `pytest` on both Python 3.11 and 3.12. Tests mock the LLM client, HTTP fetches, the OpenCode subprocess, and the eval-harness agent calls, so the suite runs offline and deterministically. The golden-set fixtures under `tests/fixtures/` are used by both the eval tests and `praxis eval` itself.
 
 ## Roadmap
 
 Praxis is a working v1, and these are the intentional next phases:
 
+- **Golden-set evaluation (implemented)** — `praxis eval` regression-checks the Analyst and Architect against hand-labeled fixtures with a deterministic rubric; LLM-as-judge scoring and an adversarial prompt-injection fixture are future work.
 - **Coder guardrails** — structural isolation on the OpenCode invocation plus a circuit-breaker on its tool calls, so a runaway prototype draft cannot burn unbounded time or tokens.
 - **Human-in-the-loop review gate** — an approval step between Architect and Coder so no code is generated until a person signs off on the plan.
 - **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
-- **Cost/token observability** — per-run and per-candidate spend accounting against `monthly_budget_usd`.
+- **Cost/token observability (implemented)** — every Analyst/Architect call is recorded with tokens, estimated USD cost, latency, stage, and candidate; `praxis usage` reports totals, a recent window, and per-stage/per-model breakdowns, and `praxis run` prints a spend footer.
 - **Confidence-aware routing** — treat borderline feasibility scores (near the threshold) as a separate routing decision rather than a binary accept/reject.
 - **Pipeline resumability** — allow a run to resume from the last completed stage instead of restarting from Scout.
 - **Minimal frontend** — a thin read-only view over the ledger and prototypes; the CLI stays the source of truth.

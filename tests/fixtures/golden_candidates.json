@@ -1,0 +1,122 @@
+[
+  {
+    "id": "cpu-finetune-small-transformer",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2401.00001",
+    "title": "Parameter-Efficient Fine-Tuning of Small Transformers for Text Classification",
+    "raw_text": "We study parameter-efficient fine-tuning of small transformer models (under 200M parameters) for text classification. LoRA adapters keep the base model frozen, cutting optimizer state and memory to a few hundred megabytes. Training a classification head plus adapters for three epochs completes in under two hours on a mid-range laptop CPU. We report accuracy within 1.5 points of full fine-tuning while using an order of magnitude less memory.",
+    "expected_verdict": "accept",
+    "score_min": 5,
+    "score_max": 10
+  },
+  {
+    "id": "local-vector-search-on-cpu",
+    "source": "github",
+    "url": "https://github.com/example/cpu-vector-search",
+    "title": "cpu-vector-search: HNSW-style search that never touches a GPU",
+    "raw_text": "A from-scratch vector search library that runs entirely on CPU. Implements an HNSW-style graph index with 128-dim float32 embeddings, brute-force and approximate search, and single-threaded and parallel query paths. A 1M-vector index fits in about 200MB of RAM. No GPU code anywhere; benchmarks compare against faiss-cpu only.",
+    "expected_verdict": "accept",
+    "score_min": 5,
+    "score_max": 10
+  },
+  {
+    "id": "train-70b-from-scratch",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2402.00002",
+    "title": "Training a 70B-Parameter Dense LLM from Scratch on Two Trillion Tokens",
+    "raw_text": "We train a 70-billion-parameter dense decoder-only model from scratch on two trillion tokens using a cluster of 1024 A100 GPUs for six months. Pipeline parallelism, ZeRO-3 sharding, and tensor-parallel embeddings are required throughout. Total compute is roughly 2.5e25 FLOPs. Loss curves show no saturation, suggesting additional scale would help.",
+    "expected_verdict": "reject",
+    "score_min": 0,
+    "score_max": 3
+  },
+  {
+    "id": "multi-gpu-diffusion",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2403.00003",
+    "title": "Scaling Text-to-Image Diffusion to Five Billion Image-Text Pairs",
+    "raw_text": "We propose a large-scale text-to-image diffusion model trained on five billion image-text pairs across eight A100 GPUs per node. Inference requires over 40GB of VRAM in fp16 and uses classifier-free guidance with a 3B-parameter UNet and a frozen CLIP text encoder. Distillation to a smaller student model is left as future work.",
+    "expected_verdict": "reject",
+    "score_min": 0,
+    "score_max": 3
+  },
+  {
+    "id": "small-rag-pipeline",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2404.00004",
+    "title": "A Compact Retrieval-Augmented Generation Pipeline for CPU-Only Machines",
+    "raw_text": "We build a retrieval-augmented generation pipeline using a 33M-parameter embedding model and a 1.5B-parameter reader, both running in fp16 on an 8GB CPU-only machine. An index of ten thousand documents fits entirely in memory. End-to-end latency stays under four seconds per query, and memory peaks at roughly 5.5GB. A streaming mode trades a little accuracy for faster first tokens.",
+    "expected_verdict": "accept",
+    "score_min": 4,
+    "score_max": 7
+  },
+  {
+    "id": "realtime-video-superresolution",
+    "source": "hn",
+    "url": "https://news.ycombinator.com/item?id=100001",
+    "title": "Show HN: Real-time 4x video super-resolution with RIFE-style optical flow",
+    "raw_text": "Real-time 4x video super-resolution at 60fps using an RIFE-style optical flow model. Requires an RTX 3090 for realtime throughput; the CPU fallback runs at roughly 2fps on an eight-core machine. Model weights are 200MB and the flow estimation stage alone uses 11GB of GPU memory.",
+    "expected_verdict": "reject",
+    "score_min": 0,
+    "score_max": 3
+  },
+  {
+    "id": "cli-structured-extraction",
+    "source": "github",
+    "url": "https://github.com/example/struct-extract",
+    "title": "struct-extract: dependency-free CLI for extracting records from messy text",
+    "raw_text": "A dependency-free Python CLI that extracts structured records (dates, names, amounts) from messy text using regex rules plus a small scoring pass to resolve conflicts. Pure standard library, no LLM required. Processes 100k documents in a few minutes on a single core with peak memory under 300MB. Ships a YAML rule file so users can add custom record types.",
+    "expected_verdict": "accept",
+    "score_min": 6,
+    "score_max": 10
+  },
+  {
+    "id": "imagenet-vit-pretraining",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2405.00005",
+    "title": "Pretraining a Vision Transformer from Scratch on ImageNet-1K",
+    "raw_text": "We pretrain an 86M-parameter Vision Transformer on ImageNet-1K from scratch using eight NVIDIA V100 GPUs for 90 epochs with a batch size of 4096 and gradient accumulation. Mixed-precision training is mandatory to fit the optimizer state. Distillation to a CPU-friendly student is mentioned only as a downstream idea.",
+    "expected_verdict": "reject",
+    "score_min": 0,
+    "score_max": 3
+  },
+  {
+    "id": "markdown-parser-library",
+    "source": "github",
+    "url": "https://github.com/example/pure-md",
+    "title": "pure-md: a spec-compliant CommonMark parser in pure Python",
+    "raw_text": "A spec-compliant CommonMark markdown parser written in pure Python with zero dependencies. A tokenizer and AST builder run in linear time, tested against over 600 spec cases, and used in production for static site generation. Includes an HTML renderer and a JSON AST serializer. Memory use stays well under 50MB even for very long documents.",
+    "expected_verdict": "accept",
+    "score_min": 7,
+    "score_max": 10
+  },
+  {
+    "id": "protein-folding-prediction",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2406.00006",
+    "title": "A Novel Approach to Protein Structure Prediction with MSA on HPC",
+    "raw_text": "We present a novel approach to protein structure prediction that requires roughly 5000 GPU-hours per target and 128GB of RAM for the multiple sequence alignment stage. A single fold takes two to three days on an HPC cluster with 64 cores and four A100s. The paper focuses on accuracy gains over baselines rather than efficiency.",
+    "expected_verdict": "reject",
+    "score_min": 0,
+    "score_max": 3
+  },
+  {
+    "id": "long-context-summarization-cpu",
+    "source": "arxiv",
+    "url": "https://arxiv.org/abs/2407.00007",
+    "title": "Two-Pass Summarization of 100k-Token Documents on an 8GB Laptop",
+    "raw_text": "We compress 100k-token documents into structured summaries using a two-pass extractive-then-abstractive pipeline. Pass one runs a CPU-friendly BM25-based sentence scorer over the whole document; pass two feeds only the top-ranked sentences to a 1B-parameter generative model. Peak memory is 6GB and runtime is about three minutes per document on an eight-core laptop. The scorer is a hundred lines of plain Python with no external dependencies.",
+    "expected_verdict": "accept",
+    "score_min": 5,
+    "score_max": 9
+  },
+  {
+    "id": "tiny-asr-on-cpu",
+    "source": "github",
+    "url": "https://github.com/example/tiny-asr",
+    "title": "tiny-asr: streaming speech-to-text with a 39M-parameter Whisper variant",
+    "raw_text": "Real-time speech-to-text on a Raspberry-Pi-class device using a distilled 39M-parameter Whisper variant. Streaming chunking with a voice activity detector, greedy decoding, and a word error rate within eight points of the large models. Peak memory is 1.2GB, and the model runs in pure fp32 on a quad-core ARM CPU with no GPU or accelerator.",
+    "expected_verdict": "accept",
+    "score_min": 5,
+    "score_max": 9
+  }
+]

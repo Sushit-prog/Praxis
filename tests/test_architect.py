@@ -43,9 +43,11 @@ def mock_call_llm(monkeypatch, text):
     """Patch architect.call_llm to return a canned markdown response."""
     calls = {}
 
-    def fake(prompt, system=None, model=None):
+    def fake(prompt, system=None, model=None, **kwargs):
         calls["prompt"] = prompt
         calls["system"] = system
+        calls["stage"] = kwargs.get("stage")
+        calls["candidate_id"] = kwargs.get("candidate_id")
         return text
 
     monkeypatch.setattr(architect_module, "call_llm", fake)
@@ -64,6 +66,8 @@ def test_architect_persists_blueprint(db_session, hardware_profile, monkeypatch)
     assert bp.candidate_id == cand.id
     assert calls["prompt"]
     assert calls["system"]
+    assert calls["stage"] == "architect"
+    assert calls["candidate_id"] == cand.id
 
     db_session.expire_all()
     stored = db_session.get(Candidate, cand.id)
@@ -92,7 +96,9 @@ def test_architect_prompt_includes_hardware_and_analysis(db_session, hardware_pr
 def test_architect_empty_output_persists(db_session, hardware_profile, monkeypatch, caplog):
     cand = make_candidate(db_session)
     analysis = make_analysis()
-    monkeypatch.setattr(architect_module, "call_llm", lambda prompt, system=None: "   ")
+    monkeypatch.setattr(
+        architect_module, "call_llm", lambda prompt, system=None, **kwargs: "   "
+    )
 
     with caplog.at_level("WARNING"):
         bp = draft_blueprint(cand, analysis, hardware_profile)

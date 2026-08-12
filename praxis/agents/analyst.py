@@ -79,6 +79,17 @@ def _build_prompt(candidate: Candidate, profile: HardwareProfile) -> str:
     )
 
 
+def _repair_prompt(bad_response: str) -> str:
+    """Ask the model to re-emit a response that failed strict JSON parsing."""
+    return (
+        "Your previous response was not valid JSON, so it could not be parsed. "
+        "Here is what you returned:\n"
+        f"---\n{bad_response[:2000]}\n---\n\n"
+        "Respond again with JSON ONLY, exactly matching the schema in your "
+        "instructions. No prose, no markdown fences."
+    )
+
+
 def _extract_json(text: str) -> str:
     """Strip code fences / surrounding prose and return the JSON substring."""
     stripped = text.strip()
@@ -132,14 +143,30 @@ def analyze(
     """Extract and score a candidate's technique, persisting status + analysis."""
     threshold = _resolve_threshold(threshold)
     prompt = _build_prompt(candidate, profile)
-    response = call_llm(prompt, system=_system_prompt())
+    response = call_llm(
+        prompt, system=_system_prompt(), stage="analyst", candidate_id=candidate.id
+    )
+    first_response = response
 
     result = _parse_response(response, threshold)
     if result is None:
         logger.warning(
+            "analyst: malformed LLM response for candidate %r; requesting strict JSON repair",
+            candidate.url,
+        )
+        response = call_llm(
+            _repair_prompt(first_response),
+            system=_system_prompt(),
+            stage="analyst",
+            candidate_id=candidate.id,
+        )
+        result = _parse_response(response, threshold)
+
+    if result is None:
+        logger.warning(
             "analyst: malformed LLM response for candidate %r: %r",
             candidate.url,
-            response[:200],
+            first_response[:200],
         )
         result = _rejected_analysis("malformed LLM response; could not parse verdict")
 

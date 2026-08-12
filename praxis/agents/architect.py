@@ -72,7 +72,12 @@ def draft_blueprint(
     profile: HardwareProfile,
 ) -> Blueprint:
     """Draft a hardware-calibrated blueprint, persist it, and return the row."""
-    md = call_llm(_build_prompt(candidate, analysis, profile), system=_system_prompt())
+    md = call_llm(
+        _build_prompt(candidate, analysis, profile),
+        system=_system_prompt(),
+        stage="architect",
+        candidate_id=candidate.id,
+    )
     if not (md or "").strip():
         logger.warning(
             "architect: empty LLM response for candidate %r; storing as-is",

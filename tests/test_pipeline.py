@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 
 import praxis.agents as agents_module
 from praxis.agents.analyst import AnalysisResult
-from praxis.db import Blueprint, Candidate
+from praxis.db import Blueprint, Candidate, LLMUsage
 from praxis.pipeline import CandidateOutcome, PipelineResult, format_summary, run
 
 
@@ -160,6 +161,42 @@ def test_run_continues_past_coder_failure(monkeypatch, hardware_profile):
     assert result.prototyped == 0
     assert result.failed == 1
     assert result.candidates[0].status == "prototype_failed"
+
+
+def test_run_reports_usage_delta(db_session, monkeypatch, hardware_profile):
+    """Usage rows written during a run show up in the result and summary."""
+    cand = _FakeCandidate("https://a", "A")
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        db_session.add(
+            LLMUsage(
+                model="m",
+                stage="analyst",
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+                cost_usd=0.001,
+                latency_ms=5,
+            )
+        )
+        db_session.commit()
+        return _analysis_for("https://a")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
+    monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    assert result.usage_calls == 1
+    assert result.usage_total_tokens == 2
+    assert result.usage_cost_usd == pytest.approx(0.001)
+    text = format_summary(result)
+    assert "LLM spend: $0.0010 across 1 calls (2 tokens)" in text
 
 
 def test_format_summary():

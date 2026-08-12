@@ -16,7 +16,7 @@ from typing import Any
 
 from praxis import agents
 from praxis.config import HardwareProfile, load_config
-from praxis.db import Candidate, get_session
+from praxis.db import Candidate, UsageTotals, get_session, usage_totals
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,9 @@ class PipelineResult:
     blueprinted: int = 0
     prototyped: int = 0
     failed: int = 0
+    usage_calls: int = 0
+    usage_total_tokens: int = 0
+    usage_cost_usd: float = 0.0
     candidates: list[CandidateOutcome] = field(default_factory=list)
 
 
@@ -94,6 +97,18 @@ def _mark_failed(candidate_id: int | None) -> None:
         session.close()
 
 
+def _snapshot_usage() -> UsageTotals | None:
+    """Snapshot recorded LLM usage, tolerating a missing/old usage table."""
+    session = get_session()
+    try:
+        return usage_totals(session=session)
+    except Exception as exc:  # noqa: BLE001 - observability must never break a run
+        logger.warning("usage snapshot failed: %s", exc)
+        return None
+    finally:
+        session.close()
+
+
 def run(
     source: str,
     topic: str,
@@ -107,6 +122,7 @@ def run(
     """Run Scout -> Analyst -> Architect -> Coder over a batch of candidates."""
     config = config or load_config()
     result = PipelineResult(source=source, topic=topic)
+    usage_before = _snapshot_usage()
 
     try:
         candidates = run_with_retry(agents.scout, retries, source=source, topic=topic, limit=limit)
@@ -200,6 +216,18 @@ def run(
             )
         )
 
+    usage_after = _snapshot_usage()
+    if usage_before is not None and usage_after is not None:
+        result.usage_calls = usage_after.calls - usage_before.calls
+        result.usage_total_tokens = usage_after.total_tokens - usage_before.total_tokens
+        result.usage_cost_usd = max(0.0, usage_after.cost_usd - usage_before.cost_usd)
+    elif usage_before is not None or usage_after is not None:
+        logger.warning(
+            "usage snapshot incomplete (before=%s after=%s); spend footer skipped",
+            usage_before is not None,
+            usage_after is not None,
+        )
+
     return result
 
 
@@ -215,6 +243,11 @@ def format_summary(result: PipelineResult) -> str:
     ]
     lines = [f"Summary for topic={result.topic!r} source={result.source}"]
     lines.extend(f"  {label}: {value}" for label, value in rows)
+    if result.usage_calls:
+        lines.append(
+            f"  LLM spend: ${result.usage_cost_usd:.4f} across {result.usage_calls} calls"
+            f" ({result.usage_total_tokens:,} tokens)"
+        )
     if result.candidates:
         lines.append("Candidates:")
         for outcome in result.candidates:
