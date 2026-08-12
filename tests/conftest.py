@@ -67,6 +67,7 @@ def db_session(db_engine, monkeypatch):
         "praxis.agents.coder",
         "praxis.pipeline",
         "praxis.llm",
+        "praxis.review",
     ):
         module = importlib.import_module(module_name)
         monkeypatch.setattr(module, "get_session", fresh_session)

@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import select
 
 from praxis import agents
+from praxis.agents.analyst import AnalysisResult
 from praxis.config import HardwareProfile, load_config
 from praxis.db import Candidate, UsageTotals, get_session, usage_totals
 
@@ -26,6 +27,7 @@ DEFAULT_RETRIES = 3
 BACKOFF_BASE_S = 1.0
 
 FAILED_STATUS = "failed"
+REVIEWED_STATUS = "reviewed"
 
 
 def run_with_retry(
@@ -68,6 +70,15 @@ class CandidateOutcome:
 
 
 @dataclass
+class BuildOutcome:
+    """Result of running the Architect + Coder stages for one candidate."""
+
+    blueprinted: bool
+    status: str
+    prototype_path: str | None = None
+
+
+@dataclass
 class PipelineResult:
     """Batch summary of a pipeline run."""
 
@@ -103,16 +114,81 @@ def _mark_failed(candidate_id: int | None) -> None:
 
 
 def _unfinished_candidates() -> list[Candidate]:
-    """Candidates from earlier runs that never finished: status `new` or `failed`."""
+    """Candidates from earlier runs that still have work: status new, failed, or reviewed."""
     session = get_session()
     try:
         return list(
             session.scalars(
-                select(Candidate).where(Candidate.status.in_(("new", FAILED_STATUS)))
+                select(Candidate).where(
+                    Candidate.status.in_(("new", FAILED_STATUS, REVIEWED_STATUS))
+                )
             ).all()
         )
     finally:
         session.close()
+
+
+def _analysis_from_candidate(candidate: Candidate) -> AnalysisResult:
+    """Reconstruct an AnalysisResult from the Analyst's persisted verdict columns."""
+    return AnalysisResult(
+        technique_summary=candidate.technique_summary or "",
+        feasibility_score=(
+            candidate.feasibility_score if candidate.feasibility_score is not None else 0
+        ),
+        feasibility_reasoning=candidate.feasibility_reasoning or "",
+        rejected=False,
+    )
+
+
+def build_from_analysis(
+    candidate: Candidate,
+    analysis: AnalysisResult,
+    *,
+    config: HardwareProfile,
+    retries: int = DEFAULT_RETRIES,
+    scratch_root: Path | None = None,
+    timeout: float | None = None,
+) -> BuildOutcome:
+    """Run the Architect and Coder stages for an analyzed candidate.
+
+    Shared by the pipeline loop and the human review gate (`praxis review
+    approve`), so an approved candidate takes exactly the same build path as a
+    freshly accepted one.
+    """
+    url = getattr(candidate, "url", "") or ""
+    try:
+        blueprint = run_with_retry(
+            agents.architect, retries, candidate=candidate, analysis=analysis, profile=config
+        )
+    except NotImplementedError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+        logger.warning("architect failed for %s: %s", url, exc)
+        _mark_failed(candidate.id)
+        return BuildOutcome(blueprinted=False, status=FAILED_STATUS)
+
+    logger.info("architect blueprinted %s", url)
+    try:
+        path = run_with_retry(
+            agents.coder,
+            retries,
+            blueprint=blueprint,
+            scratch_root=scratch_root,
+            timeout=timeout,
+        )
+    except NotImplementedError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+        logger.warning("coder failed for %s: %s", url, exc)
+        _mark_failed(candidate.id)
+        return BuildOutcome(blueprinted=True, status=FAILED_STATUS)
+
+    if path is None:
+        logger.warning("coder failed for %s (opencode non-zero or timeout)", url)
+        return BuildOutcome(blueprinted=True, status="prototype_failed")
+
+    logger.info("coder prototyped %s -> %s", url, path)
+    return BuildOutcome(blueprinted=True, status="prototyped", prototype_path=str(path))
 
 
 def _snapshot_usage() -> UsageTotals | None:
@@ -176,87 +252,69 @@ def run(
         title = getattr(candidate, "title", "") or url
         candidate_id = getattr(candidate, "id", None)
 
-        try:
-            analysis = run_with_retry(agents.analyze, retries, candidate=candidate, profile=config)
-        except NotImplementedError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
-            logger.warning("analyst failed for %s: %s", url, exc)
-            _mark_failed(candidate_id)
+        if getattr(candidate, "status", "") == REVIEWED_STATUS:
+            # Human-approved candidate: continue from the Architect using the
+            # persisted analysis; the Analyst stage is skipped.
+            analysis = _analysis_from_candidate(candidate)
+        else:
+            try:
+                analysis = run_with_retry(
+                    agents.analyze, retries, candidate=candidate, profile=config
+                )
+            except NotImplementedError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate candidate failures
+                logger.warning("analyst failed for %s: %s", url, exc)
+                _mark_failed(candidate_id)
+                result.failed += 1
+                result.candidates.append(
+                    CandidateOutcome(title=title, url=url, status=FAILED_STATUS)
+                )
+                continue
+
+            if analysis.rejected:
+                logger.info("analyst rejected %s", url)
+                result.rejected += 1
+                result.candidates.append(
+                    CandidateOutcome(title=title, url=url, status="rejected")
+                )
+                continue
+
+            if analysis.borderline:
+                # Confidence-aware routing: scores inside the threshold band are
+                # held for review rather than auto-built or silently rejected.
+                logger.info("analyst flagged %s as borderline", url)
+                result.borderline += 1
+                result.candidates.append(
+                    CandidateOutcome(title=title, url=url, status="borderline")
+                )
+                continue
+
+            result.analyzed += 1
+            logger.info("analyst accepted %s", url)
+
+        outcome = build_from_analysis(
+            candidate,
+            analysis,
+            config=config,
+            retries=retries,
+            scratch_root=scratch_root,
+            timeout=timeout,
+        )
+        if outcome.blueprinted:
+            result.blueprinted += 1
+        if outcome.status == "prototyped":
+            result.prototyped += 1
+            logger.info("coder prototyped %s -> %s", url, outcome.prototype_path)
+        else:
             result.failed += 1
-            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
-            continue
-
-        if analysis.rejected:
-            logger.info("analyst rejected %s", url)
-            result.rejected += 1
-            result.candidates.append(CandidateOutcome(title=title, url=url, status="rejected"))
-            continue
-
-        if analysis.borderline:
-            # Confidence-aware routing: scores inside the threshold band are
-            # held for review rather than auto-built or silently rejected.
-            logger.info("analyst flagged %s as borderline", url)
-            result.borderline += 1
-            result.candidates.append(CandidateOutcome(title=title, url=url, status="borderline"))
-            continue
-
-        result.analyzed += 1
-        logger.info("analyst accepted %s", url)
-
-        try:
-            blueprint = run_with_retry(
-                agents.architect,
-                retries,
-                candidate=candidate,
-                analysis=analysis,
-                profile=config,
-            )
-        except NotImplementedError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
-            logger.warning("architect failed for %s: %s", url, exc)
-            _mark_failed(candidate_id)
-            result.failed += 1
-            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
-            continue
-
-        result.blueprinted += 1
-        logger.info("architect blueprinted %s", url)
-
-        try:
-            path = run_with_retry(
-                agents.coder,
-                retries,
-                blueprint=blueprint,
-                scratch_root=scratch_root,
-                timeout=timeout,
-            )
-        except NotImplementedError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - isolate candidate failures
-            logger.warning("coder failed for %s: %s", url, exc)
-            _mark_failed(candidate_id)
-            result.failed += 1
-            result.candidates.append(CandidateOutcome(title=title, url=url, status=FAILED_STATUS))
-            continue
-
-        if path is None:
-            logger.warning("coder failed for %s (opencode non-zero or timeout)", url)
-            result.failed += 1
-            result.candidates.append(
-                CandidateOutcome(title=title, url=url, status="prototype_failed")
-            )
-            continue
-
-        result.prototyped += 1
-        logger.info("coder prototyped %s -> %s", url, path)
+            logger.warning("build ended %s for %s", outcome.status, url)
         result.candidates.append(
             CandidateOutcome(
                 title=title,
                 url=url,
-                status="prototyped",
-                prototype_path=str(path),
+                status=outcome.status,
+                prototype_path=outcome.prototype_path,
             )
         )
 

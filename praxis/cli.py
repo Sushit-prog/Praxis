@@ -50,6 +50,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--threshold", type=int, help="Feasibility threshold override for the Analyst."
     )
 
+    review = sub.add_parser(
+        "review", help="Review borderline candidates (human-in-the-loop gate)."
+    )
+    review_sub = review.add_subparsers(dest="review_action")
+    approve_parser = review_sub.add_parser(
+        "approve", help="Approve a borderline candidate and build it."
+    )
+    approve_parser.add_argument("candidate_id", type=int, help="Candidate id to approve.")
+    reject_parser = review_sub.add_parser(
+        "reject", help="Reject a borderline candidate; it will not be built."
+    )
+    reject_parser.add_argument("candidate_id", type=int, help="Candidate id to reject.")
+
     return parser
 
 
@@ -156,6 +169,43 @@ def _cmd_usage(args) -> int:
     return 0
 
 
+def _cmd_review(args) -> int:
+    from praxis.review import approve, pending_candidates, reject
+
+    if args.review_action is None:
+        pending = pending_candidates()
+        if not pending:
+            print("No candidates awaiting review.")
+            return 0
+        print("Candidates awaiting review (borderline):")
+        for cand in pending:
+            score = cand.feasibility_score if cand.feasibility_score is not None else "?"
+            print(f"  [{cand.id}] {cand.title} — score {score} ({cand.url})")
+            if cand.feasibility_reasoning:
+                print(f"        {cand.feasibility_reasoning}")
+        return 0
+
+    if args.review_action == "approve":
+        result = approve(args.candidate_id)
+    elif args.review_action == "reject":
+        result = reject(args.candidate_id)
+    else:
+        return 1
+
+    if result.error:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 1
+    if result.action == "approved":
+        if result.status in ("failed", "prototype_failed"):
+            print(f"approved {result.candidate_id}: {result.title} — build ended {result.status}")
+        else:
+            suffix = f" ({result.prototype_path})" if result.prototype_path else ""
+            print(f"approved {result.candidate_id}: {result.title} -> {result.status}{suffix}")
+    else:
+        print(f"rejected {result.candidate_id}: {result.title}")
+    return 0
+
+
 def _cmd_show(args) -> int:
     from praxis.db import Candidate, get_session, latest_blueprint
 
@@ -199,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_status(args)
     if args.command == "usage":
         return _cmd_usage(args)
+    if args.command == "review":
+        return _cmd_review(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "eval":

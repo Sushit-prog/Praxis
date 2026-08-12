@@ -141,6 +141,16 @@ praxis eval --golden my_set.json --threshold 5
 
 The Coder stage requires `opencode` on your PATH and authenticated (`opencode auth login`). The exact invocation lives in `praxis/agents/coder.py:_invoke_opencode`.
 
+Review borderline candidates — the human-in-the-loop gate:
+
+```bash
+praxis review                       # list candidates awaiting review
+praxis review approve 42            # approve and build it
+praxis review reject 42             # reject it; it will not be built
+```
+
+Candidates the Analyst flags as `borderline` (score inside the threshold band) are held for review instead of being auto-built. `praxis review` lists them with their score and reasoning; `approve` records the decision and builds the candidate through the normal Architect -> Coder path (a `reviewed` candidate left unbuilt by an interrupted approval is picked up by `praxis run --resume`, which continues from the Architect using the persisted analysis); `reject` marks it `rejected`.
+
 Track LLM token spend against the budget:
 
 ```bash
@@ -198,7 +208,7 @@ Praxis is a working v1, and these are the intentional next phases:
 - **Golden-set evaluation (implemented)** — `praxis eval` regression-checks the Analyst and Architect against hand-labeled fixtures — including adversarial prompt-injection candidates — with a deterministic rubric; LLM-as-judge scoring is future work.
 - **Prompt-injection hardening (implemented)** — candidate raw text is delimited and framed as untrusted data in the Analyst and Architect prompts, with adversarial fixtures in the golden set proving injections cannot override verdicts.
 - **Coder guardrails** — structural isolation on the OpenCode invocation plus a circuit-breaker on its tool calls, so a runaway prototype draft cannot burn unbounded time or tokens.
-- **Human-in-the-loop review gate** — an approval step between Architect and Coder so no code is generated until a person signs off on the plan.
+- **Human-in-the-loop review gate (implemented)** — `praxis review` lists `borderline` candidates; `approve` builds them through the normal Architect -> Coder path and `reject` discards them, so uncertain candidates are never auto-built without a person signing off.
 - **Agent memory** — persist review decisions and outcomes and feed them back into future Analyst scoring, so the system learns which techniques are actually buildable on target hardware.
 - **Cost/token observability (implemented)** — every Analyst/Architect call is recorded with tokens, estimated USD cost, latency, stage, and candidate; `praxis usage` reports totals, a recent window, and per-stage/per-model breakdowns, and `praxis run` prints a spend footer.
 - **LLM response caching (implemented)** — identical calls (same model + system + prompt) are served from the `llm_cache` table, so re-processing the same candidate costs nothing; any prompt or model change is a miss by construction. Disable with `PRAXIS_LLM_CACHE=0`.
