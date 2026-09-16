@@ -6,9 +6,12 @@ Praxis consumes LLM providers in two separate jobs:
   litellm model strings (``groq/...``, ``openrouter/...``, ``cerebras/...``)
   and called through litellm, which reads the provider key from the Praxis env
   (``GROQ_API_KEY`` etc., with ``PRAXIS_<PROVIDER>_API_KEY`` overrides).
-* **Job B — Coder** (`praxis/agents/coder.py`).  The OpenCode CLI resolves its
-  own keys from its auth store; Praxis only rotates the ``--model <model>`` id
-  it passes and detects exhaustion from the subprocess exit output.
+* **Job B — Coder** (`praxis/agents/coder.py`).  The OpenCode CLI routes through
+  the local omniroute gateway (declared in ``~/.config/opencode/opencode.json``,
+  baseURL ``http://localhost:20128/v1``), which owns the provider keys and does
+  backend-level failover internally.  Praxis only rotates the
+  ``--model omniroute/<id>`` id it passes and detects exhaustion from the
+  subprocess exit output.
 
 Both jobs share the same health registry.  When a provider is exhausted (rate
 limit, quota, context window), it is put into a cooldown that is persisted in

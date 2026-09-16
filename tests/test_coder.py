@@ -20,6 +20,7 @@ def _isolated_breaker(monkeypatch):
     monkeypatch.setattr(coder_module, "_breaker", None)
     monkeypatch.setenv("PRAXIS_CODER_MAX_FAILURES", "1000")
     monkeypatch.setenv("PRAXIS_CODER_COOLDOWN_S", "0")
+    monkeypatch.setenv("PRAXIS_CODER_OPENCODE_FLAGS", "--auto")
 
 
 PHASED_PLAN_MD = (
@@ -99,6 +100,34 @@ def test_draft_prototype_success(db_session, monkeypatch, tmp_path):
     assert db_session.get(Blueprint, bp.id).prototype_path == str(path)
 
 
+def test_draft_prototype_no_auto_flags(db_session, monkeypatch, tmp_path):
+    """Forks whose `opencode run` rejects --auto pass an empty flag list."""
+    monkeypatch.setenv("PRAXIS_CODER_OPENCODE_FLAGS", "")
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = mock_subprocess_run(monkeypatch, fake_completed())
+
+    path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is not None
+    assert "--auto" not in calls["cmd"]
+    assert "opencode" in calls["cmd"]
+    assert "run" in calls["cmd"]
+
+
+def test_draft_prototype_custom_flags(db_session, monkeypatch, tmp_path):
+    monkeypatch.setenv("PRAXIS_CODER_OPENCODE_FLAGS", "--print-logs")
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = mock_subprocess_run(monkeypatch, fake_completed())
+
+    path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is not None
+    assert "--print-logs" in calls["cmd"]
+    assert "--auto" not in calls["cmd"]
+
+
 def test_draft_prototype_nonzero_exit(db_session, monkeypatch, tmp_path, caplog):
     cand = make_candidate(db_session)
     bp = make_blueprint(db_session, cand)
@@ -136,7 +165,7 @@ def test_draft_prototype_prompt_scoped_to_first_phase(db_session, monkeypatch, t
     bp = make_blueprint(db_session, cand)
     captured = {}
 
-    def fake_invoke(prompt, cwd, timeout):
+    def fake_invoke(prompt, cwd, timeout, model=None):
         captured["prompt"] = prompt
         captured["cwd"] = cwd
         return fake_completed()

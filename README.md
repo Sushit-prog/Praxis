@@ -106,7 +106,9 @@ praxis status    # candidate counts by status
 praxis show 1    # view a blueprint for candidate #1
 ```
 
-The Coder stage requires `opencode` on your PATH and authenticated (`opencode auth login`).
+The Coder stage requires `opencode` on your PATH, pointed at the local omniroute
+gateway (`~/.config/opencode/opencode.json`, baseURL `http://localhost:20128/v1`).
+opencode holds no direct provider keys for Job B — see [Provider failover](#provider-failover-3-keys-2-jobs-instant-switch).
 
 ## Usage
 
@@ -227,22 +229,26 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_FALLBACK_MODELS` | comma-separated models tried after the primary when it fails (rate limit, outage) | — |
 | `PRAXIS_PROVIDERS` | Job A provider order (comma-separated) used to re-order the primary + fallback models | configured chain order |
 | `PRAXIS_PROVIDER_COOLDOWN_S` | how long an exhausted provider stays cool before the pool re-tries it | `60` |
-| `PRAXIS_CODER_MODELS` | Job B opencode model ids (comma-separated) tried in order on provider exhaustion | opencode default |
+| `PRAXIS_CODER_MODELS` | Job B opencode model ids (comma-separated `omniroute/<id>`) tried in order on provider exhaustion | opencode default |
 | `PRAXIS_CODER_PROVIDER_RETRIES` | max models tried for one coder attempt before the circuit breaker takes over | `3` |
+| `PRAXIS_CODER_OPENCODE_FLAGS` | extra flags after `opencode run`; stock opencode uses `--auto`, set empty for forks that reject it | `--auto` |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
 
-## Provider failover (6 keys, 2 jobs, instant switch)
+## Provider failover (3 keys, 2 jobs, instant switch)
 
-Praxis consumes three free providers — **Groq, OpenRouter, Cerebras** — in two
-separate jobs that read keys from different places:
+Job A consumes three free providers — **Groq, OpenRouter, Cerebras** — directly
+via litellm. Job B routes every Coder call through the local **omniroute
+gateway**, which owns the backends and does provider-level failover internally:
 
 | Job | Who calls | Keys live where | How switching works |
 |---|---|---|---|
 | **A — Analyst + Architect** (`praxis/providers.py` → `praxis/llm.py`) | litellm | Praxis env (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, with `PRAXIS_<PROVIDER>_API_KEY` overrides) | health-aware pool skips a cooling-down provider instantly — zero wasted LLM calls re-trying a dead key |
-| **B — Coder** (`praxis/agents/coder.py` → OpenCode CLI) | `opencode run` | OpenCode's own auth store (`opencode auth login groq` / `openrouter` / `cerebras`) | Praxis rotates the `--model <provider/model>` flag and detects exhaustion from exit output |
+| **B — Coder** (`praxis/agents/coder.py` → OpenCode CLI) | `opencode run` against the omniroute gateway (`~/.config/opencode/opencode.json`, baseURL `http://localhost:20128/v1`) | the gateway's own auth store; opencode holds no direct provider keys | Praxis rotates the `--model omniroute/<id>` flag across the ids in `PRAXIS_CODER_MODELS` and detects exhaustion from exit output |
 
-So you hand Praxis **3 keys** and OpenCode **3 keys** — the six APIs map one to
-one onto the two jobs.
+So you hand Praxis **3 keys** (Job A). Job B's keys live inside the omniroute
+gateway, which rotates its own backends internally; Praxis only rotates gateway
+model ids, so a single exhaustion cooldown pauses the whole gateway for the
+cooldown window rather than one backend.
 
 Exhaustion (HTTP 429, rate-limit/quota/context-window markers) puts the
 provider into a **cooldown** persisted in the `provider_health` table. The pool
@@ -261,7 +267,7 @@ praxis providers
 ```
 Provider pool health:
   [pipeline] groq: healthy
-  [coder] openrouter: cooling_down 41s left (rate_limit: 429 ...
+  [coder] omniroute: cooling_down 41s left (rate_limit: 429 ...
 ```
 
 ## Testing & CI

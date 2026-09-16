@@ -31,6 +31,12 @@ CODER_MODELS_ENV = "PRAXIS_CODER_MODELS"
 DEFAULT_PROVIDER_RETRIES = 3
 PROVIDER_RETRIES_ENV = "PRAXIS_CODER_PROVIDER_RETRIES"
 
+# Extra flags passed to `opencode run` after the subcommand. Defaults to
+# `--auto` (stock opencode's non-interactive/auto-approve flag); the fork build
+# on this machine drops unknown flags, so set it to empty in the project env.
+OPENCODE_FLAGS_ENV = "PRAXIS_CODER_OPENCODE_FLAGS"
+DEFAULT_OPENCODE_FLAGS = "--auto"
+
 
 class _CircuitBreaker:
     """Fail-fast guard around the OpenCode subprocess.
@@ -204,6 +210,19 @@ def _extract_first_phase(md: str) -> str:
     return _first_milestone(section)
 
 
+def _resolve_opencode_flags() -> list[str]:
+    """Flags for `opencode run`, from PRAXIS_CODER_OPENCODE_FLAGS (default --auto).
+
+    An unset variable yields ``--auto`` (stock opencode's non-interactive
+    flag). An explicitly empty value yields no flags — some opencode builds
+    treat ``--auto`` as an unknown argument and exit 1.
+    """
+    raw = os.environ.get(OPENCODE_FLAGS_ENV)
+    if raw is None:
+        return [DEFAULT_OPENCODE_FLAGS]
+    return [flag for flag in raw.split() if flag]
+
+
 def _build_coder_prompt(blueprint: Blueprint) -> str:
     first_phase = _extract_first_phase(blueprint.blueprint_md or "")
     return (
@@ -226,9 +245,9 @@ def _invoke_opencode(
 ) -> subprocess.CompletedProcess:
     """Run OpenCode CLI in non-interactive mode against a scratch directory."""
     if os.name == "nt":
-        cmd = ["cmd", "/c", "opencode", "run", "--auto"]
+        cmd = ["cmd", "/c", "opencode", "run", *_resolve_opencode_flags()]
     else:
-        cmd = ["opencode", "run", "--auto"]
+        cmd = ["opencode", "run", *_resolve_opencode_flags()]
     if model:
         cmd += ["--model", model]
     cmd.append(prompt)
