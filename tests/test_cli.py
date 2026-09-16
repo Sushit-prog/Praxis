@@ -131,6 +131,50 @@ def test_cli_memory_empty(tmp_path, monkeypatch, capsys):
     assert "No build memory recorded yet." in capsys.readouterr().out
 
 
+def test_cli_providers_empty(tmp_path, monkeypatch, capsys):
+    from sqlalchemy import create_engine
+
+    from praxis.db import Base
+
+    db_path = tmp_path / "empty.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    Base.metadata.create_all(create_engine(f"sqlite:///{db_path}"))
+
+    rc = main(["providers"])
+
+    assert rc == 0
+    assert "no health state recorded" in capsys.readouterr().out
+
+
+def test_cli_providers_lists_health(tmp_path, monkeypatch, capsys):
+    from sqlalchemy.orm import Session
+
+    from praxis.db import Base, ProviderHealth, get_engine
+    from praxis.providers import _wall_now
+
+    db_path = tmp_path / "p.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(
+            ProviderHealth(
+                job="pipeline",
+                provider="groq",
+                state="cooling_down",
+                cooldown_until=_wall_now(),
+                last_signal="rate_limit",
+            )
+        )
+        session.commit()
+
+    rc = main(["providers"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[pipeline] groq: cooling_down" in out
+
+
 def test_cli_usage_prints_report(seeded_db, capsys):
     rc = main(["usage"])
 

@@ -298,3 +298,103 @@ def test_coder_alias():
     from praxis.agents import coder
 
     assert coder is draft_prototype
+
+
+def _run_sequence(monkeypatch, sequence):
+    """Patch subprocess.run to return each CompletedProcess in order."""
+    calls = []
+
+    def fake(cmd, cwd=None, capture_output=None, text=None, timeout=None):
+        calls.append(cmd)
+        return sequence[min(len(calls) - 1, len(sequence) - 1)]
+
+    monkeypatch.setattr(coder_module.subprocess, "run", fake)
+    return calls
+
+
+def test_draft_prototype_exhaustion_rotates_to_next_model(db_session, monkeypatch, tmp_path):
+    """A 429 on the first coder model instantly switches to the next provider."""
+    monkeypatch.setenv(
+        "PRAXIS_CODER_MODELS",
+        "groq/llama-3.1-8b-instant,openrouter/openai/gpt-4o-mini",
+    )
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = _run_sequence(
+        monkeypatch,
+        [
+            fake_completed(returncode=1, stderr="HTTP 429 rate limit exceeded"),
+            fake_completed(stdout="built a prototype"),
+        ],
+    )
+
+    path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is not None
+    assert len(calls) == 2
+    first, second = calls
+    assert "--model" in first
+    assert "groq/llama-3.1-8b-instant" in first
+    assert "--model" in second
+    assert "openrouter/openai/gpt-4o-mini" in second
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "prototyped"
+
+
+def test_draft_prototype_all_providers_exhausted_fails(db_session, monkeypatch, tmp_path, caplog):
+    """When every configured coder model is exhausted, skip breaker tripping per model."""
+    monkeypatch.setenv(
+        "PRAXIS_CODER_MODELS",
+        "groq/llama-3.1-8b-instant,openrouter/openai/gpt-4o-mini",
+    )
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = _run_sequence(
+        monkeypatch,
+        [
+            fake_completed(returncode=1, stderr="rate limit exceeded"),
+            fake_completed(returncode=1, stderr="insufficient_quota"),
+        ],
+    )
+
+    with caplog.at_level("WARNING"):
+        path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is None
+    assert len(calls) == 2
+    assert "all providers exhausted" in caplog.text
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "prototype_failed"
+
+
+def test_draft_prototype_skips_cooling_provider(db_session, monkeypatch, tmp_path):
+    """A provider in cooldown from an earlier model failure is skipped instantly."""
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setenv(
+        "PRAXIS_CODER_MODELS",
+        "groq/llama-3.1-8b-instant,openrouter/openai/gpt-4o-mini",
+    )
+    from praxis.db import set_provider_health
+    from praxis.providers import JOB_CODER, ExhaustionSignal
+
+    set_provider_health(
+        JOB_CODER,
+        "groq",
+        state="cooling_down",
+        cooldown_until=datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=60),
+        last_signal=ExhaustionSignal.RATE_LIMIT,
+        session=db_session,
+    )
+    db_session.commit()
+
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    calls = _run_sequence(monkeypatch, [fake_completed(stdout="ok")])
+
+    path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is not None
+    assert len(calls) == 1
+    assert "groq/llama-3.1-8b-instant" not in calls[0]
+    assert "openrouter/openai/gpt-4o-mini" in calls[0]

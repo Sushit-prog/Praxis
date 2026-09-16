@@ -19,6 +19,13 @@ from litellm import completion as _default_completion
 from litellm import completion_cost as _completion_cost
 
 from praxis.db import LLMCache, LLMUsage, get_session
+from praxis.providers import (
+    JOB_PIPELINE,
+    ProviderPool,
+    classify_exhaustion,
+    order_models,
+    provider_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,33 +64,41 @@ class LLMClient:
     ) -> str:
         model = _resolve_model(model) or self._model
         kwargs: dict[str, Any] = {
-            "model": model,
             "messages": [
                 *([{"role": "system", "content": system}] if system else []),
                 {"role": "user", "content": prompt},
             ],
         }
-        # Try the primary model, then any configured fallbacks. The cache is
-        # checked per attempted model (so a cached fallback result is served
-        # when the primary is down), and each failed attempt is recorded so the
-        # usage ledger shows the full attempt story.
+        # Health-aware chain: skip cooling-down providers instantly so an
+        # exhausted key never costs a wasted LLM call. The cache is checked
+        # over the FULL chain first — a cached response is free even from a
+        # provider currently in cooldown.
+        pool = _get_pool()
+        chain = order_models([model, *_fallback_models()])
         cache_enabled = _cache_enabled()
-        errors: list[Exception] = []
-        for attempt_model in (model, *_fallback_models()):
-            attempt_key = _cache_key(attempt_model, system, prompt) if cache_enabled else None
-            if attempt_key is not None:
+        if cache_enabled:
+            for cached_model in chain:
+                attempt_key = _cache_key(cached_model, system, prompt)
                 cached = _cache_get(attempt_key)
                 if cached is not None:
-                    logger.debug("llm: cache hit for model=%s", attempt_model)
-                    _record_cache_hit(model=attempt_model, stage=stage, candidate_id=candidate_id)
+                    logger.debug("llm: cache hit for model=%s", cached_model)
+                    _record_cache_hit(model=cached_model, stage=stage, candidate_id=candidate_id)
                     return cached
 
+        attempt_chain = pool.healthy_models(chain)
+        if not attempt_chain:
+            raise RuntimeError(
+                f"all LLM providers are in cooldown ({', '.join(provider_of(m) for m in chain)})"
+            )
+        errors: list[Exception] = []
+        for attempt_model in attempt_chain:
             kwargs["model"] = attempt_model
+            _inject_provider_key(kwargs, attempt_model)
             started = time.monotonic()
             try:
                 response = self._completion(**kwargs)
                 break
-            except Exception as exc:  # noqa: BLE001 - record the attempt, then try the next model
+            except Exception as exc:  # noqa: BLE001 - record attempt, try next model
                 errors.append(exc)
                 _record_failure(
                     exc,
@@ -92,10 +107,26 @@ class LLMClient:
                     candidate_id=candidate_id,
                     latency_ms=_elapsed_ms(started),
                 )
-                logger.warning("llm: model %s failed (%s)", attempt_model, exc)
+                signal = classify_exhaustion(exc)
+                if signal is not None:
+                    pool.mark_exhausted(
+                        provider_of(attempt_model),
+                        signal,
+                        detail=str(exc)[:300],
+                    )
+                    logger.warning(
+                        "llm: %s exhausted (%s); switching to next provider",
+                        attempt_model,
+                        signal,
+                    )
+                else:
+                    logger.warning("llm: model %s failed (%s)", attempt_model, exc)
         else:
             raise errors[-1]
 
+        provider = provider_of(attempt_model)
+        if pool.is_cooling_down(provider):
+            pool.mark_healthy(provider)
         latency_ms = _elapsed_ms(started)
         _record_usage(
             response,
@@ -107,7 +138,9 @@ class LLMClient:
         content = response["choices"][0]["message"]["content"]
         if cache_enabled:
             _cache_put(
-                _cache_key(attempt_model, system, prompt), model=attempt_model, response=content
+                _cache_key(attempt_model, system, prompt),
+                model=attempt_model,
+                response=content,
             )
         return content
 
@@ -161,6 +194,25 @@ def _fallback_models() -> list[str]:
     if not raw:
         return []
     return [model.strip() for model in raw.split(",") if model.strip()]
+
+
+def _get_pool() -> ProviderPool:
+    """Return the shared provider pool for the Analyst/Architect job."""
+    global _pool
+    if _pool is None:
+        _pool = ProviderPool(JOB_PIPELINE)
+    return _pool
+
+
+_pool: ProviderPool | None = None
+
+
+def _inject_provider_key(kwargs: dict[str, Any], model: str) -> None:
+    """When a per-provider API key override is set, inject it into litellm kwargs."""
+    key_env = f"PRAXIS_{provider_of(model).upper()}_API_KEY"
+    key = os.environ.get(key_env)
+    if key:
+        kwargs["api_key"] = key
 
 
 def _cache_key(model: str, system: str | None, prompt: str) -> str:

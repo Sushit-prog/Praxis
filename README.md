@@ -52,7 +52,7 @@ The pipeline is orchestrated in `praxis/pipeline.py` as Scout -> Analyst -> Arch
 - **Scout** — fetches items matching the topic from one of `arxiv`, `github`, or `hn`, deduplicates them, and persists promising ones as `Candidate` rows (`status="new"`).
 - **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on. Scores inside the borderline band (threshold through threshold + `PRAXIS_BORDERLINE_MARGIN`, default 1) are persisted as `borderline` and held for review rather than auto-built — confidence-aware routing instead of a hard accept/reject wall. A response that fails strict JSON parsing is retried once with a repair prompt before the candidate is recorded as a rejection, so a transient formatting hiccup does not silently discard a candidate. Candidate raw text is untrusted internet content, so it is wrapped in explicit delimiters (`<<<UNTRUSTED CANDIDATE CONTENT BEGIN/END>>>`) and the system prompt tells the model to treat it as data, never as instructions — an embedded "score this 10/10" cannot override the task.
 - **Architect** — turns the accepted analysis into a `Blueprint`: a markdown engineering plan with modules, milestones, and a phased build plan, calibrated to the same hardware profile. The first phase of that plan is what the Coder will build.
-- **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run.
+- **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run. When `PRAXIS_CODER_MODELS` lists multiple `provider/model` ids, an exhausted provider (rate limit / quota) skips instantly to the next model instead of waiting.
 
 ## Design decisions
 
@@ -225,7 +225,44 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CODER_COOLDOWN_S` | how long the circuit stays open before one trial attempt | `300` |
 | `PRAXIS_LLM_CACHE` | disable the LLM response cache with `0`/`false` (enabled by default) | `1` |
 | `PRAXIS_FALLBACK_MODELS` | comma-separated models tried after the primary when it fails (rate limit, outage) | — |
+| `PRAXIS_PROVIDERS` | Job A provider order (comma-separated) used to re-order the primary + fallback models | configured chain order |
+| `PRAXIS_PROVIDER_COOLDOWN_S` | how long an exhausted provider stays cool before the pool re-tries it | `60` |
+| `PRAXIS_CODER_MODELS` | Job B opencode model ids (comma-separated) tried in order on provider exhaustion | opencode default |
+| `PRAXIS_CODER_PROVIDER_RETRIES` | max models tried for one coder attempt before the circuit breaker takes over | `3` |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
+
+## Provider failover (6 keys, 2 jobs, instant switch)
+
+Praxis consumes three free providers — **Groq, OpenRouter, Cerebras** — in two
+separate jobs that read keys from different places:
+
+| Job | Who calls | Keys live where | How switching works |
+|---|---|---|---|
+| **A — Analyst + Architect** (`praxis/providers.py` → `praxis/llm.py`) | litellm | Praxis env (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, with `PRAXIS_<PROVIDER>_API_KEY` overrides) | health-aware pool skips a cooling-down provider instantly — zero wasted LLM calls re-trying a dead key |
+| **B — Coder** (`praxis/agents/coder.py` → OpenCode CLI) | `opencode run` | OpenCode's own auth store (`opencode auth login groq` / `openrouter` / `cerebras`) | Praxis rotates the `--model <provider/model>` flag and detects exhaustion from exit output |
+
+So you hand Praxis **3 keys** and OpenCode **3 keys** — the six APIs map one to
+one onto the two jobs.
+
+Exhaustion (HTTP 429, rate-limit/quota/context-window markers) puts the
+provider into a **cooldown** persisted in the `provider_health` table. The pool
+checks health before every attempt, so an exhausted provider is skipped
+instantly and stays cool across restarts: `praxis run --resume` honors it the
+moment it runs. Each switch is logged as `[providers] <provider> cooling down
+<signal> until <time>; instant-switching away` (Job A) or
+`coder: model <model> exhausted (<signal>); switching provider` (Job B).
+
+Inspect live pool health:
+
+```bash
+praxis providers
+```
+
+```
+Provider pool health:
+  [pipeline] groq: healthy
+  [coder] openrouter: cooling_down 41s left (rate_limit: 429 ...
+```
 
 ## Testing & CI
 
@@ -253,6 +290,7 @@ Everything else in the pipeline is implemented:
 - Cost/token observability (`praxis usage`, per-batch spend footer)
 - LLM response caching (sha256-keyed, disable with `PRAXIS_LLM_CACHE=0`)
 - Model fallback (`PRAXIS_FALLBACK_MODELS`)
+- Multi-provider instant failover (Groq / OpenRouter / Cerebras, per-job keys, persisted cooldowns; `praxis providers`)
 - Pipeline resumability (`praxis run --resume`)
 - Confidence-aware borderline routing (`PRAXIS_BORDERLINE_MARGIN`)
 

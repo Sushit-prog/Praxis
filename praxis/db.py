@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     func,
     select,
@@ -123,6 +124,30 @@ class LLMCache(Base):
     model: Mapped[str] = mapped_column(String(128))
     response: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ProviderHealth(Base):
+    """Per-job provider state for instant failover (healthy | cooling_down).
+
+    Written by the provider pool in :mod:`praxis.providers`: an exhausted
+    provider (rate limit / quota / context window) is marked ``cooling_down``
+    until a cooldown timestamp, and healthy/successful calls clear it. Cooldowns
+    are persisted so they survive restarts: ``praxis run --resume`` honors an
+    exhausted provider the moment it warms up again.
+    """
+
+    __tablename__ = "provider_health"
+    __table_args__ = (UniqueConstraint("job", "provider", name="uq_provider_health"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(16), default="healthy")  # healthy | cooling_down
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_signal: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
 
 
 def _db_url() -> str:
@@ -306,6 +331,67 @@ def recent_build_memory(limit: int = 5, *, session=None) -> list[BuildMemory]:
             if len(deduped) >= limit:
                 break
         return deduped
+    finally:
+        if owns_session:
+            session.close()
+
+
+# ---------------------------------------------------------------------------
+# Provider health (cooldowns survive restarts via this table)
+# ---------------------------------------------------------------------------
+
+
+def provider_health_rows(*, session=None) -> list[ProviderHealth]:
+    """Return every provider-health row, oldest row id first (insertion order)."""
+    owns_session = session is None
+    session = session or get_session()
+    try:
+        return list(session.scalars(select(ProviderHealth).order_by(ProviderHealth.id)).all())
+    finally:
+        if owns_session:
+            session.close()
+
+
+def get_provider_health(job: str, provider: str, *, session=None) -> ProviderHealth | None:
+    """Return the health row for a (job, provider) pair, or None if never recorded."""
+    owns_session = session is None
+    session = session or get_session()
+    try:
+        return session.scalars(
+            select(ProviderHealth).where(
+                ProviderHealth.job == job, ProviderHealth.provider == provider
+            )
+        ).first()
+    finally:
+        if owns_session:
+            session.close()
+
+
+def set_provider_health(
+    job: str,
+    provider: str,
+    *,
+    state: str,
+    cooldown_until=None,
+    last_signal: str | None = None,
+    session=None,
+) -> None:
+    """Upsert the health row for a (job, provider) pair; best-effort only."""
+    owns_session = session is None
+    session = session or get_session()
+    try:
+        row = session.scalars(
+            select(ProviderHealth).where(
+                ProviderHealth.job == job, ProviderHealth.provider == provider
+            )
+        ).first()
+        if row is None:
+            row = ProviderHealth(job=job, provider=provider)
+            session.add(row)
+        row.state = state
+        row.cooldown_until = cooldown_until
+        row.last_signal = last_signal
+        session.commit()
     finally:
         if owns_session:
             session.close()

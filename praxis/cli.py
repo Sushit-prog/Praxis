@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=10, help="Max entries to show (default: 10)."
     )
 
+    sub.add_parser("providers", help="Show live provider pool health (cooldowns, signals).")
+
     review = sub.add_parser("review", help="Review borderline candidates (human-in-the-loop gate).")
     review_sub = review.add_subparsers(dest="review_action")
     approve_parser = review_sub.add_parser(
@@ -185,6 +187,39 @@ def _cmd_memory(args) -> int:
     return 0
 
 
+def _cmd_providers(args) -> int:
+    from datetime import UTC, datetime
+
+    from sqlalchemy.exc import OperationalError
+
+    from praxis.db import provider_health_rows
+
+    try:
+        rows = provider_health_rows()
+    except OperationalError as exc:
+        if "no such table" in str(exc):
+            print("Provider pool: no health state recorded yet (run the pipeline first).")
+            return 0
+        raise
+    if not rows:
+        print("Provider pool: no health state recorded yet (run the pipeline first).")
+        return 0
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    print("Provider pool health:")
+    for row in rows:
+        if row.state == "cooling_down":
+            leftover_s = (
+                round((row.cooldown_until - now).total_seconds()) if row.cooldown_until else 0
+            )
+            signal = f" ({row.last_signal})" if row.last_signal else ""
+            state = f"cooling_down {max(0, leftover_s)}s left{signal}"
+        else:
+            state = "healthy"
+        print(f"  [{row.job}] {row.provider}: {state}")
+    return 0
+
+
 def _cmd_review(args) -> int:
     from praxis.review import approve, pending_candidates, reject
 
@@ -269,6 +304,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_review(args)
     if args.command == "memory":
         return _cmd_memory(args)
+    if args.command == "providers":
+        return _cmd_providers(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "eval":

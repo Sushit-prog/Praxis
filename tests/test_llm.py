@@ -203,7 +203,7 @@ def test_llm_falls_back_to_next_model_on_failure(db_session, monkeypatch):
 
 
 def test_llm_fallback_result_served_from_cache(db_session, monkeypatch):
-    """A cached fallback response is served when the primary is still down."""
+    """A cached fallback response is served when the primary is cooling down."""
     from praxis.llm import _resolve_model, call_llm
 
     primary = _resolve_model(None)
@@ -222,10 +222,10 @@ def test_llm_fallback_result_served_from_cache(db_session, monkeypatch):
         }
 
     assert call_llm("prompt", completion=fake_completion) == "recovered"
-    # Second call: primary fails again, but the fallback response is cached,
-    # so no second fallback completion call happens.
+    # Second call: the primary provider is in cooldown (instant switch), and the
+    # fallback response is cached, so no completion call happens at all.
     assert call_llm("prompt", completion=fake_completion) == "recovered"
-    assert calls["n"] == 3  # primary fail + fallback (call 1); primary fail only (call 2)
+    assert calls["n"] == 2  # primary fail + fallback (call 1); cached (call 2)
     hits = db_session.scalars(select(LLMUsage).where(LLMUsage.cached.is_(True))).all()
     assert len(hits) == 1
 

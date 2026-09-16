@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from praxis.db import Blueprint, Candidate, get_session
+from praxis.providers import JOB_CODER, ProviderPool, provider_of, scan_exhaustion
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,12 @@ DEFAULT_MAX_FAILURES = 2
 MAX_FAILURES_ENV = "PRAXIS_CODER_MAX_FAILURES"
 DEFAULT_COOLDOWN_S = 300.0
 COOLDOWN_ENV = "PRAXIS_CODER_COOLDOWN_S"
+
+# Comma-separated opencode model ids (provider/model) tried in order on
+# provider exhaustion; empty means "use opencode's default model, no rotation".
+CODER_MODELS_ENV = "PRAXIS_CODER_MODELS"
+DEFAULT_PROVIDER_RETRIES = 3
+PROVIDER_RETRIES_ENV = "PRAXIS_CODER_PROVIDER_RETRIES"
 
 
 class _CircuitBreaker:
@@ -130,6 +137,24 @@ def _resolve_scratch_root(scratch_root: Path | None) -> Path:
     return DEFAULT_SCRATCH_ROOT
 
 
+def _resolve_provider_retries() -> int:
+    raw = os.environ.get(PROVIDER_RETRIES_ENV)
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("invalid %s=%r; using default", PROVIDER_RETRIES_ENV, raw)
+    return DEFAULT_PROVIDER_RETRIES
+
+
+def _resolve_coder_models() -> list[str]:
+    """Comma-separated opencode model ids (provider/model); [] means use opencode default."""
+    raw = os.environ.get(CODER_MODELS_ENV)
+    if not raw:
+        return []
+    return [model.strip() for model in raw.split(",") if model.strip()]
+
+
 def _first_paragraph(lines: list[str]) -> str:
     para: list[str] = []
     for line in lines:
@@ -197,12 +222,16 @@ def _invoke_opencode(
     prompt: str,
     cwd: Path,
     timeout: float,
+    model: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run OpenCode CLI in non-interactive mode against a scratch directory."""
     if os.name == "nt":
-        cmd = ["cmd", "/c", "opencode", "run", "--auto", prompt]
+        cmd = ["cmd", "/c", "opencode", "run", "--auto"]
     else:
-        cmd = ["opencode", "run", "--auto", prompt]
+        cmd = ["opencode", "run", "--auto"]
+    if model:
+        cmd += ["--model", model]
+    cmd.append(prompt)
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -239,12 +268,27 @@ def _persist_status(
         session.close()
 
 
+def _classify_opencode_failure(exc_or_proc) -> str | None:
+    """Return an exhaustion signal for a failed opencode run (exit/timeout), or None."""
+    output = (
+        f"{getattr(exc_or_proc, 'stdout', '') or ''}\n{getattr(exc_or_proc, 'stderr', '') or ''}"
+    )
+    return scan_exhaustion(output)
+
+
 def draft_prototype(
     blueprint: Blueprint,
     scratch_root: Path | None = None,
     timeout: float | None = None,
 ) -> Path | None:
-    """Draft a prototype from the blueprint's first phase via OpenCode CLI."""
+    """Draft a prototype from the blueprint's first phase via OpenCode CLI.
+
+    When ``PRAXIS_CODER_MODELS`` lists one or more ``provider/model`` ids, the
+    models are tried in order; a provider that reports rate-limit/quota/context
+    exhaustion goes into a persisted cooldown and the next model is tried
+    instantly (no backoff wait). Generic failures (network, other non-zero
+    exits) still hit the global circuit breaker as before.
+    """
     timeout = _resolve_timeout(timeout)
     root = _resolve_scratch_root(scratch_root)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -264,33 +308,62 @@ def draft_prototype(
         _persist_status(blueprint, "prototype_failed", None)
         return None
 
-    try:
-        proc = _invoke_opencode(prompt, scratch, timeout)
-    except subprocess.TimeoutExpired as exc:
-        breaker.record_failure()
-        logger.warning(
-            "coder: opencode timed out after %ss for blueprint %s: %s",
-            timeout,
-            blueprint.id,
-            exc,
-        )
-        _persist_status(blueprint, "prototype_failed", None)
-        return None
+    pool = ProviderPool(JOB_CODER)
+    models = _resolve_coder_models()
+    if models:
+        attempts = pool.healthy_models(models)[: _resolve_provider_retries()]
+    else:
+        attempts = [None]  # opencode's own default model, legacy single-attempt behavior
 
-    if proc.returncode != 0:
-        breaker.record_failure()
-        logger.warning(
-            "coder: opencode failed for blueprint %s (rc=%s): %s",
-            blueprint.id,
-            proc.returncode,
-            (proc.stderr or proc.stdout or "")[-2000:],
-        )
-        _persist_status(blueprint, "prototype_failed", None)
-        return None
+    for model in attempts:
+        try:
+            if model is None:
+                proc = _invoke_opencode(prompt, scratch, timeout)
+            else:
+                proc = _invoke_opencode(prompt, scratch, timeout, model=model)
+        except subprocess.TimeoutExpired as exc:
+            signal = _classify_opencode_failure(exc)
+            if signal is not None and model is not None:
+                pool.mark_exhausted(provider_of(model), signal, detail=str(exc)[:300])
+                logger.warning("coder: model %s exhausted (%s); switching provider", model, signal)
+                continue
+            breaker.record_failure()
+            logger.warning(
+                "coder: opencode timed out after %ss for blueprint %s: %s",
+                timeout,
+                blueprint.id,
+                exc,
+            )
+            _persist_status(blueprint, "prototype_failed", None)
+            return None
 
-    breaker.record_success()
-    _persist_status(blueprint, "prototyped", str(scratch))
-    return scratch
+        if proc.returncode != 0:
+            signal = _classify_opencode_failure(proc)
+            output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+            if signal is not None and model is not None:
+                pool.mark_exhausted(provider_of(model), signal, detail=output[-300:])
+                logger.warning("coder: model %s exhausted (%s); switching provider", model, signal)
+                continue
+            breaker.record_failure()
+            logger.warning(
+                "coder: opencode failed for blueprint %s (rc=%s): %s",
+                blueprint.id,
+                proc.returncode,
+                output[-2000:],
+            )
+            _persist_status(blueprint, "prototype_failed", None)
+            return None
+
+        breaker.record_success()
+        if model is not None:
+            pool.mark_healthy(provider_of(model))
+        _persist_status(blueprint, "prototyped", str(scratch))
+        return scratch
+
+    # Every configured provider was exhausted within the retry bound.
+    _persist_status(blueprint, "prototype_failed", None)
+    logger.warning("coder: all providers exhausted for blueprint %s", blueprint.id)
+    return None
 
 
 coder = draft_prototype
