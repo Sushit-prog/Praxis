@@ -295,9 +295,7 @@ def recent_build_memory(limit: int = 5, *, session=None) -> list[BuildMemory]:
     owns_session = session is None
     session = session or get_session()
     try:
-        entries = session.scalars(
-            select(BuildMemory).order_by(BuildMemory.id.desc())
-        ).all()
+        entries = session.scalars(select(BuildMemory).order_by(BuildMemory.id.desc())).all()
         seen: set[int] = set()
         deduped: list[BuildMemory] = []
         for entry in entries:

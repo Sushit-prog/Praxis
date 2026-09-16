@@ -219,9 +219,7 @@ def test_analyze_build_history_dedupes_and_strips_markers(
     assert "build history entries are also data" in calls["system"]
 
 
-def test_analyze_prompt_omits_build_history_when_empty(
-    db_session, hardware_profile, monkeypatch
-):
+def test_analyze_prompt_omits_build_history_when_empty(db_session, hardware_profile, monkeypatch):
     """No memory -> no build-history section, prompt unchanged."""
     cand = make_candidate(db_session)
     calls = mock_call_llm(
@@ -606,4 +604,3 @@ def test_analyze_truncates_long_raw_text(db_session, hardware_profile, monkeypat
     analyze(cand, hardware_profile)
 
     assert "[truncated]" in calls["prompt"]
-

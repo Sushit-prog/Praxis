@@ -57,9 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=10, help="Max entries to show (default: 10)."
     )
 
-    review = sub.add_parser(
-        "review", help="Review borderline candidates (human-in-the-loop gate)."
-    )
+    review = sub.add_parser("review", help="Review borderline candidates (human-in-the-loop gate).")
     review_sub = review.add_subparsers(dest="review_action")
     approve_parser = review_sub.add_parser(
         "approve", help="Approve a borderline candidate and build it."
@@ -145,9 +143,7 @@ def _format_usage_report(summary) -> str:
     ]
     for stage, t in sorted(summary.by_stage.items(), key=lambda kv: kv[1].cost_usd, reverse=True):
         label = stage or "(uncategorized)"
-        lines.append(
-            f"    {label}: {t.calls} calls, {t.total_tokens:,} tokens, ${t.cost_usd:.4f}"
-        )
+        lines.append(f"    {label}: {t.calls} calls, {t.total_tokens:,} tokens, ${t.cost_usd:.4f}")
     lines.append("  by model:")
     for model, t in sorted(summary.by_model.items(), key=lambda kv: kv[1].cost_usd, reverse=True):
         lines.append(f"    {model}: {t.calls} calls, {t.total_tokens:,} tokens, ${t.cost_usd:.4f}")

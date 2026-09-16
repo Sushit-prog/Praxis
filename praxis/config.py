@@ -40,9 +40,7 @@ def load_config(path: str | None = None) -> HardwareProfile:
     """Load a HardwareProfile, preferring env vars over YAML over defaults."""
     data = _load_yaml(path)
 
-    cpu_only_raw = (
-        _env("CPU_ONLY") if _env("CPU_ONLY") is not None else data.get("cpu_only", True)
-    )
+    cpu_only_raw = _env("CPU_ONLY") if _env("CPU_ONLY") is not None else data.get("cpu_only", True)
     ram_raw = _env("RAM_GB") if _env("RAM_GB") is not None else data.get("ram_gb", 8)
     gpu_raw = _env("GPU") if _env("GPU") is not None else data.get("gpu", False)
     budget_raw = (

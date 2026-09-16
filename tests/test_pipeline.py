@@ -231,9 +231,7 @@ def test_run_resume_processes_unfinished_candidates(db_session, monkeypatch, har
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run(
-        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
-    )
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
 
     assert result.resumed == 2
     assert result.discovered == 0  # scout found nothing new
@@ -245,9 +243,7 @@ def test_run_resume_processes_unfinished_candidates(db_session, monkeypatch, har
 
 def test_run_resume_combines_with_new_scouting(db_session, monkeypatch, hardware_profile):
     """Resumed and freshly scouted candidates are processed in one batch."""
-    old = Candidate(
-        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
-    )
+    old = Candidate(source="arxiv", url="https://old", title="Old", raw_text="x", status="new")
     db_session.add(old)
     db_session.commit()
     db_session.refresh(old)
@@ -267,9 +263,7 @@ def test_run_resume_combines_with_new_scouting(db_session, monkeypatch, hardware
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run(
-        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
-    )
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
 
     assert result.resumed == 1
     assert result.discovered == 1
@@ -297,9 +291,7 @@ def test_run_resume_failed_again_stays_failed(db_session, monkeypatch, hardware_
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run(
-        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
-    )
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
 
     assert result.resumed == 1
     assert result.failed == 1
@@ -309,9 +301,7 @@ def test_run_resume_failed_again_stays_failed(db_session, monkeypatch, hardware_
 
 def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_profile):
     """With resume, a scout failure still processes the unfinished candidates."""
-    cand = Candidate(
-        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
-    )
+    cand = Candidate(source="arxiv", url="https://old", title="Old", raw_text="x", status="new")
     db_session.add(cand)
     db_session.commit()
     db_session.refresh(cand)
@@ -327,9 +317,7 @@ def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_pro
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run(
-        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True
-    )
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
 
     assert result.resumed == 1
     assert result.analyzed == 1
@@ -338,9 +326,7 @@ def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_pro
 
 def test_run_without_resume_ignores_existing_candidates(db_session, monkeypatch, hardware_profile):
     """Default run leaves pre-existing candidates untouched."""
-    cand = Candidate(
-        source="arxiv", url="https://old", title="Old", raw_text="x", status="new"
-    )
+    cand = Candidate(source="arxiv", url="https://old", title="Old", raw_text="x", status="new")
     db_session.add(cand)
     db_session.commit()
 

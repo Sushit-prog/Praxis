@@ -55,9 +55,7 @@ def test_approve_builds_candidate(db_session, monkeypatch, hardware_profile):
     cand = _borderline_candidate(db_session)
 
     def fake_architect(**kwargs):
-        bp = Blueprint(
-            candidate_id=cand.id, feasibility_score=5.0, blueprint_md="# Plan"
-        )
+        bp = Blueprint(candidate_id=cand.id, feasibility_score=5.0, blueprint_md="# Plan")
         db_session.add(bp)
         stored = db_session.get(Candidate, cand.id)
         stored.status = "blueprinted"

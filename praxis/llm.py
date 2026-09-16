@@ -139,9 +139,7 @@ def call_llm(
     candidate.
     """
     client = LLMClient(completion=completion) if completion else get_client()
-    return client.call(
-        prompt, system=system, model=model, stage=stage, candidate_id=candidate_id
-    )
+    return client.call(prompt, system=system, model=model, stage=stage, candidate_id=candidate_id)
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +226,7 @@ def _record_cache_hit(*, model: str, stage: str | None, candidate_id: int | None
     try:
         session = get_session()
         try:
-            session.add(
-                LLMUsage(model=model, stage=stage, candidate_id=candidate_id, cached=True)
-            )
+            session.add(LLMUsage(model=model, stage=stage, candidate_id=candidate_id, cached=True))
             session.commit()
         finally:
             session.close()
@@ -263,9 +259,7 @@ def _response_usage(response: Any) -> dict[str, int | None] | None:
     injected fake in tests), in which case nothing is recorded.
     """
     usage = (
-        response.get("usage")
-        if isinstance(response, dict)
-        else getattr(response, "usage", None)
+        response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     )
     if usage is None:
         return None

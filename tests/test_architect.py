@@ -114,9 +114,7 @@ def test_architect_prompt_wraps_untrusted_text(db_session, hardware_profile, mon
 def test_architect_empty_output_persists(db_session, hardware_profile, monkeypatch, caplog):
     cand = make_candidate(db_session)
     analysis = make_analysis()
-    monkeypatch.setattr(
-        architect_module, "call_llm", lambda prompt, system=None, **kwargs: "   "
-    )
+    monkeypatch.setattr(architect_module, "call_llm", lambda prompt, system=None, **kwargs: "   ")
 
     with caplog.at_level("WARNING"):
         bp = draft_blueprint(cand, analysis, hardware_profile)

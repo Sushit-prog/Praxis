@@ -215,9 +215,7 @@ def _gpu_requirement_mentioned(md: str) -> bool:
             # to the token itself, or an unrelated "no GPU needed" clause would
             # hide a real requirement (and a terse section ending right before
             # the "## Deferred" heading could suppress one the other way).
-            window = md[
-                max(0, match.start() - _GPU_GUARD_BEFORE) : match.end() + _GPU_GUARD_AFTER
-            ]
+            window = md[max(0, match.start() - _GPU_GUARD_BEFORE) : match.end() + _GPU_GUARD_AFTER]
             if _NEGATOR_RE.search(window) or _DEFERRAL_RE.search(window):
                 continue
             return True

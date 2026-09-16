@@ -27,9 +27,7 @@ def _plain_fake_completion(**kwargs):
 def test_call_llm_records_usage(db_session):
     from praxis.llm import call_llm
 
-    result = call_llm(
-        "hello", completion=_usage_fake_completion, stage="analyst", candidate_id=7
-    )
+    result = call_llm("hello", completion=_usage_fake_completion, stage="analyst", candidate_id=7)
 
     assert result == "ok"
     rows = db_session.scalars(select(LLMUsage)).all()
@@ -75,6 +73,7 @@ def test_call_llm_records_failed_attempt(db_session):
 
 def _counting_completion(calls):
     """A completion that counts invocations and returns a canned usage response."""
+
     def fake(**kwargs):
         calls["n"] += 1
         return {

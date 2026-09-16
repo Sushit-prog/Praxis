@@ -275,9 +275,7 @@ def run(
             if analysis.rejected:
                 logger.info("analyst rejected %s", url)
                 result.rejected += 1
-                result.candidates.append(
-                    CandidateOutcome(title=title, url=url, status="rejected")
-                )
+                result.candidates.append(CandidateOutcome(title=title, url=url, status="rejected"))
                 continue
 
             if analysis.borderline:

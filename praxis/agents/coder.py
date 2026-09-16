@@ -103,6 +103,7 @@ def _get_breaker() -> _CircuitBreaker:
         _breaker = _CircuitBreaker(_resolve_max_failures(), _resolve_cooldown())
     return _breaker
 
+
 PHASED_PLAN_HEADING = "phased build plan"
 MILESTONE_RE = re.compile(r"^\s*\d+[.)]\s")
 SUBITEM_RE = re.compile(r"^\s*[-*]\s")

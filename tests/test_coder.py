@@ -21,6 +21,7 @@ def _isolated_breaker(monkeypatch):
     monkeypatch.setenv("PRAXIS_CODER_MAX_FAILURES", "1000")
     monkeypatch.setenv("PRAXIS_CODER_COOLDOWN_S", "0")
 
+
 PHASED_PLAN_MD = (
     "# Build a Fine-Tuner \u2014 Blueprint\n\n"
     "## Problem Statement\nMake a small fine-tuner.\n\n"

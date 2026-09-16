@@ -95,9 +95,7 @@ def approve(
     """Approve a borderline candidate and build it through the normal path."""
     candidate = _load_candidate(candidate_id)
     if candidate is None:
-        return ReviewResult(
-            candidate_id, "", "", "approved", "missing", error="no such candidate"
-        )
+        return ReviewResult(candidate_id, "", "", "approved", "missing", error="no such candidate")
     title = candidate.title or ""
     url = candidate.url or ""
     if candidate.status != BORDERLINE_STATUS:
@@ -146,9 +144,7 @@ def reject(candidate_id: int) -> ReviewResult:
     """Reject a borderline candidate; it will not be built."""
     candidate = _load_candidate(candidate_id)
     if candidate is None:
-        return ReviewResult(
-            candidate_id, "", "", "rejected", "missing", error="no such candidate"
-        )
+        return ReviewResult(candidate_id, "", "", "rejected", "missing", error="no such candidate")
     title = candidate.title or ""
     url = candidate.url or ""
     if candidate.status != BORDERLINE_STATUS:
