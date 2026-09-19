@@ -324,6 +324,61 @@ def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_pro
     assert result.prototyped == 1
 
 
+def test_run_scout_failure_recorded_in_stage_failures(monkeypatch, hardware_profile):
+    """Bug regression: a failed scout stage is visible in the result and summary."""
+
+    def fake_scout(**kwargs):
+        raise ValueError("unsupported source")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=3)
+
+    assert "scout" in result.stage_failures
+    assert "ValueError" in result.stage_failures["scout"]
+    assert "unsupported source" in result.stage_failures["scout"]
+    summary = format_summary(result)
+    assert "scout: FAILED" in summary
+    assert "unsupported source" in summary
+
+
+def test_run_scout_db_error_not_retried(monkeypatch, hardware_profile):
+    """Bug regression: a DB error in scout fails fast — exactly one attempt."""
+    from sqlalchemy.exc import OperationalError
+
+    calls = {"n": 0}
+
+    def fake_scout(**kwargs):
+        calls["n"] += 1
+        raise OperationalError("SELECT", {}, Exception("no such table: candidates"))
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr("praxis.pipeline.time.sleep", lambda s: None)
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=3)
+
+    assert calls["n"] == 1
+    assert "OperationalError" in result.stage_failures["scout"]
+
+
+def test_run_scout_rate_limit_error_is_retried(monkeypatch, hardware_profile):
+    """Transient scout errors still retry; exhausted attempts land in stage_failures."""
+    RateLimitError = type("RateLimitError", (Exception,), {})
+    calls = {"n": 0}
+
+    def fake_scout(**kwargs):
+        calls["n"] += 1
+        raise RateLimitError("429 too many requests")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr("praxis.pipeline.time.sleep", lambda s: None)
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=3)
+
+    assert calls["n"] == 3  # retried with backoff before giving up
+    assert "RateLimitError" in result.stage_failures["scout"]
+
+
 def test_run_without_resume_ignores_existing_candidates(db_session, monkeypatch, hardware_profile):
     """Default run leaves pre-existing candidates untouched."""
     cand = Candidate(source="arxiv", url="https://old", title="Old", raw_text="x", status="new")

@@ -7,6 +7,7 @@ skipped; a single bad candidate never aborts the rest of the batch.
 
 from __future__ import annotations
 
+import http.client
 import logging
 import time
 from collections.abc import Callable
@@ -26,8 +27,38 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETRIES = 3
 BACKOFF_BASE_S = 1.0
 
+# Retry policy: only network/rate-limit style errors are retried. Programming
+# and DB errors (TypeError, ValueError, SQLAlchemy errors, ...) fail fast —
+# retrying them cannot help and only delays a visible failure.
+_TRANSIENT_EXC_NAMES = frozenset(
+    {
+        # litellm/openai error families, matched by name so this module does not
+        # need to import litellm (llm.py re-raises the original provider error).
+        "RateLimitError",
+        "ServiceUnavailableError",
+        "InternalServerError",
+        "APIConnectionError",
+        "APITimeoutError",
+    }
+)
+_TRANSIENT_EXC_TYPES: tuple[type[BaseException], ...] = (
+    OSError,  # ConnectionError, TimeoutError, socket.timeout, requests errors
+    http.client.HTTPException,
+)
+# OS errors that are configuration/programming problems, never transient.
+_FATAL_OS_ERRORS = (FileNotFoundError, PermissionError, NotADirectoryError, IsADirectoryError)
+
 FAILED_STATUS = "failed"
 REVIEWED_STATUS = "reviewed"
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for network/rate-limit style errors worth retrying with backoff."""
+    if isinstance(exc, _FATAL_OS_ERRORS):
+        return False
+    if isinstance(exc, _TRANSIENT_EXC_TYPES):
+        return True
+    return type(exc).__name__ in _TRANSIENT_EXC_NAMES
 
 
 def run_with_retry(
@@ -37,14 +68,21 @@ def run_with_retry(
     base_backoff: float = BACKOFF_BASE_S,
     **kwargs: Any,
 ) -> Any:
-    """Call fn(**kwargs), retrying on transient errors with backoff."""
+    """Call fn(**kwargs), retrying transient (network/rate-limit) errors with backoff.
+
+    Programming and DB errors (TypeError, ValueError, SQLAlchemy errors, ...)
+    are re-raised immediately: retrying them cannot help and only delays the
+    visible failure.
+    """
     last_error: Exception | None = None
     for attempt in range(retries):
         try:
             return fn(**kwargs)
         except NotImplementedError:
             raise
-        except Exception as exc:  # noqa: BLE001 - retry on any transient failure
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_transient(exc):
+                raise
             last_error = exc
             if attempt < retries - 1:
                 delay = base_backoff * (2**attempt)
@@ -97,6 +135,17 @@ class PipelineResult:
     usage_cost_usd: float = 0.0
     usage_cached_hits: int = 0
     candidates: list[CandidateOutcome] = field(default_factory=list)
+    # Batch-level stage failures (e.g. scout): stage name -> one-line reason.
+    stage_failures: dict[str, str] = field(default_factory=dict)
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """Compact single-line reason for a stage failure, safe for the summary."""
+    # run_with_retry wraps exhausted retries in RuntimeError; prefer the cause.
+    if isinstance(exc, RuntimeError) and exc.__cause__ is not None:
+        exc = exc.__cause__
+    message = f"{type(exc).__name__}: {exc}"
+    return message.splitlines()[0][:160]
 
 
 def _mark_failed(candidate_id: int | None) -> None:
@@ -239,6 +288,7 @@ def run(
         raise
     except Exception as exc:  # noqa: BLE001 - scout failure aborts, unless there is work to resume
         logger.warning("scout failed for topic=%r: %s", topic, exc)
+        result.stage_failures["scout"] = _failure_reason(exc)
         if not candidates:
             return result
         logger.warning("scout failed; continuing with %d resumed candidate(s)", len(candidates))
@@ -345,6 +395,8 @@ def format_summary(result: PipelineResult) -> str:
     ]
     lines = [f"Summary for topic={result.topic!r} source={result.source}"]
     lines.extend(f"  {label}: {value}" for label, value in rows)
+    for stage, reason in result.stage_failures.items():
+        lines.append(f"  {stage}: FAILED ({reason})")
     if result.resumed:
         lines.append(f"  resumed: {result.resumed}")
     if result.usage_calls:

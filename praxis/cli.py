@@ -73,12 +73,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_schema() -> None:
+    """Create the SQLite schema if it does not exist yet (idempotent).
+
+    Runs once before any command so a fresh checkout has tables instead of
+    "no such table" OperationalErrors from status/show/memory/review/usage.
+    Also creates the parent directory of a configured SQLite file path, since
+    SQLite cannot create missing directories itself.
+    """
+    import os
+    from pathlib import Path
+
+    from sqlalchemy.engine import make_url
+
+    from praxis.db import init_db
+
+    url = os.environ.get("PRAXIS_DB_URL")
+    if url:
+        parsed = make_url(url)
+        if parsed.drivername.startswith("sqlite"):
+            database = parsed.database  # SQLAlchemy-normalized path (None = in-memory)
+            if database and database != ":memory:":
+                Path(database).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    init_db()
+
+
 def _cmd_run(args) -> int:
     from praxis.pipeline import format_summary, run
 
     result = run(source=args.source, topic=args.topic, limit=args.limit, resume=args.resume)
     print(format_summary(result))
-    return 0
+    # A batch-level stage failure (e.g. scout) must be visible in the exit code.
+    return 1 if result.stage_failures else 0
 
 
 def _cmd_status(args) -> int:
@@ -153,20 +179,13 @@ def _format_usage_report(summary) -> str:
 
 
 def _cmd_usage(args) -> int:
-    from sqlalchemy.exc import OperationalError
-
     from praxis.db import usage_summary
 
     if args.days < 1:
         print("error: --days must be >= 1", file=sys.stderr)
         return 1
-    try:
-        summary = usage_summary(days=args.days)
-    except OperationalError as exc:
-        if "no such table" in str(exc):
-            print("No LLM usage recorded yet (run the pipeline first).")
-            return 0
-        raise
+    # Schema is guaranteed by _ensure_schema(); a zero-row ledger is the empty case.
+    summary = usage_summary(days=args.days)
     if summary.totals.calls == 0:
         print("No LLM usage recorded yet (run the pipeline first).")
         return 0
@@ -190,17 +209,10 @@ def _cmd_memory(args) -> int:
 def _cmd_providers(args) -> int:
     from datetime import UTC, datetime
 
-    from sqlalchemy.exc import OperationalError
-
     from praxis.db import provider_health_rows
 
-    try:
-        rows = provider_health_rows()
-    except OperationalError as exc:
-        if "no such table" in str(exc):
-            print("Provider pool: no health state recorded yet (run the pipeline first).")
-            return 0
-        raise
+    # Schema is guaranteed by _ensure_schema(); no rows is the empty case.
+    rows = provider_health_rows()
     if not rows:
         print("Provider pool: no health state recorded yet (run the pipeline first).")
         return 0
@@ -288,6 +300,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format=LOG_FORMAT,
     )
+
+    # Every command reads or writes the ledger; make sure the tables exist so a
+    # fresh checkout gets clean empty output instead of "no such table" errors.
+    if args.command is not None:
+        _ensure_schema()
 
     if args.command == "run":
         try:

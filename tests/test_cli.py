@@ -223,6 +223,38 @@ def test_cli_usage_missing_table(tmp_path, monkeypatch, capsys):
     assert "No LLM usage recorded yet" in capsys.readouterr().out
 
 
+def test_cli_status_fresh_checkout_no_db(tmp_path, monkeypatch, capsys):
+    """Bug regression: status on a fresh checkout creates the schema, no traceback."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'fresh.db'}")
+    assert not (tmp_path / "fresh.db").exists()
+
+    rc = main(["status"])
+
+    assert rc == 0
+    assert "No candidates" in capsys.readouterr().out
+    assert (tmp_path / "fresh.db").exists()  # schema was created
+
+
+def test_cli_show_memory_review_usage_fresh_checkout(tmp_path, monkeypatch, capsys):
+    """Bug regression: every read command works on a brand-new empty database."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'fresh.db'}")
+
+    assert main(["show", "1"]) == 1  # candidate missing, but no crash
+    assert "no candidate" in capsys.readouterr().err
+
+    assert main(["memory"]) == 0
+    assert "No build memory recorded yet." in capsys.readouterr().out
+
+    assert main(["review"]) == 0
+    assert "No candidates awaiting review." in capsys.readouterr().out
+
+    assert main(["usage"]) == 0
+    assert "No LLM usage recorded yet" in capsys.readouterr().out
+
+    assert main(["providers"]) == 0
+    assert "no health state recorded yet" in capsys.readouterr().out
+
+
 def test_cli_status_empty_db(tmp_path, monkeypatch, capsys):
     from sqlalchemy import create_engine
 
@@ -265,6 +297,26 @@ def test_cli_run_prints_summary(monkeypatch, capsys):
     assert "rejected: 1" in out
     assert "Alpha [prototyped]" in out
     assert "Beta [rejected]" in out
+
+
+def test_cli_run_scout_failure_exits_nonzero(monkeypatch, tmp_path, capsys):
+    """Bug regression: a failed scout shows a failure line and exits non-zero."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'run.db'}")
+
+    from praxis.pipeline import PipelineResult
+
+    def failing_run(**kwargs):
+        result = PipelineResult(source="arxiv", topic="attention")
+        result.stage_failures["scout"] = "OperationalError: no such table: candidates"
+        return result
+
+    monkeypatch.setattr("praxis.pipeline.run", failing_run)
+
+    rc = main(["run", "--source", "arxiv", "--topic", "attention"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "scout: FAILED (OperationalError: no such table: candidates)" in out
 
 
 def _write_golden(path, entries):
