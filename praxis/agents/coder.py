@@ -37,6 +37,11 @@ PROVIDER_RETRIES_ENV = "PRAXIS_CODER_PROVIDER_RETRIES"
 OPENCODE_FLAGS_ENV = "PRAXIS_CODER_OPENCODE_FLAGS"
 DEFAULT_OPENCODE_FLAGS = "--auto"
 
+# How much of opencode's stderr is logged on failure: the first lines (often
+# the config/banner) and the tail (where the actual error line lives).
+_STDERR_HEAD_LINES = 10
+_STDERR_TAIL_LINES = 15
+
 # Coder stage mode: "off" (default) ends the pipeline at the blueprint (the
 # exportable artifact); "opencode" drafts prototypes via the OpenCode CLI.
 # Opt in per run with `praxis run --prototype`, or persistently with env.
@@ -314,6 +319,27 @@ def _persist_status(
         session.close()
 
 
+def _stderr_summary(output) -> str:
+    """First lines + tail of opencode's stderr for a failure log.
+
+    The real error line is almost always at the very end of stderr, while the
+    first lines show what opencode was doing; logging only a byte-limited tail
+    used to cut the error off entirely for long, single-line JSON errors.
+    """
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    lines = [line for line in (output or "").splitlines() if line.strip()]
+    if not lines:
+        return "(stderr empty)"
+    limit = _STDERR_HEAD_LINES + _STDERR_TAIL_LINES
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    omitted = len(lines) - limit
+    head = lines[:_STDERR_HEAD_LINES]
+    tail = lines[-_STDERR_TAIL_LINES:]
+    return "\n".join([*head, f"... ({omitted} lines omitted) ...", *tail])
+
+
 def _classify_opencode_failure(exc_or_proc) -> str | None:
     """Return an exhaustion signal for a failed opencode run (exit/timeout), or None."""
     output = (
@@ -375,10 +401,10 @@ def draft_prototype(
                 continue
             breaker.record_failure()
             logger.warning(
-                "coder: opencode timed out after %ss for blueprint %s: %s",
+                "coder: opencode timed out after %ss for blueprint %s; stderr:\n%s",
                 timeout,
                 blueprint.id,
-                exc,
+                _stderr_summary(exc.stderr),
             )
             _persist_status(blueprint, "prototype_failed", None)
             return None
@@ -392,10 +418,10 @@ def draft_prototype(
                 continue
             breaker.record_failure()
             logger.warning(
-                "coder: opencode failed for blueprint %s (rc=%s): %s",
+                "coder: opencode failed for blueprint %s (rc=%s); stderr:\n%s",
                 blueprint.id,
                 proc.returncode,
-                output[-2000:],
+                _stderr_summary(proc.stderr),
             )
             _persist_status(blueprint, "prototype_failed", None)
             return None

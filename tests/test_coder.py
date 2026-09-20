@@ -455,3 +455,44 @@ def test_draft_prototype_skips_cooling_provider(db_session, monkeypatch, tmp_pat
     assert len(calls) == 1
     assert "groq/llama-3.1-8b-instant" not in calls[0]
     assert "openrouter/openai/gpt-4o-mini" in calls[0]
+
+
+def test_stderr_summary_first_lines_and_tail():
+    """Long stderr keeps the head and the tail; the actual error line survives."""
+    from praxis.agents.coder import _stderr_summary
+
+    lines = [f"line {i}" for i in range(1, 51)]
+    out = _stderr_summary("\n".join(lines))
+
+    assert "line 1" in out and "line 10" in out  # head
+    assert "line 50" in out and "line 36" in out  # tail
+    assert "lines omitted" in out
+    assert "line 25" not in out  # middle is elided
+
+
+def test_stderr_summary_short_output_kept_whole():
+    from praxis.agents.coder import _stderr_summary
+
+    assert _stderr_summary("boom") == "boom"
+    assert _stderr_summary("") == "(stderr empty)"
+    assert _stderr_summary(None) == "(stderr empty)"
+
+
+def test_draft_prototype_failure_logs_stderr_head_and_tail(
+    db_session, monkeypatch, tmp_path, caplog
+):
+    """The actual error line at the end of a long stderr is visible in the log."""
+    cand = make_candidate(db_session)
+    bp = make_blueprint(db_session, cand)
+    long_stderr = "\n".join(f"noise {i}" for i in range(1, 61)) + "\nError: provider key rejected"
+    mock_subprocess_run(
+        monkeypatch, fake_completed(returncode=1, stdout="", stderr=long_stderr)
+    )
+
+    with caplog.at_level("WARNING"):
+        path = draft_prototype(bp, scratch_root=tmp_path)
+
+    assert path is None
+    assert "Error: provider key rejected" in caplog.text  # tail survived
+    assert "noise 1" in caplog.text  # head survived
+    assert "noise 30" not in caplog.text  # middle elided
