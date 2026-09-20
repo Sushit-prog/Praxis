@@ -38,6 +38,74 @@ DEFAULT_MODEL = "groq/openai/gpt-oss-20b"
 # Env toggle for the response cache; caching is on unless set to 0/false/no/off.
 CACHE_ENV = "PRAXIS_LLM_CACHE"
 
+# Truncation guard: max_tokens for the first attempt (unset = provider default)
+# and for the one retry after a truncated response (default: 2x the first
+# attempt when set, else DEFAULT_RETRY_MAX_TOKENS).
+MAX_TOKENS_ENV = "PRAXIS_MAX_TOKENS"
+MAX_TOKENS_RETRY_ENV = "PRAXIS_MAX_TOKENS_RETRY"
+DEFAULT_RETRY_MAX_TOKENS = 8192
+
+
+class TruncatedOutputError(RuntimeError):
+    """The LLM response was truncated even after a higher-max_tokens retry.
+
+    Raised instead of returning (and never caching or persisting) a partial
+    output: a blueprint that ends mid-sentence is worse than no blueprint.
+    """
+
+
+def _initial_max_tokens() -> int | None:
+    """First-attempt max_tokens from PRAXIS_MAX_TOKENS (None = provider default)."""
+    raw = os.environ.get(MAX_TOKENS_ENV)
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("invalid %s=%r; ignoring", MAX_TOKENS_ENV, raw)
+        return None
+
+
+def _retry_max_tokens(first: int | None) -> int:
+    """max_tokens for the truncation retry: env override, else 2x first, else default."""
+    raw = os.environ.get(MAX_TOKENS_RETRY_ENV)
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("invalid %s=%r; ignoring", MAX_TOKENS_RETRY_ENV, raw)
+    if first is not None:
+        return first * 2
+    return DEFAULT_RETRY_MAX_TOKENS
+
+
+def _truncation_reason(response: Any) -> str | None:
+    """Why a response counts as truncated, or None when it is complete.
+
+    Two signals: ``finish_reason == "length"`` (the model ran out of output
+    tokens mid-text), and empty content — reasoning models can spend the
+    whole budget on invisible reasoning and return nothing.
+    """
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        choice = choices[0] if choices else None
+    else:
+        choices = getattr(response, "choices", None) or []
+        choice = choices[0] if choices else None
+    if choice is None:
+        return None
+    if isinstance(choice, dict):
+        finish = choice.get("finish_reason")
+        content = (choice.get("message") or {}).get("content")
+    else:
+        finish = getattr(choice, "finish_reason", None)
+        content = getattr(getattr(choice, "message", None), "content", None)
+    if finish == "length":
+        return "finish_reason=length"
+    if content is None or (isinstance(content, str) and not content.strip()):
+        return "empty content (reasoning consumed the token budget)"
+    return None
+
 # Upper bound (seconds) for waiting out provider cooldowns when every provider
 # is rate-limited: wait for the earliest cooldown to expire, but never stall a
 # run longer than this — afterwards the run aborts with candidates retryable.
@@ -122,10 +190,50 @@ class LLMClient:
         for attempt_model in attempt_chain:
             kwargs["model"] = attempt_model
             _inject_provider_key(kwargs, attempt_model)
+            first_tokens = _initial_max_tokens()
+            if first_tokens is not None:
+                kwargs["max_tokens"] = first_tokens
+            else:
+                kwargs.pop("max_tokens", None)
             started = time.monotonic()
             try:
                 response = self._completion(**kwargs)
+                reason = _truncation_reason(response)
+                if reason is not None:
+                    # Truncation is not a provider failure: retry the SAME
+                    # model once with a higher token budget instead of
+                    # failing over or returning a partial output.
+                    _record_failure(
+                        RuntimeError(f"truncated: {reason}"),
+                        model=attempt_model,
+                        stage=stage,
+                        candidate_id=candidate_id,
+                        latency_ms=_elapsed_ms(started),
+                    )
+                    retry_tokens = _retry_max_tokens(kwargs.get("max_tokens"))
+                    logger.warning(
+                        "llm: %s output truncated (%s); retrying once with "
+                        "max_tokens=%s",
+                        attempt_model,
+                        reason,
+                        retry_tokens,
+                    )
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["max_tokens"] = retry_tokens
+                    response = self._completion(**retry_kwargs)
+                    retry_reason = _truncation_reason(response)
+                    if retry_reason is not None:
+                        raise TruncatedOutputError(
+                            f"LLM output truncated twice from {attempt_model} "
+                            f"({retry_reason}) even with max_tokens={retry_tokens}; "
+                            "refusing to return or store a partial output. "
+                            f"Raise {MAX_TOKENS_RETRY_ENV} or shorten the prompt."
+                        )
+                    # Usage for the successful retry is recorded by the normal
+                    # post-loop path (latency covers both attempts).
                 break
+            except TruncatedOutputError:
+                raise
             except Exception as exc:  # noqa: BLE001 - record attempt, try next model
                 errors.append(exc)
                 _record_failure(

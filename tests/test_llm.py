@@ -488,3 +488,114 @@ def test_all_providers_cooling_bounded_wait_then_raises(db_session, monkeypatch)
 
     # The 600s cooldowns were waited out only up to the ~90s bound.
     assert sleeps == [pytest.approx(90.0)]
+
+
+# ---------------------------------------------------------------------------
+# Truncation guard
+# ---------------------------------------------------------------------------
+
+
+def test_truncated_output_retries_once_with_higher_max_tokens(db_session, monkeypatch):
+    """finish_reason=length: one retry with a higher max_tokens, then success."""
+    from praxis import llm as llm_module
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    seen = []
+
+    def completion(**kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        if kwargs.get("max_tokens") == llm_module.DEFAULT_RETRY_MAX_TOKENS:
+            return {"choices": [{"message": {"content": "full output"}, "finish_reason": "stop"}]}
+        return {"choices": [{"message": {"content": "partial..."}, "finish_reason": "length"}]}
+
+    out = llm_module.call_llm("hello", model="groq/x", completion=completion)
+
+    assert out == "full output"
+    assert seen == [None, llm_module.DEFAULT_RETRY_MAX_TOKENS]
+
+
+def test_truncation_retry_honors_env_overrides(db_session, monkeypatch):
+    """PRAXIS_MAX_TOKENS sets the first attempt; PRAXIS_MAX_TOKENS_RETRY the retry."""
+    from praxis import llm as llm_module
+
+    monkeypatch.setenv("PRAXIS_MAX_TOKENS", "100")
+    monkeypatch.setenv("PRAXIS_MAX_TOKENS_RETRY", "500")
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    seen = []
+
+    def completion(**kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        if kwargs.get("max_tokens") == 500:
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        return {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]}
+
+    out = llm_module.call_llm("hello", model="groq/x", completion=completion)
+
+    assert out == "ok"
+    assert seen == [100, 500]
+
+
+def test_truncated_twice_raises_and_never_caches(db_session, monkeypatch):
+    """Still truncated after the retry: clear error, no partial output stored."""
+    from sqlalchemy import select
+
+    from praxis import llm as llm_module
+    from praxis.db import LLMCache, LLMUsage
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    def completion(**kwargs):
+        return {"choices": [{"message": {"content": "partial..."}, "finish_reason": "length"}]}
+
+    with pytest.raises(llm_module.TruncatedOutputError) as excinfo:
+        llm_module.call_llm("hello", model="groq/x", completion=completion)
+
+    assert "truncated twice" in str(excinfo.value)
+    assert "partial..." not in str(excinfo.value)  # the truncated text is not echoed
+    assert db_session.scalars(select(LLMCache)).all() == []  # never cached
+    rows = db_session.scalars(select(LLMUsage)).all()
+    assert rows and rows[0].error and "truncated" in rows[0].error  # ledger shows it
+
+
+def test_empty_content_from_reasoning_model_triggers_retry(db_session, monkeypatch):
+    """A reasoning model that spent everything on reasoning: retry once."""
+    from praxis import llm as llm_module
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    calls = {"n": 0}
+
+    def completion(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+        return {"choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]}
+
+    out = llm_module.call_llm("hello", model="groq/x", completion=completion)
+
+    assert out == "recovered"
+    assert calls["n"] == 2
+
+
+def test_complete_response_is_not_retried(db_session, monkeypatch):
+    """A normal response takes the single-attempt path."""
+    from praxis import llm as llm_module
+
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    calls = {"n": 0}
+
+    def completion(**kwargs):
+        calls["n"] += 1
+        return {"choices": [{"message": {"content": "fine"}, "finish_reason": "stop"}]}
+
+    assert llm_module.call_llm("hello", model="groq/x", completion=completion) == "fine"
+    assert calls["n"] == 1
