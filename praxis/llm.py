@@ -22,6 +22,7 @@ from praxis.db import LLMCache, LLMUsage, get_session
 from praxis.providers import (
     AUTH_SIGNAL,
     JOB_PIPELINE,
+    AllProvidersCoolingDownError,
     NoWorkingProviderError,
     ProviderPool,
     classify_auth_failure,
@@ -36,6 +37,11 @@ DEFAULT_MODEL = "groq/openai/gpt-oss-20b"
 
 # Env toggle for the response cache; caching is on unless set to 0/false/no/off.
 CACHE_ENV = "PRAXIS_LLM_CACHE"
+
+# Upper bound (seconds) for waiting out provider cooldowns when every provider
+# is rate-limited: wait for the earliest cooldown to expire, but never stall a
+# run longer than this — afterwards the run aborts with candidates retryable.
+MAX_COOLDOWN_WAIT_S = 90.0
 
 # Comma-separated models tried after the primary when it fails (rate limit, outage).
 FALLBACKS_ENV = "PRAXIS_FALLBACK_MODELS"
@@ -90,8 +96,26 @@ class LLMClient:
 
         attempt_chain = pool.healthy_models(chain)
         if not attempt_chain:
-            raise RuntimeError(
-                f"all LLM providers are in cooldown ({', '.join(provider_of(m) for m in chain)})"
+            # Every provider is rate-limited: wait for the earliest cooldown to
+            # expire (bounded) rather than failing the candidate outright — a
+            # rate limit is transient, and the candidate should be retried.
+            wait_s = pool.seconds_until_recovery([provider_of(m) for m in chain])
+            if wait_s is not None:
+                bounded = min(wait_s + 0.5, MAX_COOLDOWN_WAIT_S)
+                logger.warning(
+                    "llm: all providers cooling down; waiting %.0fs for the "
+                    "earliest cooldown to expire (bound %.0fs)",
+                    bounded,
+                    MAX_COOLDOWN_WAIT_S,
+                )
+                time.sleep(bounded)
+            attempt_chain = pool.healthy_models(chain)
+        if not attempt_chain:
+            raise AllProvidersCoolingDownError(
+                f"all LLM providers are cooling down after waiting up to "
+                f"{MAX_COOLDOWN_WAIT_S:.0f}s "
+                f"({', '.join(provider_of(m) for m in chain)}); "
+                "re-run with --resume later — candidates were not marked failed"
             )
         errors: list[Exception] = []
         auth_failures: list[tuple[str, str]] = []

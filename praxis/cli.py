@@ -369,13 +369,13 @@ def _cmd_review(args) -> int:
         return 0
 
     if args.review_action == "approve":
-        from praxis.providers import NoWorkingProviderError
+        from praxis.providers import ProviderUnavailableError
 
         try:
             result = approve(args.candidate_id, prototype=args.prototype)
-        except NoWorkingProviderError as exc:
-            # Provider-level failure (bad keys): the candidate stays `reviewed`
-            # (retryable); report cleanly instead of a traceback.
+        except ProviderUnavailableError as exc:
+            # Provider-level failure (bad keys or all rate-limited): the
+            # candidate stays `reviewed` (retryable); report cleanly.
             print(f"error: {exc}", file=sys.stderr)
             return 1
     elif args.review_action == "reject":

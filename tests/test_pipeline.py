@@ -805,3 +805,30 @@ def test_run_resume_picks_up_analyzed_candidates(db_session, monkeypatch, hardwa
     db_session.refresh(cand)
 
     assert [c.url for c in _unfinished_candidates()] == ["https://a"]
+
+
+def test_run_all_providers_cooling_leaves_candidates_retryable(
+    db_session, monkeypatch, hardware_profile
+):
+    """A rate-limit dead-end aborts the run without failing candidates."""
+    from praxis.providers import AllProvidersCoolingDownError
+
+    cand = Candidate(source="arxiv", url="https://a", title="A", raw_text="x", status="new")
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        raise AllProvidersCoolingDownError("all LLM providers are cooling down")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+
+    with pytest.raises(AllProvidersCoolingDownError):
+        run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "new"  # retryable, not failed

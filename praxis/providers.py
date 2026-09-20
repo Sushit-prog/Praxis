@@ -62,14 +62,32 @@ CONTEXT_MARKERS = re.compile(
 AUTH_SIGNAL = "auth"
 
 
-class NoWorkingProviderError(RuntimeError):
+class ProviderUnavailableError(RuntimeError):
+    """No provider could serve the request right now.
+
+    Base class for the two provider-pool dead-ends: every provider rejected
+    the key (:class:`NoWorkingProviderError`) or every provider is rate-limited
+    and still in cooldown after the bounded wait
+    (:class:`AllProvidersCoolingDownError`). Callers must abort the run without
+    marking candidates ``failed`` — candidates stay retryable for ``--resume``.
+    """
+
+
+class NoWorkingProviderError(ProviderUnavailableError):
     """Every configured provider rejected the request (e.g. bad API keys).
 
     Raised by the LLM layer after the whole provider chain fails with the same
     provider-level (auth) failure. Message format:
-    ``no working provider: <name>: <reason>``. Callers must abort the run
-    without marking candidates ``failed`` — the failure is a configuration
-    problem, so candidates stay in a retryable state for ``--resume``.
+    ``no working provider: <name>: <reason>``.
+    """
+
+
+class AllProvidersCoolingDownError(ProviderUnavailableError):
+    """Every provider is rate-limited and still cooling down after the bounded wait.
+
+    Raised by the LLM layer when the pool cannot serve a request even after
+    waiting for the earliest cooldown to expire (capped at ~90s). Re-running
+    with ``--resume`` later picks the candidates back up.
     """
 
 # ---------------------------------------------------------------------------
@@ -258,6 +276,26 @@ class ProviderPool:
             if not self.is_cooling_down(provider):
                 return provider
         return None
+
+    def seconds_until_recovery(self, providers: list[str] | None = None) -> float | None:
+        """Seconds until the earliest active cooldown among ``providers`` expires.
+
+        Returns None when no provider is currently cooling down. Used by Job A
+        to wait out a rate limit instead of failing the candidate outright.
+        """
+        candidates = (
+            providers if providers is not None else self.ordered_providers()
+        )
+        deadlines = [
+            self.cooldown_until(provider)
+            for provider in candidates
+            if self.is_cooling_down(provider)
+        ]
+        deadlines = [deadline for deadline in deadlines if deadline is not None]
+        if not deadlines:
+            return None
+        earliest = min(deadlines)
+        return max(0.0, (earliest - _wall_now()).total_seconds())
 
     # -- mutations ----------------------------------------------------------
 

@@ -420,3 +420,71 @@ def test_all_providers_auth_failing_raises_no_working_provider(db_session, monke
     with pytest.raises(NoWorkingProviderError) as excinfo:
         llm_module.call_llm("hello", model="groq/openai/gpt-oss-20b", completion=completion)
     assert "no working provider" in str(excinfo.value)
+
+
+def test_all_providers_cooling_waits_for_recovery_then_succeeds(db_session, monkeypatch):
+    """When every provider is rate-limited, the call waits out the earliest cooldown."""
+    from datetime import timedelta
+
+    from praxis import llm as llm_module
+    from praxis import providers as providers_module
+
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "openrouter/openai/gpt-oss-20b")
+    monkeypatch.setenv("PRAXIS_PROVIDER_COOLDOWN_S", "5")
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    # Fake clock so the cooldown actually expires during the (patched) sleep.
+    clock = {"now": providers_module._wall_now()}
+    monkeypatch.setattr(providers_module, "_wall_now", lambda: clock["now"])
+    monkeypatch.setattr(
+        llm_module.time,
+        "sleep",
+        lambda s: clock.update(now=clock["now"] + timedelta(seconds=s)),
+    )
+
+    pool = llm_module._get_pool()
+    pool.mark_exhausted("groq", "rate_limit")
+    pool.mark_exhausted("openrouter", "rate_limit")
+
+    def completion(**kwargs):
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    out = llm_module.call_llm("hello", model="groq/openai/gpt-oss-20b", completion=completion)
+
+    assert out == "ok"
+
+
+def test_all_providers_cooling_bounded_wait_then_raises(db_session, monkeypatch):
+    """Still cooling after the ~90s bound: raise without touching the LLM."""
+    from datetime import timedelta
+
+    from praxis import llm as llm_module
+    from praxis import providers as providers_module
+    from praxis.providers import AllProvidersCoolingDownError
+
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "openrouter/openai/gpt-oss-20b")
+    monkeypatch.setenv("PRAXIS_PROVIDER_COOLDOWN_S", "600")
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    clock = {"now": providers_module._wall_now()}
+    sleeps: list[float] = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        clock["now"] = clock["now"] + timedelta(seconds=s)
+
+    monkeypatch.setattr(providers_module, "_wall_now", lambda: clock["now"])
+    monkeypatch.setattr(llm_module.time, "sleep", fake_sleep)
+
+    pool = llm_module._get_pool()
+    pool.mark_exhausted("groq", "rate_limit")
+    pool.mark_exhausted("openrouter", "rate_limit")
+
+    def completion(**kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("completion must not be called while every provider cools down")
+
+    with pytest.raises(AllProvidersCoolingDownError):
+        llm_module.call_llm("hello", model="groq/openai/gpt-oss-20b", completion=completion)
+
+    # The 600s cooldowns were waited out only up to the ~90s bound.
+    assert sleeps == [pytest.approx(90.0)]

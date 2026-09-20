@@ -22,7 +22,7 @@ from praxis.agents.analyst import AnalysisResult
 from praxis.agents.coder import CODER_MODE_ENV, resolve_coder_mode
 from praxis.config import HardwareProfile, load_config
 from praxis.db import Candidate, UsageTotals, get_session, usage_totals
-from praxis.providers import NoWorkingProviderError
+from praxis.providers import ProviderUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -230,9 +230,10 @@ def build_from_analysis(
         )
     except NotImplementedError:
         raise
-    except NoWorkingProviderError:
-        # Provider-level failure (bad keys): the candidate stays in its
-        # current retryable status and the run aborts; --resume picks it up.
+    except ProviderUnavailableError:
+        # Provider-level failure (bad keys or all rate-limited): the candidate
+        # stays in its current retryable status and the run aborts; --resume
+        # picks it up.
         raise
     except Exception as exc:  # noqa: BLE001 - isolate candidate failures
         logger.warning("architect failed for %s: %s", url, exc)
@@ -355,9 +356,10 @@ def run(
                 )
             except NotImplementedError:
                 raise
-            except NoWorkingProviderError:
-                # Provider-level failure (bad keys): keep the candidate
-                # retryable and abort the run early; do not mark it failed.
+            except ProviderUnavailableError:
+                # Provider-level failure (bad keys or all rate-limited): keep
+                # the candidate retryable and abort the run early; do not
+                # mark it failed.
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate candidate failures
                 logger.warning("analyst failed for %s: %s", url, exc)

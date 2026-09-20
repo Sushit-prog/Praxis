@@ -429,3 +429,23 @@ def test_cli_run_no_working_provider_exits_nonzero(monkeypatch, tmp_path, capsys
 
     assert rc == 1
     assert "no working provider: groq" in capsys.readouterr().err
+
+
+def test_cli_run_all_providers_cooling_exits_nonzero(monkeypatch, tmp_path, capsys):
+    """A rate-limit dead-end reports cleanly and exits 1 (candidates stay retryable)."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'run.db'}")
+
+    from praxis.providers import AllProvidersCoolingDownError
+
+    def failing_run(**kwargs):
+        raise AllProvidersCoolingDownError(
+            "all LLM providers are cooling down after waiting up to 90s; "
+            "re-run with --resume later — candidates were not marked failed"
+        )
+
+    monkeypatch.setattr("praxis.pipeline.run", failing_run)
+
+    rc = main(["run", "--source", "arxiv", "--topic", "attention"])
+
+    assert rc == 1
+    assert "cooling down" in capsys.readouterr().err
