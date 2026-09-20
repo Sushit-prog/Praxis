@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("providers", help="Show live provider pool health (cooldowns, signals).")
 
+    sub.add_parser(
+        "doctor", help="Run pre-flight checks (env, provider keys, DB, coder)."
+    )
+
     review = sub.add_parser("review", help="Review borderline candidates (human-in-the-loop gate).")
     review_sub = review.add_subparsers(dest="review_action")
     approve_parser = review_sub.add_parser(
@@ -352,6 +356,28 @@ def _cmd_providers(args) -> int:
     return 0
 
 
+def _cmd_doctor(args) -> int:
+    from praxis.doctor import run_doctor_checks
+
+    print("Praxis doctor — pre-flight checks:")
+    failed = False
+    for check in run_doctor_checks():
+        if check.skipped:
+            print(f"  [ -- ] {check.name}: {check.detail}")
+            continue
+        marker = " ok " if check.ok else "FAIL"
+        print(f"  [{marker}] {check.name}: {check.detail}")
+        if not check.ok:
+            failed = True
+            if check.hint:
+                print(f"         fix: {check.hint}")
+    if failed:
+        print("doctor: some checks failed (see the fix hints above)", file=sys.stderr)
+        return 1
+    print("doctor: all checks passed")
+    return 0
+
+
 def _cmd_review(args) -> int:
     from praxis.review import approve, pending_candidates, reject
 
@@ -545,6 +571,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_memory(args)
     if args.command == "providers":
         return _cmd_providers(args)
+    if args.command == "doctor":
+        return _cmd_doctor(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "export":
