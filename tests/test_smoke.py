@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import responses
 
 import praxis
 from praxis.cli import main
@@ -272,3 +273,120 @@ def test_cli_run_subcommand_help():
     with pytest.raises(SystemExit) as excinfo:
         main(["run", "--help"])
     assert excinfo.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# Fresh-clone CI smoke tests (no network, no real keys)
+# ---------------------------------------------------------------------------
+
+ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.00001v1</id>
+    <title>A CPU-Friendly Fine-Tuning Method</title>
+    <summary>We fine-tune a small language model on commodity CPUs.</summary>
+  </entry>
+</feed>
+"""
+
+ANALYST_JSON = (
+    '{"technique_summary": "LoRA-style fine-tuning on CPU", '
+    '"feasibility_score": 6, '
+    '"feasibility_reasoning": "fits an 8GB CPU-only box", '
+    '"rejected": false}'
+)
+
+BLUEPRINT_MD = (
+    "# Blueprint\n\n"
+    "## Phased Build Plan\n\n"
+    "1. Data pipeline: parse and batch samples in plain Python.\n"
+    "2. Training loop.\n"
+)
+
+
+def _ci_env(tmp_path, monkeypatch):
+    """Fresh-clone-like env: temp DB, no keys, no coder, no model overrides."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{(tmp_path / 'ci.db').as_posix()}")
+    for key in (
+        "PRAXIS_MODEL",
+        "PRAXIS_FALLBACK_MODELS",
+        "PRAXIS_PROVIDERS",
+        "PRAXIS_CODER",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CEREBRAS_API_KEY",
+        "PRAXIS_GROQ_API_KEY",
+        "PRAXIS_OPENROUTER_API_KEY",
+        "PRAXIS_CEREBRAS_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+@responses.activate
+def test_ci_full_pipeline_smoke(tmp_path, monkeypatch, capsys):
+    """scout -> analyst -> architect against recorded HTTP/LLM responses, no network.
+
+    The accepted candidate ends `blueprinted` (coder off by default) and the
+    run exits 0.
+    """
+    _ci_env(tmp_path, monkeypatch)
+    responses.add(
+        responses.GET,
+        "https://export.arxiv.org/api/query",
+        body=ARXIV_XML,
+        status=200,
+        content_type="application/atom+xml",
+    )
+
+    from praxis import llm as llm_module
+
+    def fake_completion(**kwargs):
+        messages = kwargs["messages"]
+        system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+        if "JSON ONLY" in system:
+            return {"choices": [{"message": {"content": ANALYST_JSON}}]}
+        return {"choices": [{"message": {"content": BLUEPRINT_MD}}]}
+
+    monkeypatch.setattr(llm_module, "_default_completion", fake_completion)
+    monkeypatch.setattr(llm_module, "_pool", None)  # fresh pool bound to the temp DB
+
+    rc = main(["run", "--source", "arxiv", "--topic", "fine-tuning", "--limit", "5"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    assert "Traceback" not in captured.err
+    assert "blueprinted: 1" in captured.out
+    assert "prototyped: skipped" in captured.out
+    assert "[blueprinted]" in captured.out
+
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(f"sqlite:///{(tmp_path / 'ci.db').as_posix()}")
+    with engine.connect() as conn:
+        status = conn.execute(
+            text("SELECT status FROM candidates WHERE url LIKE '%2401.00001%'")
+        ).scalar_one()
+    engine.dispose()
+    assert status == "blueprinted"
+
+
+def test_ci_fresh_db_commands_print_clean_output(tmp_path, monkeypatch, capsys):
+    """status/show/usage/providers/doctor on a brand-new DB: no tracebacks."""
+    _ci_env(tmp_path, monkeypatch)
+
+    assert main(["status"]) == 0
+    assert "No candidates" in capsys.readouterr().out
+
+    assert main(["show", "1"]) == 1  # missing candidate: clean error, no crash
+    assert "no candidate" in capsys.readouterr().err
+
+    assert main(["usage"]) == 0
+    assert "No LLM usage recorded yet" in capsys.readouterr().out
+
+    assert main(["providers"]) == 0
+    assert "no health state recorded" in capsys.readouterr().out
+
+    monkeypatch.setattr("praxis.cli._load_env", lambda: None)  # no .env in the temp dir
+    assert main(["doctor"]) == 1  # checks run; failures are expected without keys
+    assert "Traceback" not in capsys.readouterr().out
+    assert "Traceback" not in capsys.readouterr().err
