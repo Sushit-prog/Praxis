@@ -72,7 +72,7 @@ def test_approve_builds_candidate(db_session, monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    result = approve(cand.id, config=hardware_profile, retries=1)
+    result = approve(cand.id, config=hardware_profile, retries=1, prototype=True)
 
     assert result.action == "approved"
     assert result.status == "prototyped"
@@ -105,7 +105,7 @@ def test_approve_non_borderline_errors(db_session, monkeypatch, hardware_profile
 
     monkeypatch.setattr(agents_module, "architect", fake_architect)
 
-    result = approve(cand.id, config=hardware_profile, retries=1)
+    result = approve(cand.id, config=hardware_profile, retries=1, prototype=True)
 
     assert result.error is not None
     assert "not awaiting review" in result.error
@@ -123,7 +123,7 @@ def test_approve_build_failure_reports_status(db_session, monkeypatch, hardware_
 
     monkeypatch.setattr(agents_module, "architect", fake_architect)
 
-    result = approve(cand.id, config=hardware_profile, retries=1)
+    result = approve(cand.id, config=hardware_profile, retries=1, prototype=True)
 
     assert result.status == "failed"
     db_session.expire_all()
@@ -198,7 +198,15 @@ def test_reviewed_candidate_resumed_skips_analyst(db_session, monkeypatch, hardw
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
 
     assert result.resumed == 1
     assert result.analyzed == 0
@@ -249,7 +257,7 @@ def test_review_cli_approve(monkeypatch, capsys, db_session):
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    rc = main(["review", "approve", "1"])
+    rc = main(["review", "approve", "1", "--prototype"])
 
     assert rc == 0
     assert "approved 1: X -> prototyped" in capsys.readouterr().out

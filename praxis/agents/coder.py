@@ -37,6 +37,33 @@ PROVIDER_RETRIES_ENV = "PRAXIS_CODER_PROVIDER_RETRIES"
 OPENCODE_FLAGS_ENV = "PRAXIS_CODER_OPENCODE_FLAGS"
 DEFAULT_OPENCODE_FLAGS = "--auto"
 
+# Coder stage mode: "off" (default) ends the pipeline at the blueprint (the
+# exportable artifact); "opencode" drafts prototypes via the OpenCode CLI.
+# Opt in per run with `praxis run --prototype`, or persistently with env.
+CODER_MODE_ENV = "PRAXIS_CODER"
+DEFAULT_CODER_MODE = "off"
+VALID_CODER_MODES = ("off", "opencode")
+
+
+def resolve_coder_mode(prototype: bool | None = None) -> str:
+    """Resolve the Coder stage mode from the --prototype flag and PRAXIS_CODER.
+
+    Order: an explicit --prototype decision (True/False) wins; otherwise the
+    PRAXIS_CODER env var (off|opencode); otherwise "off". Invalid env values
+    log a warning and fall back to the default, so a typo never silently
+    launches the OpenCode subprocess.
+    """
+    if prototype is not None:
+        return "opencode" if prototype else "off"
+    raw = os.environ.get(CODER_MODE_ENV)
+    if raw is None:
+        return DEFAULT_CODER_MODE
+    mode = raw.strip().lower()
+    if mode in VALID_CODER_MODES:
+        return mode
+    logger.warning("invalid %s=%r; using default %r", CODER_MODE_ENV, raw, DEFAULT_CODER_MODE)
+    return DEFAULT_CODER_MODE
+
 
 class _CircuitBreaker:
     """Fail-fast guard around the OpenCode subprocess.

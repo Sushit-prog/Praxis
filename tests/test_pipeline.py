@@ -49,7 +49,7 @@ def test_run_flows_through_all_agents(monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert isinstance(result, PipelineResult)
     assert result.discovered == 2
@@ -106,7 +106,7 @@ def test_run_all_rejected_skips_coder(monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "analyze", fake_analyze)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.rejected == 1
     assert result.prototyped == 0
@@ -140,7 +140,7 @@ def test_run_borderline_routes_separately(db_session, monkeypatch, hardware_prof
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.borderline == 1
     assert result.analyzed == 0
@@ -169,7 +169,7 @@ def test_run_continues_past_analyst_failure(monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.discovered == 2
     assert result.analyzed == 1
@@ -194,7 +194,7 @@ def test_run_continues_past_coder_failure(monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: None)
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.prototyped == 0
     assert result.failed == 1
@@ -231,7 +231,15 @@ def test_run_resume_processes_unfinished_candidates(db_session, monkeypatch, har
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
 
     assert result.resumed == 2
     assert result.discovered == 0  # scout found nothing new
@@ -263,7 +271,15 @@ def test_run_resume_combines_with_new_scouting(db_session, monkeypatch, hardware
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
 
     assert result.resumed == 1
     assert result.discovered == 1
@@ -291,7 +307,15 @@ def test_run_resume_failed_again_stays_failed(db_session, monkeypatch, hardware_
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
 
     assert result.resumed == 1
     assert result.failed == 1
@@ -317,10 +341,165 @@ def test_run_resume_survives_scout_failure(db_session, monkeypatch, hardware_pro
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, resume=True)
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
 
     assert result.resumed == 1
     assert result.analyzed == 1
+    assert result.prototyped == 1
+
+
+def test_run_coder_off_by_default_stops_at_blueprint(monkeypatch, hardware_profile):
+    """Bug/feature regression: without --prototype, the Coder never runs."""
+    cand = _FakeCandidate("https://a", "A")
+    coder_calls = {"n": 0}
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        return _analysis_for("https://a")
+
+    def fake_architect(**kwargs):
+        return "# ok"
+
+    def fake_coder(**kwargs):
+        coder_calls["n"] += 1
+        return "proto"
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+    monkeypatch.setattr(agents_module, "coder", fake_coder)
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    assert coder_calls["n"] == 0
+    assert result.blueprinted == 1
+    assert result.prototyped == 0
+    assert result.prototyped_skipped == 1
+    assert result.failed == 0
+    assert result.candidates[0].status == "blueprinted"
+    text = format_summary(result)
+    assert "prototyped: skipped" in text
+
+
+def test_run_coder_env_opencode_builds(monkeypatch, hardware_profile):
+    """PRAXIS_CODER=opencode enables the build path without the CLI flag."""
+    cand = _FakeCandidate("https://a", "A")
+    coder_calls = {"n": 0}
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        return _analysis_for("https://a")
+
+    def fake_architect(**kwargs):
+        return "# ok"
+
+    def fake_coder(**kwargs):
+        coder_calls["n"] += 1
+        return "proto"
+
+    monkeypatch.setenv("PRAXIS_CODER", "opencode")
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+    monkeypatch.setattr(agents_module, "coder", fake_coder)
+
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    assert coder_calls["n"] == 1
+    assert result.prototyped == 1
+    assert result.prototyped_skipped == 0
+    assert result.candidates[0].status == "prototyped"
+    assert "prototyped: skipped" not in format_summary(result)
+
+
+def test_run_prototype_flag_overrides_env_off(monkeypatch, hardware_profile):
+    """--prototype (prototype=True) builds even when PRAXIS_CODER=off."""
+    cand = _FakeCandidate("https://a", "A")
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        return _analysis_for("https://a")
+
+    def fake_architect(**kwargs):
+        return "# ok"
+
+    coder_calls = {"n": 0}
+
+    def fake_coder(**kwargs):
+        coder_calls["n"] += 1
+        return "proto"
+
+    monkeypatch.setenv("PRAXIS_CODER", "off")
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+    monkeypatch.setattr(agents_module, "coder", fake_coder)
+
+    result = run(
+        "arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True
+    )
+
+    assert coder_calls["n"] == 1
+    assert result.prototyped == 1
+
+
+def test_run_resume_picks_up_blueprinted_candidates(
+    db_session, monkeypatch, hardware_profile
+):
+    """A blueprinted candidate from a coder-off run is prototype-able on resume."""
+    cand = Candidate(
+        source="arxiv", url="https://bp", title="Bp", raw_text="x", status="blueprinted"
+    )
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        return []
+
+    def fake_analyze(**kwargs):
+        raise AssertionError("blueprinted candidates must not be re-analyzed")
+
+    def fake_architect(**kwargs):
+        return "# better plan"
+
+    coder_calls = {"n": 0}
+
+    def fake_coder(**kwargs):
+        coder_calls["n"] += 1
+        return "proto"
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+    monkeypatch.setattr(agents_module, "coder", fake_coder)
+
+    result = run(
+        "arxiv",
+        "attention",
+        config=hardware_profile,
+        limit=10,
+        retries=1,
+        resume=True,
+        prototype=True,
+    )
+
+    assert result.resumed == 1
+    assert coder_calls["n"] == 1
     assert result.prototyped == 1
 
 
@@ -399,7 +578,7 @@ def test_run_without_resume_ignores_existing_candidates(db_session, monkeypatch,
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.discovered == 0
     assert result.resumed == 0
@@ -433,7 +612,7 @@ def test_run_reports_usage_delta(db_session, monkeypatch, hardware_profile):
     monkeypatch.setattr(agents_module, "architect", lambda **kwargs: "# ok")
     monkeypatch.setattr(agents_module, "coder", lambda **kwargs: "proto")
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.usage_calls == 1
     assert result.usage_total_tokens == 2
@@ -526,7 +705,7 @@ def test_run_integration_db_state(db_session, monkeypatch, hardware_profile, tmp
     monkeypatch.setattr(agents_module, "architect", fake_architect)
     monkeypatch.setattr(agents_module, "coder", fake_coder)
 
-    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+    result = run("arxiv", "attention", config=hardware_profile, limit=10, retries=1, prototype=True)
 
     assert result.discovered == 4
     assert result.analyzed == 2

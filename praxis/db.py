@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -66,6 +67,34 @@ class Blueprint(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     candidate: Mapped[Candidate] = relationship(back_populates="blueprints")
+
+
+class Design(Base):
+    """A multi-pass design document for a candidate (discover -> design flow).
+
+    ``passes_json`` stores the per-pass outputs (goal, architecture, ...)
+    individually, so a failed pass leaves a resumable partial design: later
+    runs redo only the missing passes, keyed by pass id. ``defects`` holds the
+    final critic pass's defect list; ``depth`` records standard/deep.
+    """
+
+    __tablename__ = "designs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="in_progress", index=True)
+    depth: Mapped[str] = mapped_column(String(16), default="standard")
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    focus: Mapped[str | None] = mapped_column(Text, nullable=True)
+    passes_json: Mapped[str] = mapped_column(Text, default="{}")
+    defects: Mapped[str] = mapped_column(Text, default="")
+    design_md: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    candidate: Mapped[Candidate] = relationship()
 
 
 class LLMUsage(Base):
@@ -171,6 +200,52 @@ def init_db(engine=None) -> None:
     """Create all tables if they do not yet exist."""
     engine = engine or get_engine()
     Base.metadata.create_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Designs (discover -> design flow)
+# ---------------------------------------------------------------------------
+
+
+def latest_design(candidate_id: int) -> Design | None:
+    """Return the most recent design for a candidate, or None."""
+    session = get_session()
+    try:
+        return session.scalars(
+            select(Design)
+            .where(Design.candidate_id == candidate_id)
+            .order_by(Design.id.desc())
+            .limit(1)
+        ).first()
+    finally:
+        session.close()
+
+
+def save_design_pass(design_id: int, pass_id: str, content: str) -> None:
+    """Persist one design pass output incrementally (resumable partial designs)."""
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        if row is None:
+            return
+        passes = json.loads(row.passes_json or "{}")
+        passes[pass_id] = content
+        row.passes_json = json.dumps(passes)
+        session.commit()
+    finally:
+        session.close()
+
+
+def design_status_counts() -> dict[str, int]:
+    """Return counts of designs grouped by status."""
+    session = get_session()
+    try:
+        rows = session.execute(
+            select(Design.status, func.count(Design.id)).group_by(Design.status)
+        ).all()
+        return {status: count for status, count in rows}
+    finally:
+        session.close()
 
 
 def status_counts() -> dict[str, int]:

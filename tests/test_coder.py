@@ -7,7 +7,12 @@ import subprocess
 
 import pytest
 
-from praxis.agents.coder import _CircuitBreaker, _extract_first_phase, draft_prototype
+from praxis.agents.coder import (
+    _CircuitBreaker,
+    _extract_first_phase,
+    draft_prototype,
+    resolve_coder_mode,
+)
 from praxis.db import Blueprint, Candidate
 
 coder_module = importlib.import_module("praxis.agents.coder")
@@ -21,6 +26,29 @@ def _isolated_breaker(monkeypatch):
     monkeypatch.setenv("PRAXIS_CODER_MAX_FAILURES", "1000")
     monkeypatch.setenv("PRAXIS_CODER_COOLDOWN_S", "0")
     monkeypatch.setenv("PRAXIS_CODER_OPENCODE_FLAGS", "--auto")
+
+
+def test_resolve_coder_mode_defaults_off(monkeypatch):
+    monkeypatch.delenv("PRAXIS_CODER", raising=False)
+    assert resolve_coder_mode() == "off"
+    assert resolve_coder_mode(None) == "off"  # tri-state: None defers to env
+
+
+def test_resolve_coder_mode_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv("PRAXIS_CODER", "opencode")
+    assert resolve_coder_mode(False) == "off"  # explicit flag beats env
+    monkeypatch.setenv("PRAXIS_CODER", "off")
+    assert resolve_coder_mode(True) == "opencode"
+
+
+def test_resolve_coder_mode_env_values(monkeypatch, caplog):
+    monkeypatch.setenv("PRAXIS_CODER", "opencode")
+    assert resolve_coder_mode() == "opencode"
+    monkeypatch.setenv("PRAXIS_CODER", "OFF")  # case-insensitive
+    assert resolve_coder_mode() == "off"
+    monkeypatch.setenv("PRAXIS_CODER", "banana")
+    assert resolve_coder_mode() == "off"  # invalid value falls back safely
+    assert "invalid PRAXIS_CODER" in caplog.text
 
 
 PHASED_PLAN_MD = (

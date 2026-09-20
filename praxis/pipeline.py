@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from praxis import agents
 from praxis.agents.analyst import AnalysisResult
+from praxis.agents.coder import CODER_MODE_ENV, resolve_coder_mode
 from praxis.config import HardwareProfile, load_config
 from praxis.db import Candidate, UsageTotals, get_session, usage_totals
 
@@ -50,6 +51,7 @@ _FATAL_OS_ERRORS = (FileNotFoundError, PermissionError, NotADirectoryError, IsAD
 
 FAILED_STATUS = "failed"
 REVIEWED_STATUS = "reviewed"
+BLUEPRINTED_STATUS = "blueprinted"
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -137,6 +139,9 @@ class PipelineResult:
     candidates: list[CandidateOutcome] = field(default_factory=list)
     # Batch-level stage failures (e.g. scout): stage name -> one-line reason.
     stage_failures: dict[str, str] = field(default_factory=dict)
+    # Candidates whose build stopped at the blueprint because the Coder stage
+    # is disabled (PRAXIS_CODER=off / no --prototype).
+    prototyped_skipped: int = 0
 
 
 def _failure_reason(exc: BaseException) -> str:
@@ -163,13 +168,19 @@ def _mark_failed(candidate_id: int | None) -> None:
 
 
 def _unfinished_candidates() -> list[Candidate]:
-    """Candidates from earlier runs that still have work: status new, failed, or reviewed."""
+    """Candidates from earlier runs that still have work.
+
+    Includes ``blueprinted`` so a later `praxis run --prototype --resume` can
+    prototype candidates whose blueprint was produced while the Coder was off.
+    """
     session = get_session()
     try:
         return list(
             session.scalars(
                 select(Candidate).where(
-                    Candidate.status.in_(("new", FAILED_STATUS, REVIEWED_STATUS))
+                    Candidate.status.in_(
+                        ("new", FAILED_STATUS, REVIEWED_STATUS, BLUEPRINTED_STATUS)
+                    )
                 )
             ).all()
         )
@@ -197,12 +208,17 @@ def build_from_analysis(
     retries: int = DEFAULT_RETRIES,
     scratch_root: Path | None = None,
     timeout: float | None = None,
+    prototype: bool | None = None,
 ) -> BuildOutcome:
     """Run the Architect and Coder stages for an analyzed candidate.
 
     Shared by the pipeline loop and the human review gate (`praxis review
     approve`), so an approved candidate takes exactly the same build path as a
     freshly accepted one.
+
+    ``prototype=None`` defers to PRAXIS_CODER (default off). With the Coder
+    off, a successful Architect is the terminal state: the candidate stays
+    ``blueprinted`` and no OpenCode subprocess or circuit-breaker code runs.
     """
     url = getattr(candidate, "url", "") or ""
     try:
@@ -217,6 +233,18 @@ def build_from_analysis(
         return BuildOutcome(blueprinted=False, status=FAILED_STATUS)
 
     logger.info("architect blueprinted %s", url)
+
+    mode = resolve_coder_mode(prototype)
+    if mode == "off":
+        logger.info(
+            "coder disabled (%s=%s); keeping %s at blueprint (use `praxis run --prototype` "
+            "or `praxis export` to build it)",
+            CODER_MODE_ENV,
+            mode,
+            url,
+        )
+        return BuildOutcome(blueprinted=True, status=BLUEPRINTED_STATUS)
+
     try:
         path = run_with_retry(
             agents.coder,
@@ -262,13 +290,19 @@ def run(
     scratch_root: Path | None = None,
     timeout: float | None = None,
     resume: bool = False,
+    prototype: bool | None = None,
 ) -> PipelineResult:
     """Run Scout -> Analyst -> Architect -> Coder over a batch of candidates.
 
-    With ``resume=True``, candidates left in status ``new`` or ``failed`` by
-    earlier runs are processed alongside the freshly scouted ones, so an
-    interrupted batch can continue instead of restarting from scratch. Scout
-    failures degrade to the resumed candidates rather than aborting.
+    With ``resume=True``, candidates left in status ``new``, ``failed``,
+    ``reviewed``, or ``blueprinted`` by earlier runs are processed alongside
+    the freshly scouted ones, so an interrupted batch can continue instead of
+    restarting from scratch. Scout failures degrade to the resumed candidates
+    rather than aborting.
+
+    ``prototype=None`` defers to PRAXIS_CODER (default off): the pipeline ends
+    at the Architect and ``blueprinted`` is the successful terminal state.
+    Pass ``prototype=True`` to draft prototypes via the OpenCode CLI.
     """
     config = config or load_config()
     result = PipelineResult(source=source, topic=topic)
@@ -302,9 +336,10 @@ def run(
         title = getattr(candidate, "title", "") or url
         candidate_id = getattr(candidate, "id", None)
 
-        if getattr(candidate, "status", "") == REVIEWED_STATUS:
-            # Human-approved candidate: continue from the Architect using the
-            # persisted analysis; the Analyst stage is skipped.
+        if getattr(candidate, "status", "") in (REVIEWED_STATUS, BLUEPRINTED_STATUS):
+            # Human-approved candidate, or a blueprint produced while the Coder
+            # was off: continue from the Architect using the persisted
+            # analysis; the Analyst stage is skipped.
             analysis = _analysis_from_candidate(candidate)
         else:
             try:
@@ -348,12 +383,16 @@ def run(
             retries=retries,
             scratch_root=scratch_root,
             timeout=timeout,
+            prototype=prototype,
         )
         if outcome.blueprinted:
             result.blueprinted += 1
         if outcome.status == "prototyped":
             result.prototyped += 1
             logger.info("coder prototyped %s -> %s", url, outcome.prototype_path)
+        elif outcome.status == BLUEPRINTED_STATUS:
+            result.prototyped_skipped += 1
+            logger.info("build stopped at blueprint for %s (coder off)", url)
         else:
             result.failed += 1
             logger.warning("build ended %s for %s", outcome.status, url)
@@ -384,13 +423,17 @@ def run(
 
 def format_summary(result: PipelineResult) -> str:
     """Render a human-readable pipeline summary."""
+    prototyped_value: int | str = result.prototyped
+    if result.prototyped_skipped and not result.prototyped:
+        # Coder stage off: nothing was prototyped in this batch.
+        prototyped_value = "skipped"
     rows = [
         ("discovered", result.discovered),
         ("analyzed", result.analyzed),
         ("rejected", result.rejected),
         ("borderline", result.borderline),
         ("blueprinted", result.blueprinted),
-        ("prototyped", result.prototyped),
+        ("prototyped", prototyped_value),
         ("failed", result.failed),
     ]
     lines = [f"Summary for topic={result.topic!r} source={result.source}"]

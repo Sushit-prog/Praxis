@@ -17,6 +17,19 @@ def fake_completion(**kwargs):
     return {"choices": [{"message": {"content": "fake model output"}}]}
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_model_env(monkeypatch):
+    """Keep model identity out of the tests.
+
+    litellm auto-loads the project `.env` on import, so a developer's
+    PRAXIS_MODEL/PRAXIS_FALLBACK_MODELS would otherwise leak into which model
+    id the usage ledger records. Tests inject fakes and assert explicit model
+    strings; they must not depend on local env files.
+    """
+    monkeypatch.delenv("PRAXIS_MODEL", raising=False)
+    monkeypatch.delenv("PRAXIS_FALLBACK_MODELS", raising=False)
+
+
 @pytest.fixture
 def completion_func():
     """Return the fake completion function for injection into call_llm."""
@@ -60,17 +73,28 @@ def db_session(db_engine, monkeypatch):
     def fresh_session():
         return Session(bind=db_engine, expire_on_commit=False)
 
-    for module_name in (
-        "praxis.agents.scout",
-        "praxis.agents.analyst",
-        "praxis.agents.architect",
-        "praxis.agents.coder",
-        "praxis.pipeline",
-        "praxis.llm",
-        "praxis.review",
-        "praxis.providers",
-    ):
-        module = importlib.import_module(module_name)
+    # Import every module BEFORE patching: a module first imported while
+    # praxis.db.get_session is already patched would capture the test session
+    # factory permanently via its ``from praxis.db import get_session``
+    # binding (monkeypatch could never restore it).
+    modules = [
+        importlib.import_module(module_name)
+        for module_name in (
+            "praxis.agents.scout",
+            "praxis.agents.analyst",
+            "praxis.agents.architect",
+            "praxis.agents.coder",
+            "praxis.pipeline",
+            "praxis.llm",
+            "praxis.review",
+            "praxis.providers",
+            "praxis.design",
+            "praxis.discover",
+            "praxis.design_io",
+            "praxis.export",
+        )
+    ]
+    for module in modules:
         monkeypatch.setattr(module, "get_session", fresh_session)
     yield session
     session.close()

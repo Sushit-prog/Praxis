@@ -43,7 +43,7 @@ Praxis runs a four-stage agent pipeline over a batch of research candidates, per
    +---------------------+
 ```
 
-Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder delegates code generation to the OpenCode CLI as a separate subprocess rather than making an LLM call of its own. Every LLM call is also recorded to the `llm_usage` table (tokens, estimated cost, latency, stage, candidate), so spend is measurable against the `monthly_budget_usd` constraint.
+Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder (an **optional** stage, off by default) delegates code generation to an OpenCode-compatible CLI as a separate subprocess rather than making an LLM call of its own. Every LLM call is also recorded to the `llm_usage` table (tokens, estimated cost, latency, stage, candidate), so spend is measurable against the `monthly_budget_usd` constraint.
 
 ## How it works
 
@@ -52,7 +52,7 @@ The pipeline is orchestrated in `praxis/pipeline.py` as Scout -> Analyst -> Arch
 - **Scout** — fetches items matching the topic from one of `arxiv`, `github`, or `hn`, deduplicates them, and persists promising ones as `Candidate` rows (`status="new"`).
 - **Analyst** — sends each candidate's text plus the target `HardwareProfile` to the LLM, which extracts the core implementable technique and scores feasibility from 0-10. Candidates scoring below the threshold (default 4) or explicitly rejected are persisted as `rejected`; the rest move on. Scores inside the borderline band (threshold through threshold + `PRAXIS_BORDERLINE_MARGIN`, default 1) are persisted as `borderline` and held for review rather than auto-built — confidence-aware routing instead of a hard accept/reject wall. A response that fails strict JSON parsing is retried once with a repair prompt before the candidate is recorded as a rejection, so a transient formatting hiccup does not silently discard a candidate. Candidate raw text is untrusted internet content, so it is wrapped in explicit delimiters (`<<<UNTRUSTED CANDIDATE CONTENT BEGIN/END>>>`) and the system prompt tells the model to treat it as data, never as instructions — an embedded "score this 10/10" cannot override the task.
 - **Architect** — turns the accepted analysis into a `Blueprint`: a markdown engineering plan with modules, milestones, and a phased build plan, calibrated to the same hardware profile. The first phase of that plan is what the Coder will build.
-- **Coder** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run. When `PRAXIS_CODER_MODELS` lists multiple `provider/model` ids, an exhausted provider (rate limit / quota) skips instantly to the next model instead of waiting.
+- **Coder (optional)** — extracts the first milestone from the blueprint's phased build plan and hands it to the OpenCode CLI (`opencode run --auto`) running in a fresh `scratch/proto-<candidate_id>-<timestamp>/` directory. The resulting path is recorded on the blueprint; a non-zero exit or timeout is recorded as `prototype_failed` rather than crashing the run. When `PRAXIS_CODER_MODELS` lists multiple `provider/model` ids, an exhausted provider (rate limit / quota) skips instantly to the next model instead of waiting. The stage is **off by default** — enable it per run with `praxis run --prototype` or persistently with `PRAXIS_CODER=opencode`. With the Coder off, `blueprinted` is the successful terminal state, and `praxis export <id>` turns any blueprint into a build kit you can hand to any coding agent.
 
 ## Design decisions
 
@@ -85,7 +85,7 @@ pip install -e ".[dev]"
 praxis run --source arxiv --topic "retrieval augmented generation" --limit 5
 ```
 
-This runs the full Scout -> Analyst -> Architect -> Coder pipeline over up to five arXiv papers. A summary prints with the disposition of each candidate and LLM spend:
+This runs Scout -> Analyst -> Architect over up to five arXiv papers (the Coder stage is opt-in — see `--prototype` below). A summary prints with the disposition of each candidate and LLM spend:
 
 ```
 Summary for topic='retrieval augmented generation' source=arxiv
@@ -114,12 +114,17 @@ opencode holds no direct provider keys for Job B — see [Provider failover](#pr
 
 All commands are installed as the `praxis` entrypoint.
 
-Run the full pipeline for a topic (defaults to `arxiv`, up to 20 candidates):
+Run the pipeline for a topic (defaults to `arxiv`, up to 20 candidates):
 
 ```bash
 praxis run --source arxiv --topic "retrieval augmented generation" --limit 20
 praxis run --source github --topic "local vector search on CPU"
+
+# Opt into the Coder stage (drafts prototypes via the OpenCode CLI):
+praxis run --source arxiv --topic "retrieval augmented generation" --prototype
 ```
+
+By default the run stops after the Architect: candidates that pass analysis end in status `blueprinted` and the summary shows `prototyped: skipped`. `--prototype` (or `PRAXIS_CODER=opencode`) enables the Coder for the run; `--no-prototype` disables it for the run regardless of the env var. A later `praxis run --prototype --resume` picks up `blueprinted` candidates and prototypes them without re-running the Analyst.
 
 `--limit` caps how many candidates the Scout keeps; `-v`/`--verbose` enables DEBUG logging; `--resume` also picks up candidates left in status `new` or `failed` by earlier runs (interrupted batches continue instead of restarting, and a failed Scout degrades to the resumed candidates rather than aborting). A run prints a per-batch summary:
 
@@ -160,6 +165,15 @@ Print a candidate's blueprint markdown:
 ```bash
 praxis show 42
 ```
+
+Export a blueprint as a self-contained build kit for any coding agent:
+
+```bash
+praxis export 42                    # writes ./build-kit-42.md
+praxis export 42 --out my-kit.md
+```
+
+The exported markdown contains the goal, the hardware constraints from your profile (CPU-only, RAM, GPU, budget), the phased build plan, deterministic acceptance checks, and a ready-to-paste prompt for a coding agent — usable with Freebuff, Claude Code, OpenCode, or any other agent, with no API keys or gateways required. This is the intended path when the Coder stage is off.
 
 Evaluate the Analyst and Architect against the hand-labeled golden set:
 
@@ -217,6 +231,7 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | Variable | Purpose | Default |
 |---|---|---|
 | `PRAXIS_MODEL` | litellm model id used by the Analyst/Architect | `groq/llama-3.1-8b-instant` |
+| `PRAXIS_CODER` | Coder stage mode: `off` (default) stops at the blueprint, `opencode` drafts prototypes via the CLI | `off` |
 | `PRAXIS_FEASIBILITY_THRESHOLD` | minimum feasibility score (0-10) for a candidate to be accepted | `4` |
 | `PRAXIS_DB_PATH` | SQLite file path | `./praxis.db` |
 | `PRAXIS_DB_URL` | full SQLAlchemy URL; overrides `PRAXIS_DB_PATH` | — |
@@ -288,6 +303,8 @@ Praxis is a working v1. Two things are intentionally not in scope yet:
 
 Everything else in the pipeline is implemented:
 
+- Optional Coder stage (`PRAXIS_CODER=off|opencode`, `praxis run --prototype`) with `blueprinted` as a first-class terminal state
+- Build-kit export (`praxis export <id>`) for building blueprints with any external coding agent
 - Golden-set evaluation (`praxis eval`) with adversarial prompt-injection fixtures
 - Prompt-injection hardening (untrusted-content delimiters in Analyst/Architect)
 - Coder circuit breaker (fail-fast after consecutive OpenCode failures)

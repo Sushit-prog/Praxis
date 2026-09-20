@@ -162,15 +162,17 @@ def _headings(md: str) -> list[str]:
 def _section_span(md: str, heading: str) -> tuple[int, int] | None:
     """Return the (start, end) char offsets of a '## <heading>' body in raw md.
 
-    Start is just past the heading line; end is the next '##' heading (or end
-    of text). Offsets are computed from the raw string so CRLF or LF line
-    endings both resolve correctly.
+    Start is just past the heading line; end is the next same-level '##'
+    heading (or end of text). '###' and deeper subsection headings do NOT end
+    a section: design documents nest '### Components' etc. under '##
+    Architecture' and the section must include them. Offsets are computed from
+    the raw string so CRLF or LF line endings both resolve correctly.
     """
     offset = 0
     start: int | None = None
     for line in md.splitlines(keepends=True):
         stripped = line.strip()
-        if stripped.lower().startswith("##"):
+        if stripped.lower().startswith("##") and not stripped.lower().startswith("###"):
             if start is not None:
                 return start, offset
             if heading.lower() in stripped.lower():
@@ -267,6 +269,158 @@ def run_rubric(md: str, profile: HardwareProfile) -> list[RubricCheck]:
         RubricCheck("required_sections", *check_required_sections(md)),
         RubricCheck("milestones", *check_milestones(md)),
         RubricCheck("hardware_scoped_architecture", *check_hardware_scoped_architecture(md)),
+        RubricCheck("no_gpu_requirement", *check_no_gpu_requirement(md, profile)),
+        RubricCheck("ram_within_profile", *check_ram_within_profile(md, profile)),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Design-document rubric (multi-pass DESIGN.md)
+# --------------------------------------------------------------------------
+
+DESIGN_REQUIRED_SECTIONS = (
+    "Hardware & budget fit",
+    "Goals & Non-Goals",
+    "Architecture",
+    "Data Model & Contracts",
+    "Phased Implementation Plan",
+    "Risks, Cuts & Deferrals",
+)
+
+_MERMAID_RE = re.compile(r"```mermaid\n(.*?)```", re.DOTALL)
+_MERMAID_NODE_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*(?:\[|\(|\{|--|->)", re.MULTILINE)
+_CHECKBOX_RE = re.compile(r"^\s*- \[[ xX]]\s", re.MULTILINE)
+_PHASE_RE = re.compile(r"^#{2,3}\s+Phase\s+\d+", re.MULTILINE | re.IGNORECASE)
+_LABEL_RE = re.compile(r"\[source \d+\]|\(inference\)", re.IGNORECASE)
+
+
+def check_design_sections(md: str) -> tuple[bool, str]:
+    """All mandated design sections must be present as headings."""
+    headings = [h.lower() for h in _headings(md)]
+    missing = [
+        s for s in DESIGN_REQUIRED_SECTIONS if not any(s.lower() in h for h in headings)
+    ]
+    if missing:
+        return False, f"missing section(s): {', '.join(missing)}"
+    return True, "all required design sections present"
+
+
+def check_design_hardware_constraints(md: str, profile: HardwareProfile) -> tuple[bool, str]:
+    """The hardware-fit section must reference the profile's actual limits."""
+    section = _section(md, "Hardware & budget fit")
+    if not section:
+        return False, "no Hardware & budget fit section"
+    missing = []
+    if f"{profile.ram_gb} GB" not in section and f"{profile.ram_gb}GB" not in section:
+        missing.append("RAM ceiling")
+    if "CPU" not in section.upper():
+        missing.append("CPU-only")
+    if not re.search(r"\$\s*\d", section):
+        missing.append("budget")
+    if missing:
+        return False, f"hardware-fit section does not reference: {', '.join(missing)}"
+    return True, "hardware constraints referenced"
+
+
+def check_budget_table_totals(md: str, profile: HardwareProfile) -> tuple[bool, str]:
+    """Stated totals in the per-component table must respect RAM and budget."""
+    section = _section(md, "Hardware & budget fit")
+    if "|" not in section:
+        return False, "no per-component budget table"
+    ram_ok = f"<= {profile.ram_gb}" in section or f"≤ {profile.ram_gb}" in section
+    budget_ok = re.search(
+        rf"<=\s*\$?{re.escape(f'{profile.monthly_budget_usd:.2f}')}|"
+        rf"≤\s*\$?{re.escape(f'{profile.monthly_budget_usd:.2f}')}",
+        section,
+    )
+    problems = []
+    if not ram_ok:
+        problems.append(f"RAM total rule (<= {profile.ram_gb} GB) not stated")
+    if not budget_ok:
+        problems.append(f"budget total rule (<= ${profile.monthly_budget_usd:.2f}) not stated")
+    if problems:
+        return False, "; ".join(problems)
+    return True, "budget table totals within limits"
+
+
+def check_mermaid_parses(md: str) -> tuple[bool, str]:
+    """Every mermaid block must exist and contain a graph declaration + nodes."""
+    blocks = _MERMAID_RE.findall(md)
+    if not blocks:
+        return False, "no mermaid diagram"
+    for block in blocks:
+        if not re.search(r"\b(graph|flowchart)\s+(TD|TB|LR|RL|BT)\b", block):
+            return False, "mermaid block missing graph declaration"
+        if not _MERMAID_NODE_RE.search(block):
+            return False, "mermaid block has no nodes"
+    return True, f"{len(blocks)} mermaid block(s) parse"
+
+
+def check_claims_labelled(md: str) -> tuple[bool, str]:
+    """Body text must carry source references or inference labels."""
+    body = "\n".join(
+        line
+        for line in md.splitlines()
+        if not line.strip().startswith(("|", "```", "#"))
+    )
+    labels = _LABEL_RE.findall(body)
+    if len(labels) < 3:
+        return False, f"too few source/inference labels found ({len(labels)} < 3)"
+    return True, f"{len(labels)} claims labelled"
+
+
+def check_components_map_to_tasks(md: str) -> tuple[bool, str]:
+    """Every architecture component must appear in at least one plan task."""
+    arch = _section(md, "Architecture")
+    plan = _section(md, "Phased Implementation Plan")
+    if not arch:
+        return False, "no Architecture section"
+    if not plan:
+        return False, "no Phased Implementation Plan section"
+    plan_lower = plan.lower()
+    uncovered = []
+    for line in arch.splitlines():
+        match = re.match(r"[-*]\s+`?([A-Za-z_][\w .]{2,40})`?\s*[—:\-]\s+", line.strip())
+        if not match:
+            continue
+        component = match.group(1).strip().lower()
+        if component and component not in plan_lower:
+            uncovered.append(match.group(1).strip())
+    if uncovered:
+        return False, f"component(s) with no plan task: {', '.join(uncovered[:5])}"
+    return True, "every component maps to a plan task"
+
+
+def check_phase_acceptance(md: str) -> tuple[bool, str]:
+    """No phase without tasks or acceptance criteria; every phase has a test plan."""
+    plan = _section(md, "Phased Implementation Plan")
+    if not plan:
+        return False, "no Phased Implementation Plan section"
+    phases = re.split(r"(?=^#{2,3}\s+Phase\s+\d+)", plan, flags=re.MULTILINE | re.IGNORECASE)
+    phases = [p for p in phases if _PHASE_RE.search(p)]
+    if not phases:
+        return False, "no numbered phases"
+    for i, phase in enumerate(phases):
+        name = f"phase {i + 1}"
+        if not _CHECKBOX_RE.search(phase):
+            return False, f"{name} has no checkbox tasks"
+        if "acceptance" not in phase.lower() and "accept" not in phase.lower():
+            return False, f"{name} has no acceptance criteria"
+        if "test" not in phase.lower() and "eval" not in phase.lower():
+            return False, f"{name} has no test/eval plan"
+    return True, f"all {len(phases)} phase(s) have tasks, acceptance criteria, and tests"
+
+
+def run_design_rubric(md: str, profile: HardwareProfile) -> list[RubricCheck]:
+    """Run the design-doc rubric against a DESIGN.md and return per-check results."""
+    return [
+        RubricCheck("design_sections", *check_design_sections(md)),
+        RubricCheck("design_hardware_constraints", *check_design_hardware_constraints(md, profile)),
+        RubricCheck("budget_table_totals", *check_budget_table_totals(md, profile)),
+        RubricCheck("mermaid_parses", *check_mermaid_parses(md)),
+        RubricCheck("claims_labelled", *check_claims_labelled(md)),
+        RubricCheck("components_map_to_tasks", *check_components_map_to_tasks(md)),
+        RubricCheck("phase_acceptance", *check_phase_acceptance(md)),
         RubricCheck("no_gpu_requirement", *check_no_gpu_requirement(md, profile)),
         RubricCheck("ram_within_profile", *check_ram_within_profile(md, profile)),
     ]

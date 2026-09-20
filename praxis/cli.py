@@ -25,7 +25,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--resume",
         action="store_true",
-        help="Also process candidates left in status new/failed by earlier runs.",
+        help="Also process new/failed/reviewed/blueprinted candidates from earlier runs.",
+    )
+    # Tri-state: absent -> defer to PRAXIS_CODER; --prototype/--no-prototype override it.
+    run.add_argument(
+        "--prototype",
+        dest="prototype",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable the Coder stage (OpenCode CLI) for this run; overrides PRAXIS_CODER.",
+    )
+    run.add_argument(
+        "--no-prototype",
+        dest="prototype",
+        action="store_const",
+        const=False,
+        help="Disable the Coder stage for this run; overrides PRAXIS_CODER.",
     )
 
     sub.add_parser("status", help="Show candidate counts by status from the database.")
@@ -39,6 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show", help="Print the blueprint markdown for a candidate.")
     show.add_argument("candidate_id", type=int, help="Candidate id to show.")
+
+    export_parser = sub.add_parser(
+        "export",
+        help="Export a blueprint + coding-agent prompt as one markdown file (build kit).",
+    )
+    export_parser.add_argument("candidate_id", type=int, help="Candidate id to export.")
+    export_parser.add_argument(
+        "--out",
+        help="Output file path (default: ./build-kit-<candidate_id>.md).",
+    )
 
     eval_parser = sub.add_parser(
         "eval", help="Run the golden-set evaluation harness against the Analyst and Architect."
@@ -65,10 +91,51 @@ def build_parser() -> argparse.ArgumentParser:
         "approve", help="Approve a borderline candidate and build it."
     )
     approve_parser.add_argument("candidate_id", type=int, help="Candidate id to approve.")
+    approve_parser.add_argument(
+        "--prototype",
+        dest="prototype",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Also draft a prototype via the OpenCode CLI (overrides PRAXIS_CODER).",
+    )
     reject_parser = review_sub.add_parser(
         "reject", help="Reject a borderline candidate; it will not be built."
     )
     reject_parser.add_argument("candidate_id", type=int, help="Candidate id to reject.")
+
+    discover_parser = sub.add_parser(
+        "discover",
+        help="Scout + analyze a topic, print a decision table, then pick one to design.",
+    )
+    discover_parser.add_argument("--topic", required=True, help="Topic to scout for candidates.")
+    discover_parser.add_argument("--source", choices=["arxiv", "github", "hn"], default="arxiv")
+    discover_parser.add_argument(
+        "--limit", type=int, default=10, help="Max candidates to scout (default: 10)."
+    )
+    discover_parser.add_argument(
+        "--pick",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Pick table row N non-interactively (skips all prompts).",
+    )
+    discover_parser.add_argument(
+        "--focus", help="Focus note steering the design (skips the interactive focus prompt)."
+    )
+
+    design_parser = sub.add_parser(
+        "design", help="Generate a multi-pass design document for a candidate."
+    )
+    design_parser.add_argument("candidate_id", type=int, help="Candidate id to design.")
+    design_parser.add_argument("--focus", help="Optional focus note steering the design.")
+    design_parser.add_argument(
+        "--depth", choices=["standard", "deep"], default="standard", help="Design depth."
+    )
+    design_parser.add_argument(
+        "--model",
+        help="Design model override (default: PRAXIS_DESIGN_MODEL or groq/openai/gpt-oss-120b).",
+    )
 
     return parser
 
@@ -101,10 +168,40 @@ def _ensure_schema() -> None:
 def _cmd_run(args) -> int:
     from praxis.pipeline import format_summary, run
 
-    result = run(source=args.source, topic=args.topic, limit=args.limit, resume=args.resume)
+    result = run(
+        source=args.source,
+        topic=args.topic,
+        limit=args.limit,
+        resume=args.resume,
+        prototype=args.prototype,
+    )
     print(format_summary(result))
     # A batch-level stage failure (e.g. scout) must be visible in the exit code.
     return 1 if result.stage_failures else 0
+
+
+def _cmd_export(args) -> int:
+    from praxis.db import Candidate, get_session
+    from praxis.export import export_blueprint
+
+    out_path = export_blueprint(args.candidate_id, out=args.out)
+    if out_path is None:
+        session = get_session()
+        try:
+            exists = session.get(Candidate, args.candidate_id) is not None
+        finally:
+            session.close()
+        if not exists:
+            print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
+        else:
+            print(
+                f"error: candidate {args.candidate_id} has no blueprint "
+                "(run the pipeline first)",
+                file=sys.stderr,
+            )
+        return 1
+    print(f"Exported build kit for candidate {args.candidate_id} -> {out_path}")
+    return 0
 
 
 def _cmd_status(args) -> int:
@@ -249,7 +346,7 @@ def _cmd_review(args) -> int:
         return 0
 
     if args.review_action == "approve":
-        result = approve(args.candidate_id)
+        result = approve(args.candidate_id, prototype=args.prototype)
     elif args.review_action == "reject":
         result = reject(args.candidate_id)
     else:
@@ -267,6 +364,96 @@ def _cmd_review(args) -> int:
     else:
         print(f"rejected {result.candidate_id}: {result.title}")
     return 0
+
+
+def _design_and_write(candidate, profile, *, focus, depth="standard", model=None) -> int:
+    """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
+    from praxis.db import Design, get_session
+    from praxis.design import generate_design
+    from praxis.design_io import load_passes, write_design_files
+
+    result = generate_design(candidate, profile, depth=depth, focus=focus, model=model)
+    if result.status != "complete" or not result.design_md:
+        completed = ", ".join(result.completed_passes) or "none"
+        print(
+            f"error: design failed for candidate {result.candidate_id}: "
+            f"{result.error or 'incomplete passes'} (completed passes: {completed}; "
+            f"re-run the same command to resume)",
+            file=sys.stderr,
+        )
+        return 1
+
+    session = get_session()
+    try:
+        row = session.get(Design, result.design_id)
+        passes = load_passes(row) if row is not None else {}
+    finally:
+        session.close()
+
+    out_dir = write_design_files(result, candidate, profile, passes=passes)
+    print(
+        f"design complete: candidate {result.candidate_id} "
+        f"({len(result.defects)} critic defect(s) addressed)"
+    )
+    print(f"  {out_dir / 'DESIGN.md'}")
+    print(f"  {out_dir / 'TASKS.md'}")
+    print(f"  {out_dir / 'AGENT_PROMPT.md'}")
+    for defect in result.defects:
+        print(
+            f"  critic: [{defect.get('class', '?')}] {defect.get('section', '?')}: "
+            f"{defect.get('defect', '')}"
+        )
+    return 0
+
+
+def _cmd_discover(args) -> int:
+    from praxis.config import load_config
+    from praxis.design_io import record_pick
+    from praxis.discover import discover, focus_note, format_table, prompt_pick
+
+    profile = load_config()
+    result = discover(args.source, args.topic, limit=args.limit, profile=profile)
+    print(format_table(result))
+    if not result.pickable:
+        print("nothing to pick", file=sys.stderr)
+        return 1
+
+    if args.pick is not None:
+        row = next((r for r in result.pickable if r.index == args.pick), None)
+        if row is None:
+            print(f"error: no pickable row #{args.pick}", file=sys.stderr)
+            return 1
+        focus = args.focus
+    else:
+        row = prompt_pick(result)
+        if row is None:
+            print("no pick made — done.")
+            return 0
+        print(f"\ntechnique to build:\n  {row.technique}\n")
+        focus = args.focus if args.focus is not None else focus_note(row)
+
+    print(f"\npicked #{row.index}: {row.candidate.title}")
+    candidate_id = getattr(row.candidate, "id", None)
+    if candidate_id is None:
+        print("error: picked candidate is not persisted", file=sys.stderr)
+        return 1
+    record_pick(candidate_id, row.technique, focus)
+    return _design_and_write(row.candidate, profile, focus=focus)
+
+
+def _cmd_design(args) -> int:
+    from praxis.config import load_config
+    from praxis.discover import get_candidate
+
+    candidate = get_candidate(args.candidate_id)
+    if candidate is None:
+        print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
+        return 1
+    profile = load_config()
+    print(f"designing candidate {args.candidate_id}: {candidate.title}")
+    return _design_and_write(
+        candidate, profile, focus=args.focus, depth=args.depth, model=args.model
+    )
 
 
 def _cmd_show(args) -> int:
@@ -325,11 +512,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_providers(args)
     if args.command == "show":
         return _cmd_show(args)
+    if args.command == "export":
+        return _cmd_export(args)
     if args.command == "eval":
         try:
             return _cmd_eval(args)
         except Exception as exc:  # noqa: BLE001 - CLI boundary
             logging.error("praxis eval failed: %s", exc)
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "discover":
+        try:
+            return _cmd_discover(args)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            logging.error("praxis discover failed: %s", exc)
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "design":
+        try:
+            return _cmd_design(args)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            logging.error("praxis design failed: %s", exc)
             print(f"error: {exc}", file=sys.stderr)
             return 1
 

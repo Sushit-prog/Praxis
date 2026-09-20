@@ -91,8 +91,13 @@ def approve(
     retries: int = DEFAULT_RETRIES,
     scratch_root: Path | None = None,
     timeout: float | None = None,
+    prototype: bool | None = None,
 ) -> ReviewResult:
-    """Approve a borderline candidate and build it through the normal path."""
+    """Approve a borderline candidate and build it through the normal path.
+
+    ``prototype`` follows the same tri-state contract as the pipeline
+    (``None`` defers to PRAXIS_CODER, default off).
+    """
     candidate = _load_candidate(candidate_id)
     if candidate is None:
         return ReviewResult(candidate_id, "", "", "approved", "missing", error="no such candidate")
@@ -127,6 +132,7 @@ def approve(
         retries=retries,
         scratch_root=scratch_root,
         timeout=timeout,
+        prototype=prototype,
     )
     _record_memory(candidate, "approved", outcome.status)
 
