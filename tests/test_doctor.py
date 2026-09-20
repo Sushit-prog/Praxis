@@ -24,7 +24,7 @@ MODELS_BODIES = {
         "data": [{"id": "openai/gpt-oss-20b"}, {"id": "llama-3.3-70b-versatile"}]
     },
     "https://openrouter.ai/api/v1/models": {"data": [{"id": "openai/gpt-oss-20b"}]},
-    "https://api.cerebras.io/v1/models": {"data": [{"id": "llama3.1-8b"}]},
+    "https://api.cerebras.ai/v1/models": {"data": [{"id": "llama3.1-8b"}]},
 }
 
 
@@ -110,6 +110,26 @@ def test_doctor_fails_without_any_key(tmp_path, monkeypatch, capsys):
     assert rc == 1
     assert "FAIL] provider keys: no provider key configured" in out
     assert "fix: add GROQ_API_KEY=" in out
+
+
+@responses.activate
+def test_doctor_network_error_hint(tmp_path, monkeypatch, capsys):
+    """An unreachable provider gets the network hint, not the auth hint."""
+    _isolate(monkeypatch, tmp_path, env_file=None)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "csk_ok")
+    responses.add(
+        responses.GET,
+        "https://api.cerebras.ai/v1/models",
+        body=responses.ConnectionError("DNS failure"),
+    )
+
+    rc = main(["doctor"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not reach the provider (ConnectionError)" in captured.out
+    assert "fix: could not reach the provider: check network/VPN/proxy" in captured.out
+    assert "check the key value" not in captured.out
 
 
 def test_doctor_reports_missing_env(tmp_path, monkeypatch, capsys):

@@ -22,7 +22,7 @@ PROVIDER_ORDER = ("groq", "openrouter", "cerebras")
 PROVIDER_MODELS_ENDPOINTS = {
     "groq": "https://api.groq.com/openai/v1/models",
     "openrouter": "https://openrouter.ai/api/v1/models",
-    "cerebras": "https://api.cerebras.io/v1/models",
+    "cerebras": "https://api.cerebras.ai/v1/models",
 }
 MODELS_TIMEOUT_S = 10
 
@@ -46,10 +46,22 @@ def _provider_key(provider: str) -> str | None:
     return os.environ.get(f"{provider.upper()}_API_KEY") or None
 
 
-def _fetch_model_ids(provider: str, key: str) -> tuple[list[str] | None, str | None]:
+@dataclass
+class ModelsFetchResult:
+    """Outcome of a models-endpoint probe: ids, or a classified failure."""
+
+    model_ids: list[str] | None = None
+    error_kind: str | None = None  # "network" | "auth" | "http"
+    error_detail: str = ""
+
+
+def _fetch_model_ids(provider: str, key: str) -> ModelsFetchResult:
     """Authenticated GET of the provider's models endpoint.
 
-    Returns ``(model_ids, None)`` on success or ``(None, reason)`` on failure.
+    Returns the model ids on success, or a classified failure (network = the
+    provider could not be reached at all; auth = it answered and rejected the
+    key; http = any other error status) so the fix hint can tell the two
+    apart.
     """
     try:
         resp = requests.get(
@@ -58,16 +70,23 @@ def _fetch_model_ids(provider: str, key: str) -> tuple[list[str] | None, str | N
             timeout=MODELS_TIMEOUT_S,
         )
     except requests.RequestException as exc:
-        return None, f"network error ({type(exc).__name__})"
+        return ModelsFetchResult(
+            error_kind="network",
+            error_detail=f"could not reach the provider ({type(exc).__name__})",
+        )
     if resp.status_code == 200:
         try:
             data = resp.json().get("data", [])
         except ValueError:
-            return None, "unexpected (non-JSON) response body"
-        return [str(m.get("id", "")) for m in data], None
+            return ModelsFetchResult(
+                error_kind="http", error_detail="unexpected (non-JSON) response body"
+            )
+        return ModelsFetchResult(model_ids=[str(m.get("id", "")) for m in data])
     if resp.status_code in (401, 403):
-        return None, f"key rejected (HTTP {resp.status_code})"
-    return None, f"HTTP {resp.status_code}"
+        return ModelsFetchResult(
+            error_kind="auth", error_detail=f"key rejected (HTTP {resp.status_code})"
+        )
+    return ModelsFetchResult(error_kind="http", error_detail=f"HTTP {resp.status_code}")
 
 
 def _check_env() -> CheckResult:
@@ -105,18 +124,24 @@ def _check_provider(provider: str, model_id: str | None) -> list[CheckResult]:
         )
     ]
 
-    ids, error = _fetch_model_ids(provider, key)
-    if error is not None:
+    result = _fetch_model_ids(provider, key)
+    if result.error_kind is not None:
+        hints = {
+            "network": "could not reach the provider: check network/VPN/proxy",
+            "auth": "check the key value for this provider",
+            "http": "the provider answered with an error; check its status page or try again later",
+        }
         results.append(
             CheckResult(
                 f"provider {provider} models endpoint",
                 False,
-                error,
-                hint="check the key value for this provider, or your network/proxy",
+                result.error_detail,
+                hint=hints[result.error_kind],
             )
         )
         return results
 
+    ids = result.model_ids or []
     results.append(
         CheckResult(
             f"provider {provider} models endpoint",
