@@ -4,14 +4,22 @@ For arXiv candidates the full text is fetched (arXiv HTML rendering first,
 PDF text via pypdf as fallback); for GitHub candidates the README and file
 tree are used. Everything fetched from the network is UNTRUSTED data: chunks
 are wrapped in the same delimiters the Analyst uses, stripped of control
-characters, and sized so design passes receive a bounded, relevant context.
+characters and of any embedded delimiter look-alikes, sized so design passes
+receive a bounded, relevant context (heading-aware chunks, total-size cap,
+references section dropped), and cached on disk keyed by the candidate URL so
+re-runs do not re-fetch.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 
 import requests
 
@@ -21,6 +29,12 @@ TIMEOUT_S = 15
 MAX_CHUNKS = 6
 CHUNK_SIZE = 4000
 MAX_TOTAL_CHARS = 24000
+
+# Disk cache for fetched source text, keyed by candidate URL.
+CACHE_ENABLED_ENV = "PRAXIS_GROUNDING_CACHE"
+CACHE_DIR_ENV = "PRAXIS_GROUNDING_CACHE_DIR"
+DEFAULT_CACHE_DIR = Path(".praxis-cache") / "grounding"
+_CACHE_DISABLED = ("0", "false", "no", "off")
 
 ARXIV_ABS_RE = re.compile(
     r"arxiv\.org/(?:abs|pdf)/([a-z0-9.\-]+/\d{7}|\d{4}\.\d{4,5})(v\d+)?", re.IGNORECASE
@@ -64,8 +78,15 @@ class Grounding:
 
 
 def _sanitize(text: str) -> str:
-    """Normalize whitespace and strip control chars (prompt-smuggling hygiene)."""
+    """Normalize whitespace, strip control chars, neutralize delimiter look-alikes.
+
+    An attacker-controlled paper can embed the literal untrusted-content
+    markers to break out of the framing; any occurrence inside fetched text
+    is replaced so the prompt keeps exactly one begin/end pair, both ours.
+    """
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = text.replace(_UNTRUSTED_START, "[untrusted-marker removed]")
+    text = text.replace(_UNTRUSTED_END, "[untrusted-marker removed]")
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
@@ -80,45 +101,104 @@ def extract_arxiv_id(url: str) -> str | None:
     return None
 
 
+_REFS_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:references|bibliography)[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_references(text: str) -> str:
+    """Drop the References/Bibliography section (noise for design passes).
+
+    The cut happens at the first heading-level match past 30% of the text, so
+    a passing mention of 'references' early in the body is never mistaken for
+    the section itself.
+    """
+    cutoff = len(text) * 0.3
+    for match in _REFS_HEADING_RE.finditer(text):
+        if match.start() >= cutoff:
+            return text[: match.start()].rstrip()
+    return text
+
+
 def _chunk_text(text: str, max_chunks: int = MAX_CHUNKS) -> list[str]:
-    """Split into ~CHUNK_SIZE chunks on paragraph boundaries, bounded count."""
+    """Split into heading-aligned chunks, bounded by size, count, and total.
+
+    Sections are cut on markdown heading lines (arXiv HTML renderings and
+    GitHub READMEs both carry them after conversion); within a section,
+    paragraphs are packed up to CHUNK_SIZE. A chunk never mixes two headings
+    unless a single section outgrows CHUNK_SIZE. The overall grounded text is
+    capped at MAX_TOTAL_CHARS.
+    """
     text = _sanitize(text)
     if not text:
         return []
-    paragraphs = re.split(r"\n{2,}", text)
     chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        while len(para) > CHUNK_SIZE:  # hard-split oversized paragraphs
-            chunks.append(para[:CHUNK_SIZE])
-            para = para[CHUNK_SIZE:]
-        if size + len(para) > CHUNK_SIZE and current:
-            chunks.append("\n\n".join(current))
-            current, size = [], 0
-        current.append(para)
-        size += len(para)
-        if len(chunks) >= max_chunks:
+    total = 0
+
+    def _full() -> bool:
+        return len(chunks) >= max_chunks or total >= MAX_TOTAL_CHARS
+
+    for section in _split_sections(text):
+        if _full():
             break
-    if current and len(chunks) < max_chunks:
-        chunks.append("\n\n".join(current))
+        current: list[str] = []
+        size = 0
+        for para in (p.strip() for p in re.split(r"\n{2,}", section) if p.strip()):
+            while len(para) > CHUNK_SIZE:  # hard-split oversized paragraphs
+                if current:
+                    chunks.append("\n\n".join(current))
+                    total += size
+                    current, size = [], 0
+                chunks.append(para[:CHUNK_SIZE])
+                total += CHUNK_SIZE
+                para = para[CHUNK_SIZE:]
+                if _full():
+                    return chunks
+            if size + len(para) > CHUNK_SIZE and current:
+                chunks.append("\n\n".join(current))
+                total += size
+                current, size = [], 0
+            current.append(para)
+            size += len(para)
+            if _full():
+                break
+        if current and not _full():
+            chunks.append("\n\n".join(current))
+            total += size
     return chunks[:max_chunks]
+
+
+_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+\S")
+
+
+def _split_sections(text: str) -> list[str]:
+    """Split text on markdown heading lines; no headings -> one section."""
+    sections: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if _HEADING_LINE_RE.match(line) and current:
+            sections.append("\n".join(current).strip())
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append("\n".join(current).strip())
+    return [s for s in sections if s]
 
 
 def fetch_arxiv_full_text(arxiv_id: str) -> tuple[str, list[str]]:
     """Fetch arXiv full text: HTML rendering first, PDF text via pypdf fallback.
 
-    Returns (text, provenance). Empty text when both paths fail.
+    The References/Bibliography section is stripped (noise for design
+    passes). Returns (text, provenance). Empty text when both paths fail.
     """
 
     html_url = f"https://arxiv.org/html/{arxiv_id}"
     try:
         resp = requests.get(html_url, timeout=TIMEOUT_S, headers={"User-Agent": "praxis"})
         if resp.ok and "html" in (resp.headers.get("Content-Type") or ""):
-            text = _html_to_text(resp.text)
+            text = _strip_references(_html_to_text(resp.text))
             if len(text) >= 2000:
                 return _sanitize(text), [f"arXiv HTML {arxiv_id}"]
     except requests.RequestException as exc:
@@ -128,7 +208,7 @@ def fetch_arxiv_full_text(arxiv_id: str) -> tuple[str, list[str]]:
     try:
         resp = requests.get(pdf_url, timeout=TIMEOUT_S, headers={"User-Agent": "praxis"})
         resp.raise_for_status()
-        text = _pdf_to_text(resp.content)
+        text = _strip_references(_pdf_to_text(resp.content))
         if text.strip():
             return _sanitize(text), [f"arXiv PDF {arxiv_id}"]
     except requests.RequestException as exc:
@@ -140,16 +220,24 @@ def fetch_arxiv_full_text(arxiv_id: str) -> tuple[str, list[str]]:
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_HEADING_OPEN_RE = re.compile(r"<h([1-6])[^>]*>", re.IGNORECASE)
 _BLOCK_END_RE = re.compile(r"</(p|div|h[1-6]|li|tr|section|article)>", re.IGNORECASE)
 
 
 def _html_to_text(html: str) -> str:
-    """Crude HTML-to-text: drop script/style, convert block ends to newlines.
+    """Crude HTML-to-text: drop script/style, keep headings as markdown markers.
 
     Regex-based on purpose — no BeautifulSoup dependency; arXiv's HTML
-    rendering is machine-generated and regular enough for this.
+    rendering is machine-generated and regular enough for this. Headings
+    become ``#``-style lines so chunking can align on sections.
     """
+    # Neutralize untrusted-content markers BEFORE tag stripping: a marker like
+    # <<<UNTRUSTED ...>>> contains angle brackets, so the tag regex would eat it
+    # and leave the sanitizer nothing to replace.
+    html = html.replace(_UNTRUSTED_START, "[untrusted-marker removed]")
+    html = html.replace(_UNTRUSTED_END, "[untrusted-marker removed]")
     html = _SCRIPT_RE.sub(" ", html)
+    html = _HEADING_OPEN_RE.sub(lambda m: "\n\n" + "#" * int(m.group(1)) + " ", html)
     html = _BLOCK_END_RE.sub("\n\n", html)
     text = _TAG_RE.sub(" ", html)
     import html as html_mod
@@ -240,15 +328,81 @@ def fetch_github_context(url: str) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Disk cache (keyed by candidate URL)
+# ---------------------------------------------------------------------------
+
+
+def _cache_enabled() -> bool:
+    raw = os.environ.get(CACHE_ENABLED_ENV)
+    return raw is None or raw.strip().lower() not in _CACHE_DISABLED
+
+
+def _cache_dir() -> Path:
+    raw = os.environ.get(CACHE_DIR_ENV)
+    return Path(raw) if raw else DEFAULT_CACHE_DIR
+
+
+def _cache_path(url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return _cache_dir() / f"{digest}.json"
+
+
+def _cache_get(url: str) -> tuple[str, list[str]] | None:
+    """Return the cached (text, provenance) for a URL, or None."""
+    if not _cache_enabled():
+        return None
+    try:
+        data = json.loads(_cache_path(url).read_text(encoding="utf-8"))
+        text = str(data.get("text", ""))
+        provenance = [str(p) for p in data.get("provenance", [])]
+        return (text, provenance) if text else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_put(url: str, text: str, provenance: list[str]) -> None:
+    """Store fetched source text on disk; best-effort, positive results only."""
+    if not _cache_enabled() or not text:
+        return
+    path = _cache_path(url)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "url": url,
+            "cached_at": datetime.now(UTC).isoformat(),
+            "text": text,
+            "provenance": provenance,
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("grounding: cache write failed for %s: %s", url, exc)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def ground_candidate(candidate) -> Grounding:
-    """Build bounded, sanitized grounding for a candidate based on its source."""
+    """Build bounded, sanitized grounding for a candidate based on its source.
+
+    Fetches are cached on disk keyed by the candidate URL, so re-running a
+    design does not re-download the paper.
+    """
     source = (getattr(candidate, "source", "") or "").lower()
     url = getattr(candidate, "url", "") or ""
 
     if source == "arxiv" or extract_arxiv_id(url):
         arxiv_id = extract_arxiv_id(url)
         if arxiv_id:
-            text, provenance = fetch_arxiv_full_text(arxiv_id)
+            cached = _cache_get(url)
+            if cached is not None:
+                text, provenance = cached
+            else:
+                text, provenance = fetch_arxiv_full_text(arxiv_id)
+                if text:
+                    _cache_put(url, text, provenance)
             if text:
                 return Grounding(
                     chunks=_chunk_text(text),
@@ -264,7 +418,13 @@ def ground_candidate(candidate) -> Grounding:
         return Grounding(source_kind="none")
 
     if source == "github" or _parse_github_repo(url):
-        text, provenance = fetch_github_context(url)
+        cached = _cache_get(url)
+        if cached is not None:
+            text, provenance = cached
+        else:
+            text, provenance = fetch_github_context(url)
+            if text:
+                _cache_put(url, text, provenance)
         if text:
             return Grounding(chunks=_chunk_text(text), provenance=provenance, source_kind="github")
         return Grounding(source_kind="none")

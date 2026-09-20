@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "litellm>=1.0",
     "python-dotenv>=1.0",
+    "pypdf>=4.0",
     "PyYAML>=6.0",
     "requests>=2.28",
     "SQLAlchemy>=2.0",

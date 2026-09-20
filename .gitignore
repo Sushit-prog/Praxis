@@ -22,6 +22,12 @@ env/
 .ruff_cache/
 .mypy_cache/
 
+# Grounding fetch cache (arXiv/GitHub source text)
+.praxis-cache/
+
+# Generated design documents (curated examples live in examples/)
+designs/
+
 # Notebooks (scratch)
 .ipynb_checkpoints/
 
