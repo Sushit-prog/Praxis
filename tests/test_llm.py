@@ -33,7 +33,7 @@ def test_call_llm_records_usage(db_session):
     rows = db_session.scalars(select(LLMUsage)).all()
     assert len(rows) == 1
     row = rows[0]
-    assert row.model == "groq/llama-3.1-8b-instant"
+    assert row.model == "groq/openai/gpt-oss-20b"
     assert row.stage == "analyst"
     assert row.candidate_id == 7
     assert row.prompt_tokens == 10
@@ -159,7 +159,7 @@ def test_llm_cache_miss_persists_row(db_session):
     rows = db_session.scalars(select(LLMCache)).all()
     assert len(rows) == 1
     assert rows[0].response == "cached answer"
-    assert rows[0].model == "groq/llama-3.1-8b-instant"
+    assert rows[0].model == "groq/openai/gpt-oss-20b"
 
 
 def test_llm_cache_key_differs_on_system_change(db_session):

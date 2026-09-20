@@ -29,7 +29,7 @@ from praxis.providers import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "groq/llama-3.1-8b-instant"
+DEFAULT_MODEL = "groq/openai/gpt-oss-20b"
 
 # Env toggle for the response cache; caching is on unless set to 0/false/no/off.
 CACHE_ENV = "PRAXIS_LLM_CACHE"

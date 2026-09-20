@@ -132,7 +132,7 @@ def scan_exhaustion(output: str | None) -> str | None:
 def provider_of(model: str) -> str:
     """Return the provider prefix of a litellm/opencode model string.
 
-    ``groq/llama-3.1-8b-instant`` -> ``groq``; a bare model id returns itself
+    ``groq/openai/gpt-oss-20b`` -> ``groq``; a bare model id returns itself
     (treated as its own provider so it can still be routed/cooldowned).
     """
     match = PROVIDER_PREFIX_RE.match(model or "")

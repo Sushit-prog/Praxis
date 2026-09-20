@@ -211,7 +211,7 @@ praxis usage --days 7
 
 ## Configuration
 
-Praxis reads environment variables directly from the process (there is no bundled `.env` loader). `.env.example` is a reference template for the full set; export them in your shell or source them through your own dotenv tooling.
+Praxis loads a `.env` file automatically at CLI startup (via python-dotenv: `find_dotenv(usecwd=True)`, `override=False`, so variables already exported in your shell win over the file). `.env.example` is a reference template for the full set — copy it to `.env` and fill in your provider keys.
 
 ### Hardware profile
 
@@ -230,7 +230,7 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `PRAXIS_MODEL` | litellm model id used by the Analyst/Architect | `groq/llama-3.1-8b-instant` |
+| `PRAXIS_MODEL` | litellm model id used by the Analyst/Architect | `groq/openai/gpt-oss-20b` |
 | `PRAXIS_CODER` | Coder stage mode: `off` (default) stops at the blueprint, `opencode` drafts prototypes via the CLI | `off` |
 | `PRAXIS_FEASIBILITY_THRESHOLD` | minimum feasibility score (0-10) for a candidate to be accepted | `4` |
 | `PRAXIS_DB_PATH` | SQLite file path | `./praxis.db` |
