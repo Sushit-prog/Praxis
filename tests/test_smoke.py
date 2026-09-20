@@ -171,6 +171,97 @@ def test_run_with_retry_retries_connection_error_but_not_file_error(monkeypatch)
     assert calls["n"] == 1  # fatal: no retry
 
 
+def test_load_env_populates_keys_and_respects_real_env(tmp_path, monkeypatch):
+    """A temp .env supplies provider keys; real environment variables still win."""
+    import os
+
+    from praxis.cli import _load_env
+
+    dotenv_keys = (
+        "GROQ_API_KEY",
+        "CEREBRAS_API_KEY",
+        "PRAXIS_GROQ_API_KEY",
+        "PRAXIS_MODEL",
+    )
+    for key in dotenv_keys:
+        monkeypatch.delenv(key, raising=False)  # teardown removes values loaded below
+    (tmp_path / ".env").write_text(
+        "GROQ_API_KEY=gsk-from-file\n"
+        "OPENROUTER_API_KEY=sk-or-from-file\n"
+        "CEREBRAS_API_KEY=cs-from-file\n"
+        "PRAXIS_GROQ_API_KEY=praxis-override\n"
+        "PRAXIS_MODEL=groq/openai/gpt-oss-20b\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-from-shell")  # real env wins
+
+    loaded = _load_env()
+
+    assert loaded is not None and loaded.endswith(".env")
+    assert os.environ["GROQ_API_KEY"] == "gsk-from-file"
+    assert os.environ["OPENROUTER_API_KEY"] == "sk-or-from-shell"
+    assert os.environ["CEREBRAS_API_KEY"] == "cs-from-file"
+    assert os.environ["PRAXIS_GROQ_API_KEY"] == "praxis-override"
+    assert os.environ["PRAXIS_MODEL"] == "groq/openai/gpt-oss-20b"
+
+
+def test_load_env_without_file_is_noop(tmp_path, monkeypatch):
+    from praxis.cli import _load_env
+
+    monkeypatch.chdir(tmp_path)
+    assert _load_env() is None
+
+
+def test_cli_reads_config_after_dotenv(tmp_path, monkeypatch, capsys):
+    """PRAXIS_DB_URL set only in .env is honored by the CLI (env loads before config)."""
+    import os
+
+    (tmp_path / ".env").write_text(
+        f"PRAXIS_DB_URL=sqlite:///{(tmp_path / 'from-env.db').as_posix()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PRAXIS_DB_URL", raising=False)  # teardown removes loaded value
+
+    rc = main(["status"])
+
+    assert rc == 0
+    assert "No candidates" in capsys.readouterr().out
+    assert (tmp_path / "from-env.db").exists()
+    assert os.environ.get("PRAXIS_DB_URL")  # loaded for the command that just ran
+
+
+def test_provider_keys_pass_through_to_litellm(monkeypatch):
+    """Plain and PRAXIS_-prefixed keys reach the litellm kwargs.
+
+    Plain keys flow through os.environ (litellm auto-reads them there); the
+    PRAXIS_<PROVIDER>_API_KEY overrides are injected into the call kwargs.
+    """
+    from praxis.llm import _inject_provider_key
+
+    monkeypatch.setenv("PRAXIS_GROQ_API_KEY", "praxis-groq")
+    kwargs: dict = {}
+    _inject_provider_key(kwargs, "groq/openai/gpt-oss-20b")
+    assert kwargs["api_key"] == "praxis-groq"
+
+    monkeypatch.setenv("PRAXIS_OPENROUTER_API_KEY", "praxis-or")
+    kwargs = {}
+    _inject_provider_key(kwargs, "openrouter/openai/gpt-oss-20b")
+    assert kwargs["api_key"] == "praxis-or"
+
+    monkeypatch.setenv("PRAXIS_CEREBRAS_API_KEY", "praxis-cs")
+    kwargs = {}
+    _inject_provider_key(kwargs, "cerebras/llama-3.3-70b")
+    assert kwargs["api_key"] == "praxis-cs"
+
+    # No override set -> no injection; litellm reads the plain key from os.environ.
+    monkeypatch.delenv("PRAXIS_GROQ_API_KEY", raising=False)
+    kwargs = {}
+    _inject_provider_key(kwargs, "groq/openai/gpt-oss-20b")
+    assert "api_key" not in kwargs
+
+
 def test_cli_help_exits_zero(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--help"])

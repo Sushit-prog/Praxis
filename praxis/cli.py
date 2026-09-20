@@ -140,6 +140,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_env() -> str | None:
+    """Load a .env file into the process environment (first command, before config).
+
+    Uses ``find_dotenv(usecwd=True)`` so the search starts at the caller's
+    working directory, and ``override=False`` so variables already exported in
+    the real environment win over .env values. Loaded values land in
+    ``os.environ``, which is all the pass-through litellm needs for the plain
+    provider keys (GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY); the
+    PRAXIS_<PROVIDER>_API_KEY overrides are picked up later by
+    :func:`praxis.llm._inject_provider_key`. Returns the loaded path or None.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv is a hard dependency
+        logging.getLogger(__name__).warning("python-dotenv not installed; skipping .env load")
+        return None
+    path = find_dotenv(usecwd=True)
+    if not path:
+        return None
+    load_dotenv(path, override=False)
+    return path
+
+
 def _ensure_schema() -> None:
     """Create the SQLite schema if it does not exist yet (idempotent).
 
@@ -482,6 +505,10 @@ def _cmd_show(args) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Load .env before anything reads configuration so PRAXIS_* variables and
+    # provider keys in .env behave exactly like exported environment variables.
+    _load_env()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
