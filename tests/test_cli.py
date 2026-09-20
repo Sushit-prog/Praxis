@@ -412,3 +412,20 @@ def test_cli_eval_missing_golden_file(capsys):
 
     assert rc == 1
     assert "not found" in capsys.readouterr().err
+
+
+def test_cli_run_no_working_provider_exits_nonzero(monkeypatch, tmp_path, capsys):
+    """Auth failure with no usable provider aborts with a clear message and exit 1."""
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'run.db'}")
+
+    from praxis.providers import NoWorkingProviderError
+
+    def failing_run(**kwargs):
+        raise NoWorkingProviderError("no working provider: groq: invalid_api_key")
+
+    monkeypatch.setattr("praxis.pipeline.run", failing_run)
+
+    rc = main(["run", "--source", "arxiv", "--topic", "attention"])
+
+    assert rc == 1
+    assert "no working provider: groq" in capsys.readouterr().err

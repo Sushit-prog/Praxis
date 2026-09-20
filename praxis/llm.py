@@ -20,8 +20,11 @@ from litellm import completion_cost as _completion_cost
 
 from praxis.db import LLMCache, LLMUsage, get_session
 from praxis.providers import (
+    AUTH_SIGNAL,
     JOB_PIPELINE,
+    NoWorkingProviderError,
     ProviderPool,
+    classify_auth_failure,
     classify_exhaustion,
     order_models,
     provider_of,
@@ -91,6 +94,7 @@ class LLMClient:
                 f"all LLM providers are in cooldown ({', '.join(provider_of(m) for m in chain)})"
             )
         errors: list[Exception] = []
+        auth_failures: list[tuple[str, str]] = []
         for attempt_model in attempt_chain:
             kwargs["model"] = attempt_model
             _inject_provider_key(kwargs, attempt_model)
@@ -107,10 +111,22 @@ class LLMClient:
                     candidate_id=candidate_id,
                     latency_ms=_elapsed_ms(started),
                 )
+                provider = provider_of(attempt_model)
+                if classify_auth_failure(exc):
+                    # A rejected key is a provider-level failure: mark the
+                    # provider unhealthy in the persisted health table and
+                    # fail over to the next configured provider instantly.
+                    pool.mark_exhausted(provider, AUTH_SIGNAL, detail=str(exc)[:300])
+                    auth_failures.append((provider, str(exc).splitlines()[0][:160]))
+                    logger.warning(
+                        "llm: %s rejected the key (auth failure); switching to next provider",
+                        attempt_model,
+                    )
+                    continue
                 signal = classify_exhaustion(exc)
                 if signal is not None:
                     pool.mark_exhausted(
-                        provider_of(attempt_model),
+                        provider,
                         signal,
                         detail=str(exc)[:300],
                     )
@@ -122,6 +138,13 @@ class LLMClient:
                 else:
                     logger.warning("llm: model %s failed (%s)", attempt_model, exc)
         else:
+            if auth_failures and len(auth_failures) == len(attempt_chain):
+                # Every configured provider rejected the key: abort the run —
+                # retrying cannot help until the keys are fixed.
+                provider, reason = auth_failures[-1]
+                raise NoWorkingProviderError(
+                    f"no working provider: {provider}: {reason}"
+                ) from errors[-1]
             raise errors[-1]
 
         provider = provider_of(attempt_model)

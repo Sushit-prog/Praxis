@@ -724,3 +724,84 @@ def test_run_integration_db_state(db_session, monkeypatch, hardware_profile, tmp
     assert bp_a is not None
     assert bp_a.prototype_path == str(proto_path)
     assert bp_a.blueprint_md == "# Plan"
+
+
+def test_run_no_working_provider_aborts_leaving_candidates_retryable(
+    db_session, monkeypatch, hardware_profile
+):
+    """Auth failure across all providers aborts the run without failing candidates."""
+    from praxis.providers import NoWorkingProviderError
+
+    cand = Candidate(source="arxiv", url="https://a", title="A", raw_text="x", status="new")
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        raise NoWorkingProviderError("no working provider: groq: invalid_api_key")
+
+    architect_calls: list[str] = []
+
+    def fake_architect(**kwargs):
+        architect_calls.append(kwargs["candidate"].url)
+        return "# ok"
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+
+    with pytest.raises(NoWorkingProviderError):
+        run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "new"  # retryable, not failed
+    assert architect_calls == []  # aborted before any build
+
+
+def test_run_no_working_provider_during_architect_keeps_status(
+    db_session, monkeypatch, hardware_profile
+):
+    """A provider failure after the Analyst leaves the candidate resumable, not failed."""
+    from praxis.providers import NoWorkingProviderError
+
+    cand = Candidate(source="arxiv", url="https://a", title="A", raw_text="x", status="new")
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    def fake_scout(**kwargs):
+        return [cand]
+
+    def fake_analyze(**kwargs):
+        # Mirror the real Analyst: a successful analysis persists `analyzed`.
+        db_session.get(Candidate, cand.id).status = "analyzed"
+        db_session.commit()
+        return _analysis_for("https://a")
+
+    def fake_architect(**kwargs):
+        raise NoWorkingProviderError("no working provider: groq: 401")
+
+    monkeypatch.setattr(agents_module, "scout", fake_scout)
+    monkeypatch.setattr(agents_module, "analyze", fake_analyze)
+    monkeypatch.setattr(agents_module, "architect", fake_architect)
+
+    with pytest.raises(NoWorkingProviderError):
+        run("arxiv", "attention", config=hardware_profile, limit=10, retries=1)
+
+    db_session.expire_all()
+    assert db_session.get(Candidate, cand.id).status == "analyzed"
+
+
+def test_run_resume_picks_up_analyzed_candidates(db_session, monkeypatch, hardware_profile):
+    """Candidates interrupted between Analyst and Architect are resumed."""
+    from praxis.pipeline import _unfinished_candidates
+
+    cand = Candidate(source="arxiv", url="https://a", title="A", raw_text="x", status="analyzed")
+    db_session.add(cand)
+    db_session.commit()
+    db_session.refresh(cand)
+
+    assert [c.url for c in _unfinished_candidates()] == ["https://a"]

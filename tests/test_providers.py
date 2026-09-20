@@ -9,6 +9,7 @@ from praxis.providers import (
     JOB_PIPELINE,
     ExhaustionSignal,
     ProviderPool,
+    classify_auth_failure,
     classify_exhaustion,
     order_models,
     provider_of,
@@ -140,3 +141,16 @@ def test_first_healthy_skips_cooling(db_session):
     pool = ProviderPool(JOB_PIPELINE)
     pool.mark_exhausted("groq", ExhaustionSignal.RATE_LIMIT)
     assert pool.first_healthy() == "openrouter"
+
+
+def test_classify_auth_failure_variants():
+    """401, AuthenticationError, and the BadRequestError invalid_api_key variant."""
+    assert classify_auth_failure(_FakeError("Unauthorized", status_code=401))
+    assert classify_auth_failure(_FakeError("invalid_api_key: bad key", status_code=400))
+    AuthenticationError = type("AuthenticationError", (Exception,), {})
+    assert classify_auth_failure(AuthenticationError("bad key"))
+    assert classify_auth_failure(_FakeError("Incorrect API key provided"))
+    assert not classify_auth_failure(_FakeError("connection reset by peer"))
+    assert not classify_auth_failure(_FakeError("boom", status_code=500))
+    assert not classify_auth_failure(_FakeError("429 too many requests"))
+    assert classify_exhaustion(_FakeError("invalid_api_key", status_code=401)) is None

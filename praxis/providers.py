@@ -56,6 +56,22 @@ CONTEXT_MARKERS = re.compile(
     r"context.?window|context.?length|context_length_exceeded|maximum context", re.IGNORECASE
 )
 
+# Signal written to the provider health table when a provider rejects the API
+# key itself. Distinct from exhaustion: a bad key does not heal after a rate
+# limit cooldown, so the run must fail over and abort if no provider remains.
+AUTH_SIGNAL = "auth"
+
+
+class NoWorkingProviderError(RuntimeError):
+    """Every configured provider rejected the request (e.g. bad API keys).
+
+    Raised by the LLM layer after the whole provider chain fails with the same
+    provider-level (auth) failure. Message format:
+    ``no working provider: <name>: <reason>``. Callers must abort the run
+    without marking candidates ``failed`` — the failure is a configuration
+    problem, so candidates stay in a retryable state for ``--resume``.
+    """
+
 # ---------------------------------------------------------------------------
 # Exhaustion classification
 # ---------------------------------------------------------------------------
@@ -109,6 +125,37 @@ def classify_exhaustion(exc: Exception) -> str | None:
     if "context" in lowered:
         return ExhaustionSignal.CONTEXT
     return None
+
+
+def classify_auth_failure(exc: Exception) -> bool:
+    """True when the exception means the provider rejected the API key.
+
+    Catches HTTP 401, ``AuthenticationError``-style exception classes, and the
+    litellm ``BadRequestError`` variant that wraps an ``invalid_api_key``
+    message (some providers answer a bad key with 400, not 401).
+    """
+    if getattr(exc, "status_code", None) == 401:
+        return True
+    if "auth" in type(exc).__name__.lower():
+        return True
+    message = str(exc).lower()
+    key_words = ("api_key", "api key", "apikey", "bearer")
+    bad_key_words = (
+        "invalid",
+        "incorrect",
+        "unauthorized",
+        "missing",
+        "denied",
+        "forbidden",
+        "not valid",
+        "wrong",
+        "expired",
+    )
+    if any(word in message for word in key_words) and any(
+        word in message for word in bad_key_words
+    ):
+        return True
+    return "unauthorized" in message or "authentication" in message
 
 
 def scan_exhaustion(output: str | None) -> str | None:

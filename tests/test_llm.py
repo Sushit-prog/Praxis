@@ -371,3 +371,52 @@ def test_usage_summary_aggregates(db_session):
     assert summary.by_stage["architect"].cost_usd == pytest.approx(0.003)
     assert summary.by_model["m1"].calls == 2
     assert summary.by_model["m2"].total_tokens == 400
+
+
+def _auth_error(model: str) -> Exception:
+    """An auth-shaped provider error (litellm AuthenticationError style)."""
+    exc = RuntimeError(f"{model}: invalid_api_key")
+    exc.status_code = 401
+    return exc
+
+
+def test_auth_failure_fails_over_to_next_provider(db_session, monkeypatch):
+    """A 401 marks the provider unhealthy and the next configured provider is used."""
+    from praxis import llm as llm_module
+    from praxis.db import get_provider_health
+    from praxis.providers import JOB_PIPELINE
+
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "openrouter/openai/gpt-oss-20b")
+    monkeypatch.setattr(llm_module, "_pool", None)  # fresh pool bound to the test DB
+
+    called = []
+
+    def completion(**kwargs):
+        called.append(kwargs["model"])
+        if kwargs["model"].startswith("groq"):
+            raise _auth_error(kwargs["model"])
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    out = llm_module.call_llm("hello", model="groq/openai/gpt-oss-20b", completion=completion)
+
+    assert out == "ok"
+    assert [m.split("/")[0] for m in called] == ["groq", "openrouter"]
+    row = get_provider_health(JOB_PIPELINE, "groq", session=db_session)
+    assert row is not None and row.state == "cooling_down"
+    assert row.last_signal.startswith("auth")
+
+
+def test_all_providers_auth_failing_raises_no_working_provider(db_session, monkeypatch):
+    """Every configured provider rejecting the key aborts with a clear error."""
+    from praxis import llm as llm_module
+    from praxis.providers import NoWorkingProviderError
+
+    monkeypatch.setenv("PRAXIS_FALLBACK_MODELS", "openrouter/openai/gpt-oss-20b")
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    def completion(**kwargs):
+        raise _auth_error(kwargs["model"])
+
+    with pytest.raises(NoWorkingProviderError) as excinfo:
+        llm_module.call_llm("hello", model="groq/openai/gpt-oss-20b", completion=completion)
+    assert "no working provider" in str(excinfo.value)

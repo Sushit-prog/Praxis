@@ -22,6 +22,7 @@ from praxis.agents.analyst import AnalysisResult
 from praxis.agents.coder import CODER_MODE_ENV, resolve_coder_mode
 from praxis.config import HardwareProfile, load_config
 from praxis.db import Candidate, UsageTotals, get_session, usage_totals
+from praxis.providers import NoWorkingProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,9 @@ def _unfinished_candidates() -> list[Candidate]:
     """Candidates from earlier runs that still have work.
 
     Includes ``blueprinted`` so a later `praxis run --prototype --resume` can
-    prototype candidates whose blueprint was produced while the Coder was off.
+    prototype candidates whose blueprint was produced while the Coder was off,
+    and ``analyzed`` so candidates interrupted between the Analyst and the
+    Architect (e.g. a run aborted by a provider failure) are picked up too.
     """
     session = get_session()
     try:
@@ -179,7 +182,7 @@ def _unfinished_candidates() -> list[Candidate]:
             session.scalars(
                 select(Candidate).where(
                     Candidate.status.in_(
-                        ("new", FAILED_STATUS, REVIEWED_STATUS, BLUEPRINTED_STATUS)
+                        ("new", "analyzed", FAILED_STATUS, REVIEWED_STATUS, BLUEPRINTED_STATUS)
                     )
                 )
             ).all()
@@ -226,6 +229,10 @@ def build_from_analysis(
             agents.architect, retries, candidate=candidate, analysis=analysis, profile=config
         )
     except NotImplementedError:
+        raise
+    except NoWorkingProviderError:
+        # Provider-level failure (bad keys): the candidate stays in its
+        # current retryable status and the run aborts; --resume picks it up.
         raise
     except Exception as exc:  # noqa: BLE001 - isolate candidate failures
         logger.warning("architect failed for %s: %s", url, exc)
@@ -347,6 +354,10 @@ def run(
                     agents.analyze, retries, candidate=candidate, profile=config
                 )
             except NotImplementedError:
+                raise
+            except NoWorkingProviderError:
+                # Provider-level failure (bad keys): keep the candidate
+                # retryable and abort the run early; do not mark it failed.
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate candidate failures
                 logger.warning("analyst failed for %s: %s", url, exc)
