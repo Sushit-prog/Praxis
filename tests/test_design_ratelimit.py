@@ -511,8 +511,8 @@ def test_too_large_skips_entry_without_wait_or_cooldown(design_setup, monkeypatc
     assert cerebras_successes == 6
     assert waits == []  # never slept
     # No cooldown was recorded for groq: a smaller request may still go there.
-    from praxis.db import get_session as patched_get_session
     from praxis.db import ProviderHealth
+    from praxis.db import get_session as patched_get_session
 
     session = patched_get_session()
     rows = session.query(ProviderHealth).all()
@@ -521,7 +521,9 @@ def test_too_large_skips_entry_without_wait_or_cooldown(design_setup, monkeypatc
     assert all(r.state != "cooling_down" for r in groq_rows)
 
 
-def test_too_large_on_every_entry_shrinks_once_then_fails_clearly(design_setup, monkeypatch, capsys):
+def test_too_large_on_every_entry_shrinks_once_then_fails_clearly(
+    design_setup, monkeypatch, capsys
+):
     """Every entry rejects the size: one shrink, one more round, clear error."""
     import praxis.design as design_module
     import praxis.grounding as grounding_module
