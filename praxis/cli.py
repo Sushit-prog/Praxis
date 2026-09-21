@@ -12,6 +12,23 @@ from praxis.design import PASS_IDS
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
+def _force_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to UTF-8 with replacement on Windows.
+
+    Model text can contain any Unicode (U+2011 non-breaking hyphens, smart
+    quotes); the legacy Windows console code page (cp1252/cp850) would raise
+    UnicodeEncodeError mid-print and kill the command. ``errors="replace"``
+    guarantees printing never crashes; only unrenderable chars degrade.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - already-closed stream
+                pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="praxis",
@@ -696,6 +713,10 @@ def _cmd_show(args) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Model text is arbitrary Unicode; the Windows console may not be. Do this
+    # before any command prints anything.
+    _force_utf8_stdio()
 
     # Load .env before anything reads configuration so PRAXIS_* variables and
     # provider keys in .env behave exactly like exported environment variables.

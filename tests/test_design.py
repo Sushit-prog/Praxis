@@ -1061,3 +1061,111 @@ def test_pass_calls_target_5000_token_request(design_db, no_grounding, monkeypat
         input_tokens = len(prompt) // 4
         assert input_tokens + (max_tokens or 0) <= design_module.DESIGN_REQUEST_TOKEN_CAP + 300
     assert all(mt == design_module.DEFAULT_PASS_OUTPUT_TOKENS for _, mt in prompts[:5])
+
+
+# ---------------------------------------------------------------------------
+# Item 7: Windows/UTF-8 hardening (normalization, stdio, file writing)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_model_text_replaces_problem_characters():
+    """U+2011, smart quotes, and no-break spaces become plain ASCII."""
+    from praxis.config import normalize_model_text
+
+    raw = "co\u2011operate\u00a0freely \u2018quoted\u2019 and \u201cdouble\u201d"
+    normalized = normalize_model_text(raw)
+    assert "\u2011" not in normalized and "-" in normalized
+    assert "\u00a0" not in normalized and " " in normalized
+    assert "\u2018" not in normalized and "'" in normalized
+    assert "\u201c" not in normalized and '"' in normalized
+
+
+def test_normalize_model_text_handles_none_and_empty():
+    from praxis.config import normalize_model_text
+
+    assert normalize_model_text(None) == ""
+    assert normalize_model_text("") == ""
+    assert normalize_model_text("plain text") == "plain text"
+
+
+def test_pass_output_normalized_before_storage(design_db, no_grounding, monkeypatch):
+    """Stored pass output has problem characters normalized away."""
+    import praxis.design as design_module
+    from praxis.db import latest_design
+
+    tricky = (
+        "## Technique\n\nThe model runs co\u2011operatively on\u00a0CPU "
+        "\u2014 a claim from [source 1].\n"
+    )
+
+    def tricky_call_llm(prompt, system=None, model=None, **kwargs):
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return tricky
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", tricky_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    assert "\u2011" not in result.design_md
+    assert "\u00a0" not in result.design_md
+    stored = json.loads(latest_design(design_db).passes_json)
+    assert all("\u2011" not in v for v in stored.values())
+    assert "co-operatively" in stored["technique"]
+
+
+def test_show_export_design_show_with_2011_in_text(
+    design_db, no_grounding, monkeypatch, tmp_path, capsys
+):
+    """praxis show, export, and design --show exit cleanly with U+2011 text."""
+    import io
+
+    from praxis.db import Blueprint, Design, get_session, save_design_pass
+    from praxis.export import export_blueprint
+    from tests.test_design import GOOD_PASSES
+
+    tricky_title = "CPU\u2011Fine\u2011Tune"
+    session = get_session()
+    from praxis.db import Candidate
+
+    cand = session.get(Candidate, design_db)
+    cand.title = tricky_title
+    session.add(cand)
+    blueprint = Blueprint(
+        candidate_id=design_db,
+        blueprint_md=f"# {tricky_title} — Blueprint\n\nco\u2011operative \u2018text\u2019\n",
+        feasibility_score=8,
+    )
+    session.add(blueprint)
+    design = Design(candidate_id=design_db, status="complete")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    for pass_id, content in GOOD_PASSES.items():
+        save_design_pass(design_id, pass_id, content)
+
+    # Wrap real stdio with a cp1252 stream: prints of U+2011 must survive
+    # because main() reconfigures the stream to UTF-8 before printing.
+    narrow = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr("praxis.cli.sys.stdout", narrow)
+
+    from praxis.cli import main
+
+    # 1) design --show with U+2011 in stored passes
+    code = main(["design", str(design_db), "--show"])
+    assert code == 0
+
+    # 2) praxis show with U+2011 in the blueprint
+    code = main(["show", str(design_db)])
+    assert code == 0
+
+    # 3) export writes a build kit with U+2011 in the title/text
+    out_path = export_blueprint(design_db, out=str(tmp_path / "kit.md"))
+    assert out_path is not None
+    kit = out_path.read_text(encoding="utf-8")
+    assert tricky_title in kit

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,42 @@ class HardwareProfile:
 
 def _env(name: str) -> str | None:
     return os.environ.get(f"{ENV_PREFIX}{name}")
+
+
+# Characters that look harmless in a browser but break Windows consoles,
+# terminals, and some tooling when model output is stored and re-printed.
+_CHAR_REPLACEMENTS = {
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2010": "-",  # unicode hyphen
+    "\u2012": "-",  # figure dash
+    "\u2013": "-",  # en dash
+    "\u2014": "-",  # em dash (kept often, but normalizing is safer on Windows)
+    "\u2212": "-",  # minus sign
+    "\u00a0": " ",  # no-break space
+    "\u202f": " ",  # narrow no-break space
+    "\u2007": " ",  # figure space
+    "\u2009": " ",  # thin space
+    "\u200b": "",  # zero-width space
+    "\u2018": "'",  # left single smart quote
+    "\u2019": "'",  # right single smart quote
+    "\u201c": '"',  # left double smart quote
+    "\u201d": '"',  # right double smart quote
+}
+
+
+def normalize_model_text(text: str | None) -> str:
+    """Normalize model output before storing/printing it.
+
+    Replaces non-breaking hyphens and spaces, smart quotes, and zero-width
+    characters with their plain ASCII equivalents so stored artifacts survive
+    Windows code pages, consoles, and round-trips through other tools.
+    """
+    if not text:
+        return ""
+    for src, dst in _CHAR_REPLACEMENTS.items():
+        text = text.replace(src, dst)
+    # NFKC folds remaining compatibility characters (full-width forms, etc.).
+    return unicodedata.normalize("NFKC", text)
 
 
 def _load_yaml(path: str | None) -> dict[str, Any]:

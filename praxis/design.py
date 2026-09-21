@@ -45,6 +45,7 @@ from praxis.config import (
     HardwareProfile,
     ModelLimits,
     load_facts,
+    normalize_model_text,
     render_facts_sheet,
     resolve_model_limits,
 )
@@ -1357,6 +1358,11 @@ def _load_passes(design: Design) -> dict[str, str]:
         return {}
 
 
+def _store_pass_content(content: str) -> str:
+    """Normalize model output before it is stored or cached anywhere."""
+    return normalize_model_text(content)
+
+
 def _get_or_create_design(
     candidate_id: int, depth: str | None, model: str | None, focus: str | None
 ) -> Design:
@@ -1502,6 +1508,7 @@ def generate_design(
                 progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
                 max_tokens=pass_max_tokens,
             )
+            content = _store_pass_content(content)
             done[pass_id] = content
             save_design_pass(design.id, pass_id, content)
             logger.info("design: pass %s complete for candidate %s", pass_id, candidate_id)
@@ -1560,6 +1567,7 @@ def generate_design(
                     model,
                     completion=completion,
                 )
+                done[target] = _store_pass_content(done[target])
                 save_design_pass(design.id, target, done[target])
             rounds += 1
             if defects and rounds < max_regeneration_rounds:
