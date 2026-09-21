@@ -137,7 +137,10 @@ def test_resolve_model_limits_exact_and_suffix_match():
 def test_model_limits_yaml_missing_or_malformed_is_tolerated(tmp_path):
     """A missing or malformed model_limits block degrades to no limits."""
     bad = tmp_path / "bad.yaml"
-    bad.write_text("model_limits:\n  - tpm: 8000\n  - not: a dict\nmodel_limits_str: oops\n", encoding="utf-8")
+    bad.write_text(
+        "model_limits:\n  - tpm: 8000\n  - not: a dict\nmodel_limits_str: oops\n",
+        encoding="utf-8",
+    )
     facts = load_facts(str(bad))
     assert facts.model_limits == []
 
@@ -151,7 +154,11 @@ def test_render_facts_sheet_lists_per_model_limits():
 
     facts = FactsSheet(
         model_limits=[
-            ModelLimits(model="groq/openai/gpt-oss-120b", tpm=8000, note="observed on the free tier, Sep 2026, may change"),
+            ModelLimits(
+                model="groq/openai/gpt-oss-120b",
+                tpm=8000,
+                note="observed on the free tier, Sep 2026, may change",
+            ),
             ModelLimits(model="groq/qwen/qwen3.8-27b", itpm=7000, otpm=1000),
         ]
     )
