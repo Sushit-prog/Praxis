@@ -554,6 +554,7 @@ class DesignResult:
     defects: list[dict[str, str]] = field(default_factory=list)
     design_md: str = ""
     error: str | None = None
+    critic_skip_note: str | None = None
     calls: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
@@ -889,6 +890,141 @@ def _critic_prompt(design_md: str, facts: FactsSheet) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# Chunked critic: one call per section, compact digest of the others
+# --------------------------------------------------------------------------
+
+
+# Each critic call stays under this input + output token budget; the section
+# under review is trimmed to the elastic part of the prompt.
+CRITIC_CALL_TOKEN_CAP = 5000
+CRITIC_OUTPUT_TOKENS = 1500
+_CRITIC_CUT_NOTE = "\n[section truncated for review]"
+
+
+def _section_digest(other_content: str, max_chars: int = 2000) -> str:
+    """Compact digest (~500 tokens) of the sections NOT under review."""
+    lines = [
+        ln
+        for ln in other_content.splitlines()
+        if ln.strip().startswith(("-", "|", "#"))
+    ]
+    digest = "\n".join(lines)
+    if len(digest) > max_chars:
+        digest = digest[: max_chars - 20] + "\n[digest truncated]"
+    return digest
+
+
+def _chunked_critic_prompt(
+    pass_id: str,
+    done: dict[str, str],
+    facts: FactsSheet,
+    *,
+    token_cap: int = CRITIC_CALL_TOKEN_CAP,
+    output_tokens: int = CRITIC_OUTPUT_TOKENS,
+) -> str:
+    """One chunked-critic call: a single pass output + digest of the rest.
+
+    The section under review is head-truncated (with a marker) when needed so
+    input + the critic's output budget stays under ``token_cap`` tokens — the
+    digests of the other sections are already bounded by ``_section_digest``.
+    """
+    spec = _PASS_SPECS[pass_id]
+    section_text = (done.get(pass_id) or "").strip()
+    other_parts = [
+        f"### {spec2['title']} (digest)\n{_section_digest(done.get(other, ''))}"
+        for other, spec2 in _PASS_SPECS.items()
+        if other != pass_id and (done.get(other) or "").strip()
+    ]
+    header = (
+        f"HARD CONSTRAINTS: CPU-only={facts.cpu_only}, RAM={facts.ram_gb}GB, "
+        f"GPU={'yes' if facts.gpu else 'none'}, "
+        f"budget=${facts.monthly_budget_usd:.2f}/month, OS={facts.os}.\n\n"
+        f"SECTION UNDER REVIEW: '{spec['title']}'\n\n"
+    )
+    footer = (
+        "\n\nOTHER SECTIONS (compact digests, for cross-section checks only):\n"
+        + ("\n\n".join(other_parts) or "(none yet)")
+        + "\n\n"
+        "Review it against the defect classes in your instructions — but ONLY "
+        "the section under review (cross-referencing the digests where "
+        "needed) — and respond with the JSON verdict."
+    )
+    budget_chars = (
+        token_cap - output_tokens
+    ) * _CHARS_PER_TOKEN - len(header) - len(footer) - len(_CRITIC_CUT_NOTE)
+    if len(section_text) > max(0, budget_chars):
+        cut = section_text[: max(0, budget_chars)]
+        keep = cut.rfind("\n")
+        if keep > 200:
+            cut = cut[:keep]
+        section_text = cut + _CRITIC_CUT_NOTE
+    return header + section_text + footer
+
+
+def _critic_section_pass_ids(done: dict[str, str]) -> list[str]:
+    """The pass ids eligible for a chunked-critic call, in pass order."""
+    return [p for p in _PASS_ORDER if (done.get(p) or "").strip()]
+
+
+def _run_chunked_critic(
+    done: dict[str, str],
+    *,
+    candidate_id: int | None,
+    facts: FactsSheet,
+    model: str,
+    completion=None,
+    max_tokens: int | None = None,
+    only_pass_ids: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Run the critic per section; return the defects found.
+
+    Each call receives ONE pass output, a compact digest of the other passes
+    (~500 tokens), and the hard constraints, and returns a defect list for
+    that section — every call stays under ~5000 input + output tokens. When a
+    chain entry cannot fit a critic call (known limits or a request-too-large
+    rejection), that entry is skipped by ``_design_llm_call``; when no entry
+    can serve the call at all, :class:`RequestTooLargeError` propagates and
+    the caller records a skip note instead of failing the whole run.
+    """
+    targets = (
+        [p for p in _PASS_ORDER if p in (only_pass_ids or [])]
+        if only_pass_ids
+        else _critic_section_pass_ids(done)
+    )
+    defects: list[dict[str, str]] = []
+    for pass_id in targets:
+        if pass_id not in done or not done[pass_id].strip():
+            continue
+        prompt = _chunked_critic_prompt(
+            pass_id,
+            done,
+            facts,
+            token_cap=CRITIC_CALL_TOKEN_CAP,
+            output_tokens=max_tokens or CRITIC_OUTPUT_TOKENS,
+        )
+        _wait_for_tpm_budget(
+            model,
+            prompt,
+            facts,
+            output_tokens=max_tokens or CRITIC_OUTPUT_TOKENS,
+            progress_label=f"critic/{pass_id}",
+        )
+        response = _design_llm_call(
+            prompt,
+            system=CRITIC_SYSTEM_PROMPT,
+            model=model,
+            stage="design_critic",
+            candidate_id=candidate_id,
+            completion=completion,
+            facts=facts,
+            progress_label=f"critic/{pass_id}",
+            max_tokens=max_tokens,
+        )
+        defects.extend(_parse_defects(response))
+    return defects
+
+
 def _regenerate_section(
     pass_id: str,
     candidate: Candidate,
@@ -941,6 +1077,7 @@ def assemble_design_md(
     *,
     defects: list[dict[str, str]] | None = None,
     facts: FactsSheet | None = None,
+    critic_skip_note: str | None = None,
 ) -> str:
     """Assemble the final DESIGN.md from pass outputs + the hardware anchor."""
     facts = facts or load_facts()
@@ -962,7 +1099,9 @@ def assemble_design_md(
         if pass_id == "hardware_fit":
             lines += [build_hardware_fit_anchor(facts, profile), ""]
     lines += ["## Critic review", ""]
-    if defects:
+    if critic_skip_note:
+        lines += [critic_skip_note]
+    elif defects:
         lines += ["Defects found and addressed by regeneration:"]
         lines += [f"- [{d['class']}] {d['section']}: {d['defect']}" for d in defects]
     else:
@@ -1153,6 +1292,7 @@ def generate_design(
     pace_seconds: float | None = None,
     max_regeneration_rounds: int = 2,
     rerun_passes: list[str] | None = None,
+    run_critic: bool = True,
 ) -> DesignResult:
     """Run the multi-pass design generation for one candidate.
 
@@ -1216,30 +1356,37 @@ def generate_design(
             if pace > 0 and pass_id != _PASS_ORDER[-1]:
                 time.sleep(pace)
 
-        # -- critic pass ------------------------------------------------------
-        design_md = assemble_design_md(done, profile, candidate, facts=facts)
-        critic_prompt = _critic_prompt(design_md, facts)
-        critic_max_tokens = resolve_pass_output_tokens(model, facts)
-        _wait_for_tpm_budget(
-            model, critic_prompt, facts, output_tokens=critic_max_tokens, progress_label="critic"
-        )
-        critic_response = _design_llm_call(
-            critic_prompt,
-            system=CRITIC_SYSTEM_PROMPT,
-            model=model,
-            stage="design_critic",
-            candidate_id=candidate_id,
-            completion=completion,
-            facts=facts,
-            progress_label="critic",
-            max_tokens=critic_max_tokens,
-        )
-        defects = _parse_defects(critic_response)
-        # History of every defect the critic raised across rounds (even ones a
-        # later critic pass cleared) — the report keeps what was found.
-        found_defects = list(defects)
+        # -- chunked critic: one call per section ------------------------------
+        found_defects: list[dict[str, str]] = []
+        critic_skipped_reason: str | None = None
+        defects: list[dict[str, str]] = []
+        if not run_critic:
+            critic_skipped_reason = "critic skipped: --no-critic"
+        else:
+            critic_max_tokens = resolve_pass_output_tokens(
+                model, facts, planned=CRITIC_OUTPUT_TOKENS
+            )
+            try:
+                found_defects = _run_chunked_critic(
+                    done,
+                    candidate_id=candidate_id,
+                    facts=facts,
+                    model=model,
+                    completion=completion,
+                    max_tokens=critic_max_tokens,
+                )
+                defects = list(found_defects)
+            except Exception as critic_exc:  # noqa: BLE001 - critic is best-effort
+                logger.warning("design: chunked critic failed: %s", critic_exc)
+                defects = []
+                if isinstance(critic_exc, RequestTooLargeError):
+                    critic_skipped_reason = f"critic skipped: {critic_exc}"
+                else:
+                    critic_skipped_reason = f"critic skipped: {critic_exc}"
 
         # -- bounded regeneration of flagged sections -------------------------
+        # Only the sections the critic flagged get regenerated; the re-review
+        # calls stay per-section so every call keeps its small prompt.
         rounds = 0
         while defects and rounds < max_regeneration_rounds:
             flagged = []
@@ -1264,31 +1411,32 @@ def generate_design(
                 save_design_pass(design.id, target, done[target])
             rounds += 1
             if defects and rounds < max_regeneration_rounds:
-                design_md = assemble_design_md(
-                    done, profile, candidate, facts=facts
-                )
-                critic_retry_prompt = _critic_prompt(design_md, facts)
-                _wait_for_tpm_budget(
-                    model, critic_retry_prompt, facts, progress_label="critic"
-                )
-                critic_response = _design_llm_call(
-                    critic_retry_prompt,
-                    system=CRITIC_SYSTEM_PROMPT,
-                    model=model,
-                    stage="design_critic",
-                    candidate_id=candidate_id,
-                    completion=completion,
-                    facts=facts,
-                    progress_label="critic",
-                )
-                defects = _parse_defects(critic_response)
+                recheck_ids = list(dict.fromkeys(target for target, _ in flagged))
+                try:
+                    defects = _run_chunked_critic(
+                        done,
+                        candidate_id=candidate_id,
+                        facts=facts,
+                        model=model,
+                        completion=completion,
+                        max_tokens=critic_max_tokens,
+                        only_pass_ids=recheck_ids,
+                    )
+                except Exception as critic_exc:  # noqa: BLE001 - critic is best-effort
+                    logger.warning("design: chunked critic re-review failed: %s", critic_exc)
+                    defects = []
                 found_defects.extend(defects)
 
         defects_text = "\n".join(
             f"[{d['class']}] {d['section']}: {d['defect']} -> {d['fix']}" for d in found_defects
         )
         final_md = assemble_design_md(
-            done, profile, candidate, defects=found_defects or None, facts=facts
+            done,
+            profile,
+            candidate,
+            defects=found_defects or None,
+            facts=facts,
+            critic_skip_note=critic_skipped_reason,
         )
 
         session = get_session()
@@ -1312,6 +1460,7 @@ def generate_design(
             completed_passes=list(done),
             defects=found_defects,
             design_md=final_md,
+            critic_skip_note=critic_skipped_reason,
             calls=calls,
             total_tokens=total_tokens,
             cost_usd=cost_usd,

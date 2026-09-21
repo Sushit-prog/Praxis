@@ -234,37 +234,40 @@ def test_generate_design_runs_all_passes_and_critic(design_db, no_grounding, mon
     assert "## Hardware & Budget Fit" in result.design_md
     assert "### Hard constraints (from hardware_profile.yaml)" in result.design_md
     assert "Critic pass completed with no defects." in result.design_md
-    # 5 content passes + 1 critic, all on the resolved default design model
-    assert len(seen_models) == 6
+    # 5 content passes + 5 chunked critic calls (one per section), all on the
+    # resolved default design model.
+    assert len(seen_models) == 10
     assert set(seen_models) == {"groq/openai/gpt-oss-120b"}
     assert seen_stages.count("design") == 5
-    assert seen_stages.count("design_critic") == 1
+    assert seen_stages.count("design_critic") == 5
 
 
 def test_generate_design_regenerates_flagged_sections(design_db, no_grounding, monkeypatch):
     import praxis.design as design_module
 
-    critic_responses = iter(
-        [
-            json.dumps(
+    defect_json = json.dumps(
+        {
+            "defects": [
                 {
-                    "defects": [
-                        {
-                            "class": "UNCOVERED_COMPONENT",
-                            "section": "Architecture",
-                            "defect": "Retriever has no task.",
-                            "fix": "Add a Retriever task to Phase 1.",
-                        }
-                    ]
+                    "class": "UNCOVERED_COMPONENT",
+                    "section": "Architecture",
+                    "defect": "Retriever has no task.",
+                    "fix": "Add a Retriever task to Phase 1.",
                 }
-            ),
-            json.dumps({"defects": []}),
-        ]
+            ]
+        }
     )
 
     def fake_call_llm(prompt, system=None, model=None, **kwargs):
         if "Review it against the defect classes" in prompt:
-            return next(critic_responses)
+            # The chunked critic reviews one section per call: flag the
+            # Architecture section the first time it is reviewed, then clear.
+            if "SECTION UNDER REVIEW: 'Architecture'" in prompt:
+                if not hasattr(fake_call_llm, "flagged"):
+                    fake_call_llm.flagged = True
+                    return defect_json
+                return json.dumps({"defects": []})
+            return json.dumps({"defects": []})
         for content in GOOD_PASSES.values():
             title = content.split("\n", 1)[0].lstrip("# ").strip()
             if f"start with its '## {title}'" in prompt:
@@ -282,7 +285,7 @@ def test_generate_design_regenerates_flagged_sections(design_db, no_grounding, m
     md = result.design_md
     assert "## Critic review" in md
     assert "[UNCOVERED_COMPONENT] Architecture" in md
-    # 5 passes + critic + 1 regeneration + second critic
+    # The single flagged section is regenerated exactly once.
     assert md.count("## Critic review") == 1
 
 
@@ -473,8 +476,9 @@ def test_pass_prompts_carry_section_citation_requirement(design_db, no_grounding
     monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
     generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
 
-    assert len(prompts) == 6
-    for prompt in prompts[:-1]:  # content passes, not the critic
+    # 5 content passes + 5 chunked critic calls (one per section).
+    assert len(prompts) == 10
+    for prompt in prompts[:5]:  # content passes, not the critic calls
         assert "UNVERIFIED" in prompt  # the labelling rule is in every pass prompt
 
 
@@ -577,9 +581,10 @@ def test_every_pass_uses_the_system_prompt(design_db, no_grounding, monkeypatch)
     monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
     generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
 
-    assert len(systems) == 6
+    # 5 content passes + 5 chunked critic calls (one per section).
+    assert len(systems) == 10
     assert all(s == design_module.SYSTEM_PROMPT for s in systems[:5])
-    assert systems[5] == design_module.CRITIC_SYSTEM_PROMPT
+    assert all(s == design_module.CRITIC_SYSTEM_PROMPT for s in systems[5:])
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +701,7 @@ def test_facts_sheet_appears_in_every_pass_prompt(design_db, no_grounding, monke
         _Candidate(design_db), HardwareProfile(), facts=facts, pace_seconds=0.0
     )
 
-    content_prompts = prompts[:-1]  # exclude the critic prompt
+    content_prompts = prompts[:5]  # content passes; the rest are critic calls
     assert len(content_prompts) == 5
     for prompt in content_prompts:
         assert "HARD CONSTRAINTS" in prompt
@@ -748,8 +753,8 @@ def test_injection_in_paper_does_not_alter_prompt_structure(
     result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
     assert result.status == "complete"
 
-    assert len(prompts) == 6
-    for prompt in prompts[:-1]:
+    assert len(prompts) == 10
+    for prompt in prompts[:5]:
         # Exactly one begin/end pair (ours); embedded markers were neutralized.
         assert prompt.count(start) == 1
         assert prompt.count(end) == 1
@@ -758,3 +763,123 @@ def test_injection_in_paper_does_not_alter_prompt_structure(
         # verbatim BEFORE the untrusted block.
         assert "HARD CONSTRAINTS" in prompt.split(start, 1)[0]
         assert "999 GB" not in prompt.split(start, 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# Item 3: chunked critic, --no-critic, auto-skip note
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_critic_reviews_each_section_separately(design_db, no_grounding, monkeypatch):
+    """Each critic call carries ONE section + digests of the others, not the doc."""
+    import praxis.design as design_module
+
+    critic_prompts = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        if "Review it against the defect classes" in prompt:
+            critic_prompts.append(prompt)
+            return json.dumps({"defects": []})
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    assert len(critic_prompts) == len(PASS_IDS)
+    for pass_id in PASS_IDS:
+        title = design_module._PASS_SPECS[pass_id]["title"]
+        own = next(p for p in critic_prompts if f"SECTION UNDER REVIEW: '{title}'" in p)
+        # The section itself is present in full.
+        first_line = GOOD_PASSES[pass_id].split("\n", 1)[0]
+        assert first_line in own
+        # The other sections appear only as bounded digests, and the whole
+        # prompt stays comfortably under the ~5000-token call budget.
+        assert "OTHER SECTIONS (compact digests" in own
+        assert "Critic review" not in own  # never the assembled document
+    biggest = max(len(p) for p in critic_prompts)
+    assert biggest <= design_module.CRITIC_CALL_TOKEN_CAP * 4
+
+
+def test_chunked_critic_under_cap_trims_section_not_framing(design_db, no_grounding, monkeypatch):
+    """An oversized section is truncated inside the review text; framing stays."""
+    import praxis.design as design_module
+
+    big_passes = dict(GOOD_PASSES)
+    big_passes["technique"] = GOOD_PASSES["technique"] + ("\ndetail line\n" * 2000)
+    seen = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        seen.append(prompt)
+        for content in big_passes.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    technique_review = next(p for p in seen if "SECTION UNDER REVIEW: 'Technique'" in p)
+    assert "[section truncated for review]" in technique_review
+    assert "SECTION UNDER REVIEW" in technique_review  # header survives
+    assert "respond with the JSON verdict" in technique_review  # tail survives
+    total_tokens = len(technique_review) // 4 + design_module.CRITIC_OUTPUT_TOKENS
+    assert total_tokens <= design_module.CRITIC_CALL_TOKEN_CAP
+
+
+def test_no_critic_flag_skips_all_critic_calls(design_db, no_grounding, monkeypatch):
+    """run_critic=False makes zero design_critic calls and records a skip note."""
+    import praxis.design as design_module
+
+    stages = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        stages.append(kwargs.get("stage"))
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(
+        _Candidate(design_db), HardwareProfile(), pace_seconds=0.0, run_critic=False
+    )
+    assert result.status == "complete"
+    assert stages.count("design") == 5
+    assert "design_critic" not in stages
+    assert result.critic_skip_note == "critic skipped: --no-critic"
+    assert "critic skipped: --no-critic" in result.design_md
+    assert "## Critic review" in result.design_md
+
+
+def test_critic_auto_skip_note_on_request_too_large(design_db, no_grounding, monkeypatch):
+    """When no chain entry fits a critic call, the run completes with a note."""
+    import praxis.design as design_module
+
+    def passes_ok_critic_too_large(prompt, system=None, model=None, **kwargs):
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            exc = RuntimeError("request too large for this model")
+            exc.status_code = 413
+            raise exc
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", passes_ok_critic_too_large)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"  # the design itself succeeded
+    assert result.critic_skip_note and result.critic_skip_note.startswith("critic skipped:")
+    assert "critic skipped:" in result.design_md
+    # The content passes were stored; nothing was lost by the critic skip.
+    assert set(result.completed_passes) == set(PASS_IDS)

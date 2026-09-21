@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
             "pass instead of starting a new one."
         ),
     )
+    design_parser.add_argument(
+        "--no-critic",
+        action="store_true",
+        help="Skip the chunked critic review (saves one call per section).",
+    )
 
     return parser
 
@@ -478,6 +483,7 @@ def _design_and_write(
     depth="standard",
     model=None,
     rerun_passes=None,
+    run_critic=True,
 ) -> int:
     """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
     from praxis.design import generate_design
@@ -490,6 +496,7 @@ def _design_and_write(
         focus=focus,
         model=model,
         rerun_passes=rerun_passes,
+        run_critic=run_critic,
     )
     if result.status != "complete" or not result.design_md:
         completed = ", ".join(result.completed_passes) or "none"
@@ -592,6 +599,7 @@ def _cmd_design(args) -> int:
         depth=args.depth,
         model=args.model,
         rerun_passes=rerun_passes,
+        run_critic=not args.no_critic,
     )
 
 

@@ -238,11 +238,11 @@ def test_chain_failover_moves_to_next_provider(design_setup, monkeypatch):
     result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
 
     assert result.status == "complete"
-    # Each of the 6 calls (5 passes + critic) retries groq to exhaustion
-    # (1 + RATE_LIMIT_MAX_RETRIES attempts) before failing over to cerebras.
-    assert attempts["groq"] == 6 * (1 + RATE_LIMIT_MAX_RETRIES)
-    assert len(waits) == 6 * RATE_LIMIT_MAX_RETRIES
-    assert len(models_succeeded) == 6
+    # Each of the 10 calls (5 passes + 5 chunked critic) retries groq to
+    # exhaustion (1 + RATE_LIMIT_MAX_RETRIES attempts) before failing over.
+    assert attempts["groq"] == 10 * (1 + RATE_LIMIT_MAX_RETRIES)
+    assert len(waits) == 10 * RATE_LIMIT_MAX_RETRIES
+    assert len(models_succeeded) == 10
     assert all(m.startswith("cerebras") for m in models_succeeded)
 
 
@@ -504,11 +504,10 @@ def test_too_large_skips_entry_without_wait_or_cooldown(design_setup, monkeypatc
 
     assert result.status == "complete"
     # Groq rejected each call exactly once (no wait-and-retry), then cerebras.
-    assert attempts.count("groq/openai/gpt-oss-120b") == 0 or True  # counting below
     groq_attempts = sum(1 for m in attempts if m.startswith("groq"))
     cerebras_successes = sum(1 for m in attempts if m.startswith("cerebras"))
-    assert groq_attempts == 6  # 5 passes + critic, one instant rejection each
-    assert cerebras_successes == 6
+    assert groq_attempts == 10  # 5 passes + 5 chunked critic, one rejection each
+    assert cerebras_successes == 10
     assert waits == []  # never slept
     # No cooldown was recorded for groq: a smaller request may still go there.
     from praxis.db import ProviderHealth

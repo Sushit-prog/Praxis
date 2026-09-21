@@ -376,8 +376,8 @@ def test_cli_design_resume_continues_partial(cli_discover_env, monkeypatch, caps
     assert "DESIGN.md" in out
     assert "LLM usage:" in out
     # The stored technique pass was reused, not regenerated: only the other 4
-    # content passes + critic were called.
-    assert len(calls) == 5
+    # content passes + the 5 chunked critic calls were made.
+    assert len(calls) == 9
     stored = latest_design(cid)
     assert stored.status == "complete"
     assert json.loads(stored.passes_json)["technique"] == GOOD_PASSES["technique"]
