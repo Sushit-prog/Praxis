@@ -511,7 +511,8 @@ def test_too_large_skips_entry_without_wait_or_cooldown(design_setup, monkeypatc
     assert cerebras_successes == 6
     assert waits == []  # never slept
     # No cooldown was recorded for groq: a smaller request may still go there.
-    from praxis.db import ProviderHealth, get_session as patched_get_session
+    from praxis.db import get_session as patched_get_session
+    from praxis.db import ProviderHealth
 
     session = patched_get_session()
     rows = session.query(ProviderHealth).all()
