@@ -276,10 +276,10 @@ def test_resolve_design_model_chain_parsing(monkeypatch):
 
 
 def test_tpm_pacing_waits_when_window_is_full(monkeypatch):
-    """When used + request exceeds the TPM limit, the call waits."""
-    from praxis.config import FactsSheet
+    """When used + request exceeds the model's TPM limit, the call waits."""
+    from praxis.config import FactsSheet, ModelLimits
 
-    facts = FactsSheet(provider_limits=["groq gpt-oss-20b: 8000 TPM"])
+    facts = FactsSheet(model_limits=[ModelLimits(model="groq/openai/gpt-oss-120b", tpm=8000)])
     window = _TokenWindow()
     monkeypatch.setattr("praxis.design._token_window", window)
     waits: list[float] = []
@@ -294,9 +294,9 @@ def test_tpm_pacing_waits_when_window_is_full(monkeypatch):
 
 def test_tpm_pacing_skips_when_window_has_room(monkeypatch):
     """Under the limit: no wait, no sleep."""
-    from praxis.config import FactsSheet
+    from praxis.config import FactsSheet, ModelLimits
 
-    facts = FactsSheet(provider_limits=["groq gpt-oss-20b: 8000 TPM"])
+    facts = FactsSheet(model_limits=[ModelLimits(model="groq/openai/gpt-oss-120b", tpm=8000)])
     window = _TokenWindow()
     monkeypatch.setattr("praxis.design._token_window", window)
     waits: list[float] = []
@@ -307,8 +307,8 @@ def test_tpm_pacing_skips_when_window_has_room(monkeypatch):
     assert waits == []
 
 
-def test_tpm_pacing_ignores_unknown_provider(monkeypatch):
-    """No TPM line for the provider in the facts sheet -> never waits."""
+def test_tpm_pacing_ignores_unknown_model(monkeypatch):
+    """A model with no known limits is NOT throttled, however big the request."""
     from praxis.config import FactsSheet
 
     monkeypatch.setattr("praxis.design._token_window", _TokenWindow())
@@ -325,6 +325,93 @@ def test_tpm_window_drops_stale_events():
     window.record("groq", 5000, now=0.0)
     assert window.used("groq", now=TPM_WINDOW_S - 1) == 5000
     assert window.used("groq", now=TPM_WINDOW_S + 5) == 0
+
+
+# ---------------------------------------------------------------------------
+# per-model limits: itpm/otpm axes and max_tokens clamping (item 1)
+# ---------------------------------------------------------------------------
+
+
+def test_pacing_respects_itpm_input_axis(monkeypatch):
+    """A qwen-style entry: input alone can bust ITPM even with tiny output."""
+    from praxis.config import FactsSheet, ModelLimits
+
+    facts = FactsSheet(
+        model_limits=[ModelLimits(model="groq/qwen/qwen3.8-27b", itpm=7000, otpm=1000)]
+    )
+    window = _TokenWindow()
+    monkeypatch.setattr("praxis.design._token_window", window)
+    waits: list[float] = []
+    monkeypatch.setattr("praxis.design._sleep", lambda s: waits.append(s))
+
+    # 6500 input tokens used; a 1500-token input + 200 output breaks ITPM.
+    window.record("groq", 6500)
+    _wait_for_tpm_budget("groq/qwen/qwen3.8-27b", "x" * 6000, facts, output_tokens=200)
+    assert waits, "ITPM breach must trigger a wait"
+
+
+def test_pacing_respects_otpm_output_axis(monkeypatch):
+    """Output alone busting OTPM triggers a wait even when input fits."""
+    from praxis.config import FactsSheet, ModelLimits
+
+    facts = FactsSheet(
+        model_limits=[ModelLimits(model="groq/qwen/qwen3.8-27b", itpm=7000, otpm=1000)]
+    )
+    window = _TokenWindow()
+    monkeypatch.setattr("praxis.design._token_window", window)
+    waits: list[float] = []
+    monkeypatch.setattr("praxis.design._sleep", lambda s: waits.append(s))
+
+    # Output budget nearly used up: an 800-token output request breaches OTPM.
+    window.record("groq", 0, 900)
+    _wait_for_tpm_budget("groq/qwen/qwen3.8-27b", "tiny", facts, output_tokens=800)
+    assert waits, "OTPM breach must trigger a wait"
+
+
+def test_resolve_pass_output_tokens_clamps_to_otpm():
+    """max_tokens for a pass is min(planned, otpm); no limits -> unclamped."""
+    from praxis.config import FactsSheet, ModelLimits
+    from praxis.design import resolve_pass_output_tokens
+
+    facts = FactsSheet(
+        model_limits=[ModelLimits(model="groq/qwen/qwen3.8-27b", otpm=1000)]
+    )
+    assert resolve_pass_output_tokens("groq/qwen/qwen3.8-27b", facts) == 1000
+    assert resolve_pass_output_tokens("groq/qwen/qwen3.8-27b", facts, planned=500) == 500
+    # No entry for this model: no clamping.
+    assert resolve_pass_output_tokens("cerebras/qwen-3.8-27b", facts) > 1000
+    assert resolve_pass_output_tokens("any/model", None) > 1000
+
+
+def test_pass_call_carries_otpm_clamped_max_tokens(design_setup, monkeypatch):
+    """The design calls pass max_tokens through to call_llm, clamped to OTPM."""
+    import praxis.design as design_module
+
+    candidate_id, profile, _waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/qwen/qwen3.8-27b")
+    captured: list[int | None] = []
+
+    def fake_call_llm(prompt, system=None, model=None, max_tokens=None, **kwargs):
+        captured.append(max_tokens)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    from praxis.config import load_facts
+
+    result = generate_design(
+        _Candidate(candidate_id), profile, facts=load_facts(), pace_seconds=0.0
+    )
+    assert result.status == "complete"
+    assert captured, "expected design calls"
+    # Every call's max_tokens is clamped to qwen3.8-27b's otpm=1000 from the YAML.
+    assert max(t for t in captured if t is not None) == 1000
+    assert all(t is not None and t <= 1000 for t in captured)
 
 
 # ---------------------------------------------------------------------------

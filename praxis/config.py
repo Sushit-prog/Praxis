@@ -76,9 +76,59 @@ class FactsSheet:
     monthly_budget_usd: float = 15.0
     local_only: bool = True
     provider_limits: list[str] = field(default_factory=list)
+    model_limits: list[ModelLimits] = field(default_factory=list)
     preferred_stack: list[str] = field(default_factory=list)
     stack_notes: list[str] = field(default_factory=list)
     avoid: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ModelLimits:
+    """Per-model free-tier rate limits (all optional, all tokens/minute).
+
+    ``tpm`` caps total tokens (input + output), ``itpm`` input tokens only,
+    ``otpm`` output tokens only. A model with no entry — or a missing limit
+    within its entry — is not throttled on that axis.
+    """
+
+    model: str
+    tpm: int | None = None
+    itpm: int | None = None
+    otpm: int | None = None
+    note: str = ""
+
+
+def _load_model_limits(value: Any) -> list[ModelLimits]:
+    """Parse the YAML ``model_limits`` list into ModelLimits entries."""
+    if not isinstance(value, list):
+        return []
+    limits: list[ModelLimits] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        if not model:
+            continue
+
+        def _opt(name: str, _item: dict[str, Any] = item) -> int | None:
+            raw = _item.get(name)
+            if raw is None:
+                return None
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                return None
+
+        limits.append(
+            ModelLimits(
+                model=model,
+                tpm=_opt("tpm"),
+                itpm=_opt("itpm"),
+                otpm=_opt("otpm"),
+                note=str(item.get("note") or ""),
+            )
+        )
+    return limits
 
 
 def _as_list(value: Any) -> list[str]:
@@ -117,10 +167,27 @@ def load_facts(path: str | None = None) -> FactsSheet:
         monthly_budget_usd=_to_float(budget_raw, default=15.0),
         local_only=_to_bool(data.get("local_only", True)),
         provider_limits=_as_list(data.get("provider_limits")),
+        model_limits=_load_model_limits(data.get("model_limits")),
         preferred_stack=_as_list(data.get("preferred_stack")),
         stack_notes=_as_list(data.get("stack_notes")),
         avoid=_as_list(data.get("avoid")),
     )
+
+
+def resolve_model_limits(facts: FactsSheet, model: str) -> ModelLimits | None:
+    """The limits entry for ``model``, or None when the model is unthrottled.
+
+    Matches the full litellm id first (``groq/openai/gpt-oss-120b``); falls
+    back to a suffix match so a YAML entry written as ``openai/gpt-oss-120b``
+    still covers the fully qualified model.
+    """
+    for entry in facts.model_limits:
+        if entry.model == model:
+            return entry
+    for entry in facts.model_limits:
+        if model.endswith(entry.model) or entry.model.endswith(model):
+            return entry
+    return None
 
 
 def render_facts_sheet(facts: FactsSheet) -> str:
@@ -138,6 +205,18 @@ def render_facts_sheet(facts: FactsSheet) -> str:
     if facts.provider_limits:
         lines.append("- Provider free-tier limits:")
         lines.extend(f"  - {limit}" for limit in facts.provider_limits)
+    if facts.model_limits:
+        lines.append("- Per-model rate limits (observed on the free tier, Sep 2026, may change):")
+        for entry in facts.model_limits:
+            parts = []
+            if entry.tpm is not None:
+                parts.append(f"{entry.tpm} TPM total")
+            if entry.itpm is not None:
+                parts.append(f"{entry.itpm} ITPM input")
+            if entry.otpm is not None:
+                parts.append(f"{entry.otpm} OTPM output")
+            note = f" ({entry.note})" if entry.note else ""
+            lines.append(f"  - {entry.model}: {', '.join(parts)}{note}")
     if facts.preferred_stack:
         lines.append(f"- Preferred stack: {', '.join(facts.preferred_stack)}")
     if facts.stack_notes:

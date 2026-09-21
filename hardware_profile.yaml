@@ -31,6 +31,18 @@ avoid:
   - CUDA-only libraries
   - VPS unless justified
 provider_limits:
-  - "groq gpt-oss-20b: 8000 TPM — observed on the free tier (Sep 2026), may change"
   - "openrouter: UNVERIFIED: check before relying"
   - "cerebras: UNVERIFIED: check before relying"
+# Per-model free-tier rate limits; each limit is optional and a model with no
+# entry here (or a missing limit) is NOT throttled by the design engine.
+model_limits:
+  - model: groq/openai/gpt-oss-120b
+    tpm: 8000
+    note: "observed on the free tier, Sep 2026, may change"
+  - model: groq/openai/gpt-oss-20b
+    tpm: 8000
+    note: "observed on the free tier, Sep 2026, may change"
+  - model: groq/qwen/qwen3.8-27b
+    itpm: 7000
+    otpm: 1000
+    note: "observed on the free tier, Sep 2026, may change"

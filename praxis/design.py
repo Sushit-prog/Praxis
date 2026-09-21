@@ -40,7 +40,14 @@ import time
 from dataclasses import dataclass, field
 
 from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START, _strip_delimiters
-from praxis.config import FactsSheet, HardwareProfile, load_facts, render_facts_sheet
+from praxis.config import (
+    FactsSheet,
+    HardwareProfile,
+    ModelLimits,
+    load_facts,
+    render_facts_sheet,
+    resolve_model_limits,
+)
 from praxis.db import (
     Candidate,
     Design,
@@ -75,9 +82,10 @@ RATE_LIMIT_MAX_WAIT_S = 90.0
 RATE_LIMIT_WAIT_MARGIN_S = 2.0
 RATE_LIMIT_DEFAULT_WAIT_S = 60.0
 
-# Proactive pacing: never let input + max_tokens exceed the provider's TPM
-# limit inside a 60s window. Tokens are tracked in-memory (this process only;
-# cross-process accounting would need the ledger and overcounts restarts).
+# Proactive pacing: never let a request exceed any of the model's free-tier
+# limits (total TPM, input ITPM, output OTPM) inside a 60s window. Tokens are
+# tracked in-memory per provider and axis (this process only; cross-process
+# accounting would need the ledger and overcounts restarts).
 TPM_WINDOW_S = 60.0
 DEFAULT_PASS_OUTPUT_TOKENS = 2500
 
@@ -104,56 +112,146 @@ def parse_retry_after(message: str) -> float | None:
 
 
 class _TokenWindow:
-    """Sliding-window token usage per provider for proactive TPM pacing."""
+    """Sliding-window token usage per provider for proactive pacing.
+
+    Input and output tokens are tracked separately so each of the three
+    free-tier axes (total TPM, input ITPM, output OTPM) can be enforced.
+    """
 
     def __init__(self) -> None:
-        self._events: dict[str, list[tuple[float, int]]] = {}
+        # provider -> [(timestamp, input_tokens, output_tokens), ...]
+        self._events: dict[str, list[tuple[float, int, int]]] = {}
 
-    def record(self, provider: str, tokens: int, *, now: float | None = None) -> None:
+    def record(
+        self, provider: str, input_tokens: int, output_tokens: int = 0, *, now: float | None = None
+    ) -> None:
         now = time.monotonic() if now is None else now
-        self._events.setdefault(provider, []).append((now, tokens))
+        self._events.setdefault(provider, []).append((now, input_tokens, output_tokens))
 
-    def used(self, provider: str, *, now: float | None = None) -> int:
+    def used(self, provider: str, *, axis: str = "total", now: float | None = None) -> int:
+        """Tokens used in the window on one axis: total, input, or output."""
         now = time.monotonic() if now is None else now
         events = self._events.get(provider, [])
-        fresh = [(ts, n) for ts, n in events if now - ts < TPM_WINDOW_S]
+        fresh = [e for e in events if now - e[0] < TPM_WINDOW_S]
         self._events[provider] = fresh
-        return sum(n for _, n in fresh)
+        if axis == "input":
+            return sum(i for _, i, _ in fresh)
+        if axis == "output":
+            return sum(o for _, _, o in fresh)
+        return sum(i + o for _, i, o in fresh)
 
 
 _token_window = _TokenWindow()
 
 
-def _resolve_tpm_limit(provider: str, facts: FactsSheet | None) -> int:
-    """The provider's TPM limit from the facts sheet, or 0 when unknown.
+def resolve_pass_output_tokens(
+    model: str, facts: FactsSheet | None, planned: int | None = None
+) -> int:
+    """max_tokens for a design call: the planned size clamped to OTPM.
 
-    Looks for "N TPM" in the facts sheet's provider_limits lines (e.g. "groq
-    gpt-oss-20b: 8000 TPM"); the first matching line for this provider wins.
+    The model's ``otpm`` limit (if known) caps the output budget; a model with
+    no known limits is not clamped at all.
     """
-    if facts is None:
-        return 0
-    for line in facts.provider_limits:
-        lowered = line.lower()
-        if provider not in lowered:
-            continue
-        match = re.search(r"(\d+)\s*tpm", lowered)
-        if match:
-            return int(match.group(1))
-    return 0
+    planned = DEFAULT_PASS_OUTPUT_TOKENS if planned is None else planned
+    limits = resolve_model_limits(facts, model) if facts is not None else None
+    if limits is not None and limits.otpm is not None:
+        return min(planned, limits.otpm)
+    return planned
 
 
-def _seconds_to_wait_for_tpm(
-    used_tokens: int, request_tokens: int, tpm_limit: int, *, now: float | None = None
+def _seconds_to_wait(
+    used: dict[str, int],
+    request: dict[str, int],
+    limits: ModelLimits,
 ) -> float:
-    """Seconds until the sliding window frees enough budget for this request."""
-    if tpm_limit <= 0:
-        return 0.0
-    if used_tokens + request_tokens <= tpm_limit:
-        return 0.0
-    overage = used_tokens + request_tokens - tpm_limit
-    # Conservative drain rate; without per-event timestamps for tokens we
-    # assume the oldest tokens free capacity at a steady rate.
-    return (overage / tpm_limit) * TPM_WINDOW_S
+    """Seconds until the sliding window frees enough budget on EVERY axis.
+
+    ``used``/``request`` map axis name -> tokens for "total", "input" and
+    "output"; each known limit is checked against its own axis and the wait
+    covers the binding constraint.
+    """
+    worst = 0.0
+    pairs = (
+        ("total", limits.tpm),
+        ("input", limits.itpm),
+        ("output", limits.otpm),
+    )
+    for axis, limit in pairs:
+        if limit is None or limit <= 0:
+            continue
+        over = used.get(axis, 0) + request.get(axis, 0) - limit
+        if over > 0:
+            # Conservative drain rate: the window frees capacity steadily.
+            worst = max(worst, (over / limit) * TPM_WINDOW_S)
+    return worst
+
+
+def _wait_for_tpm_budget(
+    model: str,
+    prompt: str,
+    facts: FactsSheet | None,
+    *,
+    output_tokens: int = DEFAULT_PASS_OUTPUT_TOKENS,
+    progress_label: str = "",
+) -> None:
+    """Sleep proactively when the request would exceed any known model limit.
+
+    Tracks input/output tokens used in the last 60s per provider (in-memory
+    sliding window); when the upcoming request would not fit inside the
+    model's TPM/ITPM/OTPM limits, waits until it does. A model with no known
+    limits is never throttled.
+    """
+    limits = resolve_model_limits(facts, model) if facts is not None else None
+    if limits is None:
+        return
+    provider = provider_of(model)
+    input_tokens = len(prompt) // _CHARS_PER_TOKEN
+    request = {
+        "total": input_tokens + output_tokens,
+        "input": input_tokens,
+        "output": output_tokens,
+    }
+    used = {axis: _token_window.used(provider, axis=axis) for axis in ("total", "input", "output")}
+    wait_s = _seconds_to_wait(used, request, limits)
+    if wait_s <= 0:
+        return
+    wait_s = min(wait_s + 0.5, RATE_LIMIT_MAX_WAIT_S)
+    binding = _binding_axis(used, request, limits)
+    if progress_label:
+        print(
+            f"  {progress_label}: pacing {wait_s:.0f}s to stay within "
+            f"{model} limits ({binding})",
+            flush=True,
+        )
+    logger.info(
+        "design: pacing %.0fs before %s (used total=%d input=%d output=%d vs "
+        "limits tpm=%s itpm=%s otpm=%s)",
+        wait_s,
+        provider,
+        used["total"],
+        used["input"],
+        used["output"],
+        limits.tpm,
+        limits.itpm,
+        limits.otpm,
+    )
+    _sleep(wait_s)
+
+
+def _binding_axis(used: dict[str, int], request: dict[str, int], limits: ModelLimits) -> str:
+    """Human-readable name of the limit this request is closest to breaking."""
+    worst_axis, worst_frac = "total", 0.0
+    for label, key, limit in (
+        ("tpm (total)", "total", limits.tpm),
+        ("itpm (input)", "input", limits.itpm),
+        ("otpm (output)", "output", limits.otpm),
+    ):
+        if limit is None or limit <= 0:
+            continue
+        frac = (used.get(key, 0) + request.get(key, 0)) / limit
+        if frac > worst_frac:
+            worst_axis, worst_frac = label, frac
+    return f"{worst_axis} at {min(1.0, worst_frac):.0%} of limit"
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -171,6 +269,7 @@ def _design_llm_call(
     completion=None,
     facts: FactsSheet | None = None,
     progress_label: str = "",
+    max_tokens: int | None = None,
 ) -> str:
     """One design LLM call with rate-limit wait-and-retry and TPM accounting.
 
@@ -201,6 +300,7 @@ def _design_llm_call(
                     stage=stage,
                     candidate_id=candidate_id,
                     completion=completion,
+                    max_tokens=max_tokens,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -239,54 +339,21 @@ def _design_llm_call(
     raise last_exc  # every chain entry exhausted its retries
 
 
-def _record_usage_estimate(prompt: str, content: str, provider: str, elapsed: float) -> None:
-    """Record an estimated token usage of a completed call in the TPM window.
-
-    Uses the 4-chars/token heuristic on prompt + completion; where the real
-    ledger rows exist (litellm reported usage) they are authoritative — this
-    estimate only feeds the in-process pacing window.
-    """
-    estimate = (len(prompt) + len(content)) // _CHARS_PER_TOKEN
-    _token_window.record(provider, estimate)
-
-
-def _wait_for_tpm_budget(
-    model: str,
+def _record_usage_estimate(
     prompt: str,
-    facts: FactsSheet | None,
-    *,
-    output_tokens: int = DEFAULT_PASS_OUTPUT_TOKENS,
-    progress_label: str = "",
+    content: str,
+    provider: str,
+    elapsed: float,
 ) -> None:
-    """Sleep proactively when input + max_tokens would exceed the TPM limit.
+    """Record an estimated token usage of a completed call in the pacing window.
 
-    Tracks tokens used in the last 60s per provider (in-memory sliding
-    window); when the upcoming request would not fit, waits until it does.
+    Uses the 4-chars/token heuristic on prompt (input) and completion
+    (output); where the real ledger rows exist (litellm reported usage) they
+    are authoritative — this estimate only feeds the in-process pacing window.
     """
-    tpm_limit = _resolve_tpm_limit(provider_of(model), facts)
-    if tpm_limit <= 0:
-        return
-    request_tokens = len(prompt) // _CHARS_PER_TOKEN + output_tokens
-    used = _token_window.used(provider_of(model))
-    wait_s = _seconds_to_wait_for_tpm(used, request_tokens, tpm_limit)
-    if wait_s <= 0:
-        return
-    wait_s = min(wait_s + 0.5, RATE_LIMIT_MAX_WAIT_S)
-    if progress_label:
-        print(
-            f"  {progress_label}: pacing {wait_s:.0f}s to stay under "
-            f"{tpm_limit} TPM ({provider_of(model)})",
-            flush=True,
-        )
-    logger.info(
-        "design: pacing %.0fs before %s (%d used + %d request vs %d TPM)",
-        wait_s,
-        provider_of(model),
-        used,
-        request_tokens,
-        tpm_limit,
+    _token_window.record(
+        provider, len(prompt) // _CHARS_PER_TOKEN, len(content) // _CHARS_PER_TOKEN
     )
-    _sleep(wait_s)
 
 
 # 4 chars/token is the classic conservative estimate for English + code.
@@ -1029,10 +1096,12 @@ def generate_design(
             prompt = cap_pass_prompt_chars(
                 _pass_prompt(pass_id, candidate, facts, done, grounding_text, focus)
             )
+            pass_max_tokens = resolve_pass_output_tokens(model, facts)
             _wait_for_tpm_budget(
                 model,
                 prompt,
                 facts,
+                output_tokens=pass_max_tokens,
                 progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
             )
             content = _design_llm_call(
@@ -1044,6 +1113,7 @@ def generate_design(
                 completion=completion,
                 facts=facts,
                 progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
+                max_tokens=pass_max_tokens,
             )
             done[pass_id] = content
             save_design_pass(design.id, pass_id, content)
@@ -1054,7 +1124,10 @@ def generate_design(
         # -- critic pass ------------------------------------------------------
         design_md = assemble_design_md(done, profile, candidate, facts=facts)
         critic_prompt = _critic_prompt(design_md, facts)
-        _wait_for_tpm_budget(model, critic_prompt, facts, progress_label="critic")
+        critic_max_tokens = resolve_pass_output_tokens(model, facts)
+        _wait_for_tpm_budget(
+            model, critic_prompt, facts, output_tokens=critic_max_tokens, progress_label="critic"
+        )
         critic_response = _design_llm_call(
             critic_prompt,
             system=CRITIC_SYSTEM_PROMPT,
@@ -1064,6 +1137,7 @@ def generate_design(
             completion=completion,
             facts=facts,
             progress_label="critic",
+            max_tokens=critic_max_tokens,
         )
         defects = _parse_defects(critic_response)
         # History of every defect the critic raised across rounds (even ones a

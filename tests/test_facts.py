@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from praxis.config import FactsSheet, load_facts, render_facts_sheet
+from praxis.config import FactsSheet, load_facts, render_facts_sheet, resolve_model_limits
 
 
 def test_load_facts_defaults_when_yaml_missing(tmp_path):
@@ -42,8 +42,13 @@ def test_load_facts_reads_full_profile():
     assert facts.usable_ram_gb == 4
     assert facts.monthly_budget_usd == 15.0
     assert facts.local_only is True
-    joined = " | ".join(facts.provider_limits)
-    assert "groq gpt-oss-20b" in joined and "8000 TPM" in joined
+    # Per-model limits carry the seeded free-tier observations.
+    by_model = {e.model: e for e in facts.model_limits}
+    assert by_model["groq/openai/gpt-oss-120b"].tpm == 8000
+    assert by_model["groq/openai/gpt-oss-20b"].tpm == 8000
+    qwen = by_model["groq/qwen/qwen3.8-27b"]
+    assert qwen.itpm == 7000 and qwen.otpm == 1000
+    assert all("Sep 2026" in e.note for e in facts.model_limits)
     notes = " | ".join(facts.stack_notes)
     assert "llama.cpp" in notes and "GGUF" in notes
     assert any("embedding model" in note for note in facts.stack_notes)
@@ -91,3 +96,66 @@ def test_render_facts_sheet_omits_empty_sections():
     assert "Provider free-tier limits" not in md
     assert "Stack notes" not in md
     assert "Avoid" not in md
+
+
+# ---------------------------------------------------------------------------
+# Per-model rate limits (tpm / itpm / otpm), each optional
+# ---------------------------------------------------------------------------
+
+
+def test_model_limits_default_empty_and_entry_fields_optional():
+    """No YAML entry -> no limits; a partial entry throttles only its axes."""
+    from praxis.config import ModelLimits
+
+    assert FactsSheet().model_limits == []
+
+    facts = FactsSheet(model_limits=[ModelLimits(model="m/one")])
+    limits = resolve_model_limits(facts, "m/one")
+    assert limits is not None
+    assert limits.tpm is None and limits.itpm is None and limits.otpm is None
+
+
+def test_resolve_model_limits_exact_and_suffix_match():
+    from praxis.config import ModelLimits
+
+    facts = FactsSheet(
+        model_limits=[
+            ModelLimits(model="groq/openai/gpt-oss-120b", tpm=8000),
+            ModelLimits(model="qwen/qwen3.8-27b", itpm=7000, otpm=1000),
+        ]
+    )
+    # Exact full-id match.
+    assert resolve_model_limits(facts, "groq/openai/gpt-oss-120b").tpm == 8000
+    # Suffix match: YAML entry without the provider prefix.
+    limits = resolve_model_limits(facts, "groq/qwen/qwen3.8-27b")
+    assert limits.itpm == 7000 and limits.otpm == 1000
+    # A model with no entry is not throttled.
+    assert resolve_model_limits(facts, "cerebras/qwen-3.8-27b") is None
+    assert resolve_model_limits(FactsSheet(), "groq/openai/gpt-oss-120b") is None
+
+
+def test_model_limits_yaml_missing_or_malformed_is_tolerated(tmp_path):
+    """A missing or malformed model_limits block degrades to no limits."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("model_limits:\n  - tpm: 8000\n  - not: a dict\nmodel_limits_str: oops\n", encoding="utf-8")
+    facts = load_facts(str(bad))
+    assert facts.model_limits == []
+
+    wrong_type = tmp_path / "wrong.yaml"
+    wrong_type.write_text("model_limits: 42\n", encoding="utf-8")
+    assert load_facts(str(wrong_type)).model_limits == []
+
+
+def test_render_facts_sheet_lists_per_model_limits():
+    from praxis.config import ModelLimits
+
+    facts = FactsSheet(
+        model_limits=[
+            ModelLimits(model="groq/openai/gpt-oss-120b", tpm=8000, note="observed on the free tier, Sep 2026, may change"),
+            ModelLimits(model="groq/qwen/qwen3.8-27b", itpm=7000, otpm=1000),
+        ]
+    )
+    md = render_facts_sheet(facts)
+    assert "groq/openai/gpt-oss-120b: 8000 TPM total" in md
+    assert "groq/qwen/qwen3.8-27b: 7000 ITPM input, 1000 OTPM output" in md
+    assert "Sep 2026" in md

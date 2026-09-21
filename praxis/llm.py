@@ -138,6 +138,7 @@ class LLMClient:
         *,
         stage: str | None = None,
         candidate_id: int | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         model = _resolve_model(model) or self._model
         kwargs: dict[str, Any] = {
@@ -190,7 +191,9 @@ class LLMClient:
         for attempt_model in attempt_chain:
             kwargs["model"] = attempt_model
             _inject_provider_key(kwargs, attempt_model)
-            first_tokens = _initial_max_tokens()
+            # An explicit caller max_tokens (e.g. the design engine clamping to
+            # the model's OTPM limit) wins over the global PRAXIS_MAX_TOKENS.
+            first_tokens = max_tokens if max_tokens is not None else _initial_max_tokens()
             if first_tokens is not None:
                 kwargs["max_tokens"] = first_tokens
             else:
@@ -319,15 +322,24 @@ def call_llm(
     stage: str | None = None,
     candidate_id: int | None = None,
     completion: Callable[..., Any] | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """Call an LLM, optionally injecting a completion function for tests.
 
     ``stage`` (e.g. ``\"analyst\"`` or ``\"architect\"``) and ``candidate_id`` are
     recorded alongside the call so spend can be attributed per stage and per
-    candidate.
+    candidate. ``max_tokens`` caps the output size for this call only (the
+    design engine uses it to respect a model's OTPM free-tier limit).
     """
     client = LLMClient(completion=completion) if completion else get_client()
-    return client.call(prompt, system=system, model=model, stage=stage, candidate_id=candidate_id)
+    return client.call(
+        prompt,
+        system=system,
+        model=model,
+        stage=stage,
+        candidate_id=candidate_id,
+        max_tokens=max_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
