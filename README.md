@@ -200,6 +200,70 @@ praxis memory        # recent human review decisions and their outcomes
 
 Each `review approve`/`reject` records a `build_memory` entry (technique, decision, outcome). The Analyst's next prompts include a `Build history` section listing those outcomes, and the system prompt instructs it to treat past failures as ground truth — a technique similar to one that previously failed to build is scored lower, so the system learns which techniques are actually buildable on the target hardware.
 
+## Design engine (multi-pass DESIGN.md)
+
+`praxis design <id>` turns an analyzed candidate into an implementable design
+document. The command works on any persisted candidate — accepted, borderline
+(`review approved`), blueprinted, or selected via `praxis discover --pick N`:
+
+```bash
+praxis design 42                          # full design, writes designs/042-<slug>/
+praxis design 42 --focus "skip the UI"    # steer scope with a focus note
+praxis design 42 --pass 4                 # re-run only the plan pass
+praxis design 42 --resume                 # continue a partial design
+```
+
+The design runs as five paced LLM passes (small, ~2-3k-token calls routed
+through the same provider pool and response cache as the rest of the
+pipeline). Each pass receives the facts sheet (from `hardware_profile.yaml`) as
+HARD CONSTRAINTS, the focus note, the relevant paper chunks, and a compact
+summary of the earlier passes; every pass output is persisted as it completes,
+so an interrupted run resumes at the failed pass:
+
+1. **Technique** — the paper's core method as precisely as the source text
+   allows: inputs, outputs, algorithm steps, formulas, thresholds, and the
+   evaluation setup, each with a section citation; "from the paper" is kept
+   strictly separate from "my inference".
+2. **Architecture** — components, responsibilities, data flow, interfaces, a
+   Mermaid diagram, and a decision record per key choice (options considered,
+   choice, why, what would make us revisit it).
+3. **Data Model & Contracts** — schemas, module/file tree, CLI/API surface,
+   and the core algorithm as pseudocode with concrete default parameters.
+4. **Phased Implementation Plan** — Phase 1 is the smallest end-to-end vertical
+   slice that proves the idea; tasks carry stable ids (`TASK-001...`), each
+   with an acceptance criterion and its test; an eval plan with metrics and
+   baselines closes the pass.
+5. **Hardware & Budget Fit** — a per-component RAM/CPU/$ table against the
+   facts sheet with totals vs headroom, alternatives "rejected because they
+   don't fit", a degradation plan, risks, and cuts.
+
+A skeptical critic pass reviews the assembled document and flags defects
+(budget-table drift, unsourced claims, uncovered components, hidden
+assumptions, scope realism); flagged sections are regenerated in bounded
+rounds. A deterministic anchor (hard constraints, checkable total rule,
+Windows pitfalls) is appended inside the hardware-fit section so the rubric
+keeps verifying the sums.
+
+Every pass prompt carries the facts sheet and the **UNVERIFIED rule**: never
+state prices, model sizes or library capabilities that are not in the facts
+sheet or the paper without labelling them `UNVERIFIED: check before relying`.
+Source material is fetched and sanitized by the grounding layer (arXiv HTML
+first, PDF text via pypdf as fallback; README + file tree for GitHub repos),
+chunked by heading, disk-cached per URL, and injected as untrusted data inside
+the same delimiters the Analyst uses — embedded injection attempts are
+neutralized before they reach any prompt.
+
+Output is saved to the DB and written to `designs/<NNN>-<slug>/`:
+
+- **`DESIGN.md`** — all sections assembled from the passes plus the critic
+  review appendix.
+- **`TASKS.md`** — a checkbox list with the plan pass's `TASK-001...` ids
+  (bare tasks are numbered automatically).
+- **`AGENT_PROMPT.md`** — a paste-ready Phase 1 prompt for any coding agent.
+
+The command prints the file paths plus a usage footer (`LLM usage: N calls, T
+tokens, $C`) aggregated from the ledger.
+
 Track LLM token spend against the budget:
 
 ```bash
@@ -248,6 +312,11 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CODER_PROVIDER_RETRIES` | max models tried for one coder attempt before the circuit breaker takes over | `3` |
 | `PRAXIS_CODER_OPENCODE_FLAGS` | extra flags after `opencode run`; stock opencode uses `--auto`, set empty for forks that reject it | `--auto` |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
+| `PRAXIS_DESIGN_MODEL` | litellm model id used by the design passes | `groq/openai/gpt-oss-120b` |
+| `PRAXIS_MAX_TOKENS` | first-attempt `max_tokens` for LLM calls (unset = provider default) | — |
+| `PRAXIS_MAX_TOKENS_RETRY` | `max_tokens` for the truncation-guard retry (default: 2x first, else 8192) | — |
+| `PRAXIS_GROUNDING_CACHE` | disable the source-grounding disk cache with `0`/`false` | `1` |
+| `PRAXIS_GROUNDING_CACHE_DIR` | directory for the grounding disk cache | `./.praxis-cache/grounding` |
 
 ## Provider failover (3 keys, 2 jobs, instant switch)
 
@@ -304,6 +373,7 @@ Praxis is a working v1. Two things are intentionally not in scope yet:
 Everything else in the pipeline is implemented:
 
 - Optional Coder stage (`PRAXIS_CODER=off|opencode`, `praxis run --prototype`) with `blueprinted` as a first-class terminal state
+- Multi-pass design engine (`praxis design`) with facts-sheet constraints, source grounding, truncation guard, per-pass resume (`--pass N`, `--resume`), critic review, and `DESIGN.md`/`TASKS.md`/`AGENT_PROMPT.md` output
 - Build-kit export (`praxis export <id>`) for building blueprints with any external coding agent
 - Golden-set evaluation (`praxis eval`) with adversarial prompt-injection fixtures
 - Prompt-injection hardening (untrusted-content delimiters in Analyst/Architect)
