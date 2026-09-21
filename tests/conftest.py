@@ -28,6 +28,10 @@ def _hermetic_model_env(monkeypatch):
     """
     monkeypatch.delenv("PRAXIS_MODEL", raising=False)
     monkeypatch.delenv("PRAXIS_FALLBACK_MODELS", raising=False)
+    # litellm's import side-effect also loads the project .env, which leaks
+    # hardware-profile overrides into facts-sheet/profile loading.
+    for var in ("PRAXIS_RAM_GB", "PRAXIS_CPU_ONLY", "PRAXIS_GPU", "PRAXIS_MONTHLY_BUDGET_USD"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture

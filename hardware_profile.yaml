@@ -1,13 +1,36 @@
-avoid:
-- Docker-heavy pipelines
-- local GPU-required models
-- Neo4j
-cpu: Intel i5
-gpu: null
+# Target machine, budget, and environment facts.
+#
+# Missing keys fall back to defaults in praxis/config.py::load_facts. Every
+# value here is rendered into design passes as a hard constraint, so keep it
+# accurate; label anything you have not verified.
 os: Windows 11
-preferred_stack:
-- Python
-- LangGraph
-- SQLite
-- Groq API
+cpu: Intel i5
+cpu_only: true
+gpu: null
 ram_gb: 8
+# RAM is shared with the OS: the app should plan for this much usable headroom.
+usable_ram_gb: 4
+monthly_budget_usd: 15.0
+# Runs locally; a VPS is out unless the design explicitly justifies one.
+local_only: true
+preferred_stack:
+  - Python
+  - LangGraph
+  - SQLite
+  - Groq API
+stack_notes:
+  - "Local generative models: llama.cpp with GGUF quantized weights (CPU), sized to the usable-RAM headroom"
+  - "Embeddings: use a small dedicated embedding model (e.g. a compact sentence-transformer), not the generative LLM"
+  - "Persistence: prefer SQLite unless the design proves it insufficient"
+  - "Avoid CUDA-only libraries entirely — the machine is CPU-only"
+  - "Docker / WSL2 only if the design explicitly justifies it; otherwise plain Python on Windows"
+avoid:
+  - Docker-heavy pipelines
+  - local GPU-required models
+  - Neo4j
+  - CUDA-only libraries
+  - VPS unless justified
+provider_limits:
+  - "groq gpt-oss-20b: 8000 TPM — observed on the free tier (Sep 2026), may change"
+  - "openrouter: UNVERIFIED: check before relying"
+  - "cerebras: UNVERIFIED: check before relying"
