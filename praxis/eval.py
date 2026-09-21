@@ -279,12 +279,11 @@ def run_rubric(md: str, profile: HardwareProfile) -> list[RubricCheck]:
 # --------------------------------------------------------------------------
 
 DESIGN_REQUIRED_SECTIONS = (
-    "Hardware & budget fit",
-    "Goals & Non-Goals",
+    "Technique",
     "Architecture",
     "Data Model & Contracts",
     "Phased Implementation Plan",
-    "Risks, Cuts & Deferrals",
+    "Hardware & Budget Fit",
 )
 
 _MERMAID_RE = re.compile(r"```mermaid\n(.*?)```", re.DOTALL)
@@ -307,7 +306,7 @@ def check_design_sections(md: str) -> tuple[bool, str]:
 
 def check_design_hardware_constraints(md: str, profile: HardwareProfile) -> tuple[bool, str]:
     """The hardware-fit section must reference the profile's actual limits."""
-    section = _section(md, "Hardware & budget fit")
+    section = _section(md, "Hardware & Budget Fit") or _section(md, "Hardware & budget fit")
     if not section:
         return False, "no Hardware & budget fit section"
     missing = []
@@ -324,7 +323,7 @@ def check_design_hardware_constraints(md: str, profile: HardwareProfile) -> tupl
 
 def check_budget_table_totals(md: str, profile: HardwareProfile) -> tuple[bool, str]:
     """Stated totals in the per-component table must respect RAM and budget."""
-    section = _section(md, "Hardware & budget fit")
+    section = _section(md, "Hardware & Budget Fit") or _section(md, "Hardware & budget fit")
     if "|" not in section:
         return False, "no per-component budget table"
     ram_ok = f"<= {profile.ram_gb}" in section or f"≤ {profile.ram_gb}" in section
@@ -380,7 +379,10 @@ def check_components_map_to_tasks(md: str) -> tuple[bool, str]:
     plan_lower = plan.lower()
     uncovered = []
     for line in arch.splitlines():
-        match = re.match(r"[-*]\s+`?([A-Za-z_][\w .]{2,40})`?\s*[—:\-]\s+", line.strip())
+        stripped = line.strip()
+        if stripped.lower().startswith(("- dr-", "* dr-")):
+            continue  # decision records are not components
+        match = re.match(r"[-*]\s+`?([A-Za-z_][\w .]{2,40})`?\s*[—:\-]\s+", stripped)
         if not match:
             continue
         component = match.group(1).strip().lower()
