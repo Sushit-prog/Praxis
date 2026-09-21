@@ -7,7 +7,12 @@ from pathlib import Path
 
 from praxis.config import HardwareProfile
 from praxis.db import BuildMemory, Candidate, Design, get_session
-from praxis.design import DesignResult, render_agent_prompt, render_tasks_md
+from praxis.design import (
+    PASS_IDS,
+    DesignResult,
+    render_agent_prompt,
+    render_tasks_md,
+)
 
 DESIGNS_DIR = Path("designs")
 
@@ -48,6 +53,60 @@ def write_design_files(
         render_agent_prompt(passes, profile, candidate), encoding="utf-8"
     )
     return out_dir
+
+
+def render_partial_md(
+    passes: dict[str, str],
+    candidate: Candidate,
+    *,
+    error: str | None = None,
+) -> str:
+    """Render DESIGN.partial.md: every completed pass + the missing ones.
+
+    Written when a design run fails or is incomplete so partial progress is
+    inspectable on disk (and resumable via ``praxis design <id> --resume``).
+    """
+    title = (getattr(candidate, "title", "") or "Design").strip()
+    completed = [p for p in PASS_IDS if (passes.get(p) or "").strip()]
+    missing = [p for p in PASS_IDS if p not in completed]
+    lines = [
+        f"# Design (partial): {title}",
+        "",
+        f"_Candidate #{getattr(candidate, 'id', '?')} · "
+        f"{getattr(candidate, 'url', '') or 'n/a'}_",
+        "",
+        f"**Incomplete design — {len(completed)} of {len(PASS_IDS)} passes done.**",
+    ]
+    if error:
+        lines += ["", f"Failure: {error}"]
+    if missing:
+        lines += ["", "Missing passes: " + ", ".join(missing)]
+        lines += ["", "Re-run `praxis design <id> --resume` to finish it."]
+    lines += [""]
+    for pass_id in PASS_IDS:
+        content = (passes.get(pass_id) or "").strip()
+        if not content:
+            continue
+        lines += [content, ""]
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_partial_design(
+    candidate: Candidate,
+    passes: dict[str, str],
+    *,
+    error: str | None = None,
+    root: Path | None = None,
+) -> Path:
+    """Write designs/<id>-<slug>/DESIGN.partial.md; return the file path."""
+    title = (getattr(candidate, "title", "") or f"candidate-{getattr(candidate, 'id', 0)}").strip()
+    out_dir = design_dir(
+        getattr(candidate, "id", 0), title, root
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "DESIGN.partial.md"
+    path.write_text(render_partial_md(passes, candidate, error=error), encoding="utf-8")
+    return path
 
 
 def record_pick(candidate_id: int, technique: str, focus: str | None) -> None:

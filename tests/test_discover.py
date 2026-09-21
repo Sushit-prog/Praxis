@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from praxis.cli import main
@@ -516,3 +518,112 @@ def test_cli_design_usage_footer_prints_totals(cli_discover_env, monkeypatch, ca
     assert code == 0
     assert "LLM usage:" in out
     assert "1 calls, 1,234 tokens, $0.0025" in out
+
+
+# ---------------------------------------------------------------------------
+# Item 6: DESIGN.partial.md on failure and `praxis design --show`
+# ---------------------------------------------------------------------------
+
+
+def test_cli_design_failure_writes_partial_file(cli_discover_env, monkeypatch, capsys):
+    """A failed design run writes DESIGN.partial.md listing missing passes."""
+    import praxis.design as design_module
+    from praxis.design import PASS_IDS
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+    calls = {"n": 0}
+
+    def failing_on_second_pass(prompt, system=None, model=None, **kwargs):
+        calls["n"] += 1
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                if title == "Architecture":
+                    raise RuntimeError("provider exploded")
+                return content
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", failing_on_second_pass)
+
+    code = main(["design", str(cid)])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "partial design written" in captured.err
+
+    # The partial file exists and lists the missing passes.
+    partials = list(Path("designs").glob(f"{cid:03d}-*/DESIGN.partial.md"))
+    assert len(partials) == 1
+    text = partials[0].read_text(encoding="utf-8")
+    assert "Incomplete design" in text
+    assert "Failure: provider exploded" in text
+    assert "Missing passes:" in text
+    for missing in ("architecture", "data_contracts", "plan", "hardware_fit"):
+        assert missing in text
+    # Completed passes are included in full.
+    assert GOOD_PASSES["technique"] in text
+    assert len(PASS_IDS) == 5
+
+
+def test_cli_design_show_prints_completed_passes(cli_discover_env, monkeypatch, capsys):
+    """--show prints the newest design's completed passes without generating."""
+    import json as json_module
+
+    from praxis.db import Design, get_session, save_design_pass
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+    session = get_session()
+    design = Design(candidate_id=cid, status="complete")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    for pass_id, content in GOOD_PASSES.items():
+        save_design_pass(design_id, pass_id, content)
+
+    # --show must not call the LLM at all.
+    def no_llm(prompt, system=None, model=None, **kwargs):
+        raise AssertionError("no LLM call expected for --show")
+
+    monkeypatch.setattr(json_module, "__name__", json_module.__name__)  # no-op keep json import
+    import praxis.design as design_module
+
+    monkeypatch.setattr(design_module, "call_llm", no_llm)
+
+    code = main(["design", str(cid), "--show"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"Design for candidate {cid} (status: complete)" in out
+    assert "## Technique" in out
+    assert "## Hardware & Budget Fit" in out
+
+
+def test_cli_design_show_works_for_in_progress_design(cli_discover_env, monkeypatch, capsys):
+    """--show on an in-progress design prints only the completed passes."""
+    from praxis.db import Design, get_session, save_design_pass
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+    session = get_session()
+    design = Design(candidate_id=cid, status="in_progress")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    save_design_pass(design_id, "technique", GOOD_PASSES["technique"])
+
+    code = main(["design", str(cid), "--show"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "in progress — showing completed passes only" in out
+    assert "## Technique" in out
+    assert "## Hardware & Budget Fit" not in out  # never generated
+
+
+def test_cli_design_show_without_design_errors(cli_discover_env, capsys):
+    """--show for a candidate with no design prints a clean error."""
+    cid = cli_discover_env
+    code = main(["design", str(cid), "--show"])
+    assert code == 1
+    assert "has no design" in capsys.readouterr().err

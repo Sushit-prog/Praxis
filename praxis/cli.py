@@ -175,6 +175,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the chunked critic review (saves one call per section).",
     )
+    design_parser.add_argument(
+        "--show",
+        action="store_true",
+        help=(
+            "Print the completed passes of this candidate's newest design "
+            "(works for in-progress designs too) instead of generating."
+        ),
+    )
 
     return parser
 
@@ -495,7 +503,7 @@ def _design_and_write(
 ) -> int:
     """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
     from praxis.design import generate_design
-    from praxis.design_io import write_design_files
+    from praxis.design_io import write_design_files, write_partial_design
 
     result = generate_design(
         candidate,
@@ -508,12 +516,28 @@ def _design_and_write(
     )
     if result.status != "complete" or not result.design_md:
         completed = ", ".join(result.completed_passes) or "none"
+        # Partial progress stays inspectable on disk and resumable.
+        from praxis.db import get_session
+        from praxis.design_io import load_passes as _load_passes
+
+        session = get_session()
+        try:
+            from praxis.db import Design
+
+            row = session.get(Design, result.design_id) if result.design_id else None
+            stored_passes = _load_passes(row) if row is not None else {}
+        finally:
+            session.close()
+        partial_path = write_partial_design(
+            candidate, stored_passes, error=result.error
+        )
         print(
             f"error: design failed for candidate {result.candidate_id}: "
             f"{result.error or 'incomplete passes'} (completed passes: {completed}; "
-            f"re-run the same command to resume)",
+            f"re-run the same command with --resume to continue)",
             file=sys.stderr,
         )
+        print(f"  partial design written: {partial_path}", file=sys.stderr)
         return 1
 
     from praxis.db import get_session
@@ -583,10 +607,45 @@ def _cmd_discover(args) -> int:
     return _design_and_write(row.candidate, profile, focus=focus)
 
 
+def _print_design_passes(candidate_id: int) -> int:
+    """Print the completed passes of a candidate's newest design (--show)."""
+    from praxis.db import latest_design
+    from praxis.design_io import load_passes as _load_passes
+
+    design = latest_design(candidate_id)
+    if design is None:
+        print(f"error: candidate {candidate_id} has no design", file=sys.stderr)
+        return 1
+    passes = _load_passes(design)
+    if not passes:
+        print(
+            f"error: design for candidate {candidate_id} has no completed passes "
+            f"(status: {design.status})",
+            file=sys.stderr,
+        )
+        return 1
+    status_note = (
+        "in progress — showing completed passes only" if design.status == "in_progress" else ""
+    )
+    header = f"Design for candidate {candidate_id} (status: {design.status})"
+    if status_note:
+        header += f" — {status_note}"
+    print(header)
+    for _pass_id, content in passes.items():
+        if not (content or "").strip():
+            continue
+        print()
+        print(content.rstrip())
+    return 0
+
+
 def _cmd_design(args) -> int:
     from praxis.config import load_config
     from praxis.design import PASS_IDS
     from praxis.discover import get_candidate
+
+    if getattr(args, "show", False):
+        return _print_design_passes(args.candidate_id)
 
     candidate = get_candidate(args.candidate_id)
     if candidate is None:
