@@ -535,3 +535,48 @@ def test_assembled_hardware_fit_keeps_anchor_after_pass_content(hardware_profile
     assert "### Windows-specific pitfalls" in fit  # anchor
     # The anchor lands before the next pass heading, inside the section.
     assert fit.index("Hard constraints") < fit.index("## Critic review")
+
+
+def test_system_prompt_is_staff_engineer_persona():
+    """All passes share the staff-engineer system prompt with its key rules."""
+    import praxis.design as design_module
+
+    prompt = design_module.SYSTEM_PROMPT
+    for phrase in (
+        "staff-level AI/ML systems engineer",
+        "without asking questions",
+        "decision record",
+        "Quantify everything you can",
+        "State assumptions and unknowns explicitly",
+        "Never invent results from the paper",
+        "smallest vertical slice",
+        "name what you would cut",
+        "failure modes",
+        "The target machine is a hard constraint",
+        "No filler, no marketing language",
+    ):
+        assert phrase in prompt, f"system prompt missing: {phrase!r}"
+
+
+def test_every_pass_uses_the_system_prompt(design_db, no_grounding, monkeypatch):
+    """The system prompt is sent on all 5 content passes and the critic gets its own."""
+    import praxis.design as design_module
+
+    systems = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        systems.append(system)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+
+    assert len(systems) == 6
+    assert all(s == design_module.SYSTEM_PROMPT for s in systems[:5])
+    assert systems[5] == design_module.CRITIC_SYSTEM_PROMPT
