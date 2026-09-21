@@ -87,8 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("providers", help="Show live provider pool health (cooldowns, signals).")
 
-    sub.add_parser(
+    doctor_parser = sub.add_parser(
         "doctor", help="Run pre-flight checks (env, provider keys, DB, coder)."
+    )
+    doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Also send a 1-token completion to every PRAXIS_DESIGN_MODEL chain "
+            "entry and report live failures (payment, auth, unavailable model)."
+        ),
     )
 
     review = sub.add_parser("review", help="Review borderline candidates (human-in-the-loop gate).")
@@ -388,7 +396,7 @@ def _cmd_doctor(args) -> int:
 
     print("Praxis doctor — pre-flight checks:")
     failed = False
-    for check in run_doctor_checks():
+    for check in run_doctor_checks(deep=getattr(args, "deep", False)):
         if check.skipped:
             print(f"  [ -- ] {check.name}: {check.detail}")
             continue

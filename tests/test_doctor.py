@@ -242,3 +242,123 @@ def test_doctor_chain_entry_without_key_is_skipped(tmp_path, monkeypatch, capsys
     assert rc == 0
     assert "design chain cerebras" in out
     assert "no CEREBRAS_API_KEY configured" in out
+
+
+# ---------------------------------------------------------------------------
+# --deep: live 1-token probes per design-chain entry
+# ---------------------------------------------------------------------------
+
+
+def _deep_isolation(monkeypatch, tmp_path):
+    """Isolate a deep doctor run: temp DB, fake key, no .env file."""
+    import importlib
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from praxis.db import Base
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'doctor.db'}")
+    Base.metadata.create_all(engine)
+
+    def fresh_session():
+        return Session(bind=engine, expire_on_commit=False)
+
+    for name in ("praxis.db", "praxis.providers", "praxis.llm", "praxis.design"):
+        module = importlib.import_module(name)
+        monkeypatch.setattr(module, "get_session", fresh_session)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
+    # .env (auto-loaded by litellm's import) leaks real keys; scrub them so
+    # key-presence reflects only what this test sets.
+    for leaked in (
+        "OPENROUTER_API_KEY",
+        "CEREBRAS_API_KEY",
+        "PRAXIS_OPENROUTER_API_KEY",
+        "PRAXIS_CEREBRAS_API_KEY",
+        "PRAXIS_GROQ_API_KEY",
+    ):
+        monkeypatch.delenv(leaked, raising=False)
+    # _check_env probes the filesystem: a missing .env fails that check, which
+    # is fine for these tests (we assert on the probe lines, not on .env).
+
+
+def test_doctor_deep_probes_reported_per_chain_entry(monkeypatch, tmp_path):
+    """--deep sends one probe per chain entry and reports failures with hints."""
+    import praxis.doctor as doctor_module
+
+    _deep_isolation(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b, cerebras/qwen-3.8-27b"
+    )
+    monkeypatch.setenv("CEREBRAS_API_KEY", "csk_test")
+
+    probed = []
+
+    def fake_completion(**kwargs):
+        probed.append(kwargs["model"])
+        if kwargs["model"].startswith("cerebras"):
+            exc = RuntimeError("402: payment required")
+            exc.status_code = 402
+            raise exc
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(doctor_module, "_completion_for_probe", lambda: fake_completion)
+
+    checks = doctor_module.run_doctor_checks(deep=True)
+    probe_checks = [c for c in checks if c.name.startswith("design chain probe")]
+    assert [c.name for c in probe_checks] == [
+        "design chain probe groq",
+        "design chain probe cerebras",
+    ]
+    assert probed == ["groq/openai/gpt-oss-120b", "cerebras/qwen-3.8-27b"]
+    groq_check = probe_checks[0]
+    assert groq_check.ok is True
+    cerebras_check = probe_checks[1]
+    assert cerebras_check.ok is False
+    assert "payment required" in cerebras_check.detail
+    assert cerebras_check.hint  # fix hint present
+
+
+def test_doctor_plain_mode_skips_probes(monkeypatch, tmp_path):
+    """Without --deep no probe line appears (behaviour unchanged)."""
+    import praxis.doctor as doctor_module
+
+    _deep_isolation(monkeypatch, tmp_path)
+    sent = {"n": 0}
+
+    def fake_completion(**kwargs):
+        sent["n"] += 1
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(doctor_module, "_completion_for_probe", lambda: fake_completion)
+    monkeypatch.setattr(
+        doctor_module,
+        "_fetch_model_ids",
+        lambda p, k: doctor_module.ModelsFetchResult(model_ids=["openai/gpt-oss-120b"]),
+    )
+
+    checks = doctor_module.run_doctor_checks(deep=False)
+    assert sent["n"] == 0
+    assert not [c for c in checks if c.name.startswith("design chain probe")]
+
+
+def test_doctor_deep_probe_skips_entry_without_key(monkeypatch, tmp_path):
+    """An entry whose provider has no key is skipped, not probed."""
+    import praxis.doctor as doctor_module
+
+    _deep_isolation(monkeypatch, tmp_path)
+    # A provider no key exists for (set or leaked from .env).
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "unknownprov/some-model")
+    monkeypatch.delenv("UNKNOWNPROV_API_KEY", raising=False)
+    monkeypatch.delenv("PRAXIS_UNKNOWNPROV_API_KEY", raising=False)
+
+    def fake_completion(**kwargs):
+        raise AssertionError("no probe should be sent without a key")
+
+    monkeypatch.setattr(doctor_module, "_completion_for_probe", lambda: fake_completion)
+
+    checks = doctor_module.run_doctor_checks(deep=True)
+    probe_checks = [c for c in checks if c.name.startswith("design chain probe")]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].skipped is True

@@ -7,6 +7,10 @@ endpoint, and that the configured ``PRAXIS_MODEL`` exists in that provider's
 list; the database path writable with a creatable schema; and the
 ``PRAXIS_CODER`` status. Every failure carries a one-line fix hint, and the
 CLI exits non-zero when any check fails.
+
+With ``--deep``, one extra check per PRAXIS_DESIGN_MODEL chain entry sends a
+1-token completion and reports real failures (payment required, model
+unavailable, auth) with a fix hint; plain `praxis doctor` is unchanged.
 """
 
 from __future__ import annotations
@@ -25,6 +29,11 @@ PROVIDER_MODELS_ENDPOINTS = {
     "cerebras": "https://api.cerebras.ai/v1/models",
 }
 MODELS_TIMEOUT_S = 10
+
+# --deep probe: the smallest possible chat completion per chain entry.
+DEEP_PROBE_TIMEOUT_S = 30
+DEEP_PROBE_MAX_TOKENS = 1
+DEEP_PROBE_PROMPT = "ping"
 
 
 @dataclass
@@ -284,7 +293,99 @@ def _check_design_chain(
     return results
 
 
-def run_doctor_checks() -> list[CheckResult]:
+# ---------------------------------------------------------------------------
+# --deep: live 1-token completion per design-chain entry
+# ---------------------------------------------------------------------------
+
+
+def _classify_deep_failure(status_code: int | None, message: str) -> tuple[str, str]:
+    """(short label, fix hint) for a failed deep probe."""
+    lowered = message.lower()
+    if status_code == 401 or status_code == 403 or "auth" in lowered or "api key" in lowered:
+        return "auth", "check the provider API key in .env"
+    if status_code == 402 or "quota" in lowered or "billing" in lowered or "payment" in lowered:
+        return (
+            "payment required",
+            "billing rejected the request — check the account's plan/balance",
+        )
+    if (
+        status_code == 404
+        or "does not exist" in lowered
+        or "not found" in lowered
+        or "decommissioned" in lowered
+    ):
+        return (
+            "model unavailable",
+            "fix or remove the entry in PRAXIS_DESIGN_MODEL (see the provider's model list)",
+        )
+    if status_code == 429 or "rate limit" in lowered:
+        return (
+            "rate limited",
+            "the probe was throttled; the entry works — retry the doctor later",
+        )
+    return "request failed", "check the provider's status page and the model id spelling"
+
+
+def _completion_for_probe():
+    """The completion callable used by deep probes (indirection for tests)."""
+    from litellm import completion as _completion
+
+    return _completion
+
+
+def _probe_chain_entry(entry: str) -> CheckResult:
+    """Send a 1-token completion to one chain entry; classify the outcome."""
+    from praxis.llm import _inject_provider_key
+
+    completion = _completion_for_probe()
+    provider, _, model_id = entry.partition("/")
+    kwargs: dict = {
+        "model": entry,
+        "messages": [{"role": "user", "content": DEEP_PROBE_PROMPT}],
+        "max_tokens": DEEP_PROBE_MAX_TOKENS,
+        "timeout": DEEP_PROBE_TIMEOUT_S,
+    }
+    _inject_provider_key(kwargs, entry)
+    try:
+        completion(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - any failure is the finding
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc)[:300]
+        kind, hint = _classify_deep_failure(status_code, message)
+        return CheckResult(
+            f"design chain probe {provider}",
+            False,
+            f"{entry}: {kind} ({message.splitlines()[0][:120]})",
+            hint=hint,
+        )
+    return CheckResult(
+        f"design chain probe {provider}",
+        True,
+        f"{entry}: 1-token completion succeeded",
+    )
+
+
+def _check_design_chain_deep() -> list[CheckResult]:
+    """Live-probe every PRAXIS_DESIGN_MODEL chain entry with a 1-token call."""
+    from praxis.design import resolve_design_model_chain
+
+    results: list[CheckResult] = []
+    for entry in resolve_design_model_chain(None):
+        provider, _, model_id = entry.partition("/")
+        if not _provider_key(provider):
+            results.append(
+                CheckResult(
+                    f"design chain probe {provider}",
+                    skipped=True,
+                    detail=f"{entry}: no {provider.upper()}_API_KEY configured; cannot probe",
+                )
+            )
+            continue
+        results.append(_probe_chain_entry(entry))
+    return results
+
+
+def run_doctor_checks(*, deep: bool = False) -> list[CheckResult]:
     """Run every pre-flight check and return the checklist results in order."""
     from praxis.llm import _resolve_model
 
@@ -325,6 +426,8 @@ def run_doctor_checks() -> list[CheckResult]:
         )
 
     results.extend(_check_design_chain(fetched_by_provider))
+    if deep:
+        results.extend(_check_design_chain_deep())
     results.append(_check_db())
     results.append(_check_coder())
     return results
