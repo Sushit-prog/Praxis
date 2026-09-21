@@ -7,40 +7,57 @@ Praxis runs a four-stage agent pipeline over a batch of research candidates, per
 ## Architecture
 
 ```
- arXiv / GitHub / HN
-           |
-           v
-   +-------------+          Scout: fetch + dedupe candidates for a topic.
-   |    Scout    |          (HTTP only; no LLM call here.)
-   +-------------+
-           |
-           | candidate
-           v
-   +-------------+          LLM API (litellm)     Analyst: extract the single
-   |   Analyst   | -----------------------------> implementable technique and
-   +-------------+                                score feasibility 0-10
-           |                                      against the hardware profile.
-           | accepted analysis
-           v
-   +-------------+          LLM API (litellm)     Architect: emit a hardware-
-   |  Architect  | -----------------------------> calibrated blueprint in
-   +-------------+                                markdown, with a phased
-           |                                      build plan.
-           | blueprint
-           v
-   +-------------+          external subprocess   Coder: scoped to the first
-   |    Coder    | -----------------------------> milestone only, runs
-   +-------------+                                `opencode run --auto <phase>`
-           |                                      in a fresh scratch directory.
-           | prototype path
-           v
-   +---------------------+
-   | SQLite              |
-   | candidates ·        |
-   | blueprints ·        |
-   | llm usage ·         |
-   | prototype paths     |
-   +---------------------+
+                  RESEARCH
+                     ↓
+        ┌────────────────────────┐
+        │ Discover candidate     │
+        │ papers / ideas         │
+        └───────────┬────────────┘
+                    ↓
+             SHORTLIST IDEAS
+                    ↓
+             USER CHOOSES ONE
+                    ↓
+        ┌────────────────────────┐
+        │ Understand the paper   │
+        │ - problem              │
+        │ - method               │
+        │ - assumptions          │
+        │ - experiments          │
+        └───────────┬────────────┘
+                    ↓
+             DEFINE PROJECT
+                    ↓
+        ┌────────────────────────┐
+        │ PRD / Scope            │
+        │ User / use case        │
+        │ What to reproduce      │
+        │ What to improve        │
+        │ What NOT to build      │
+        └───────────┬────────────┘
+                    ↓
+            FEASIBILITY CHECK
+       Hardware / budget / data
+                    ↓
+             TECHNICAL DESIGN
+                    ↓
+        ┌────────────────────────┐
+        │ Architecture           │
+        │ Components             │
+        │ Data flow              │
+        │ APIs / interfaces      │
+        │ Models                 │
+        │ DB / storage           │
+        │ Evaluation             │
+        │ Security               │
+        └───────────┬────────────┘
+                    ↓
+             IMPLEMENTATION PLAN
+                    ↓
+        TASKS + ACCEPTANCE CRITERIA
+                    ↓
+             OPTIONAL CODING
+              AGENT / HUMAN
 ```
 
 Every stage reads and writes the same SQLite ledger, so a run is fully auditable. Only the Analyst and Architect call the LLM directly; the Coder (an **optional** stage, off by default) delegates code generation to an OpenCode-compatible CLI as a separate subprocess rather than making an LLM call of its own. Every LLM call is also recorded to the `llm_usage` table (tokens, estimated cost, latency, stage, candidate), so spend is measurable against the `monthly_budget_usd` constraint.
