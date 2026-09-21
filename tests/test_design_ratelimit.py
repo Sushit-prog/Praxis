@@ -1,0 +1,362 @@
+"""Rate-limit handling: wait-and-retry, chain failover, TPM pacing, request cap.
+
+Standalone from test_design.py: defines its own pass fixtures and DB setup so
+the rate-limit behavior can be tested with patched sleeps and a tiny fake
+call_llm.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from praxis.config import HardwareProfile
+from praxis.design import (
+    RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_MAX_WAIT_S,
+    TPM_WINDOW_S,
+    UNTRUSTED_END,
+    UNTRUSTED_START,
+    _TokenWindow,
+    _wait_for_tpm_budget,
+    cap_pass_prompt_chars,
+    generate_design,
+    parse_retry_after,
+    resolve_design_model,
+    resolve_design_model_chain,
+)
+
+GOOD_PASSES = {
+    "technique": "## Technique\n\npaper says this [source 1].\n",
+    "architecture": "## Architecture\n\n- C1 — does things (inference).\n",
+    "data_contracts": "## Data Model & Contracts\n\n### Data model\n```text\nrow\n```\n",
+    "plan": (
+        "## Phased Implementation Plan\n\n"
+        "### Phase 1: Slice\n"
+        "- [ ] TASK-001 Do it (acceptance: works; test: test_it)\n"
+        "**Tests:** pytest.\n"
+    ),
+    "hardware_fit": "## Hardware & Budget Fit\n\n| C | 1 GB | 1 | $0 |\n",
+}
+
+
+class _Candidate:
+    def __init__(self, cid=1):
+        self.id = cid
+        self.source = "arxiv"
+        self.url = "https://arxiv.org/abs/2401.12345"
+        self.title = "CPU Fine-Tune"
+        self.raw_text = "Fine-tune a small transformer on CPU."
+        self.technique_summary = "LoRA fine-tuning on CPU"
+        self.feasibility_score = 8
+
+
+def _rate_limit_error(message="Error: 429 rate limit exceeded, try again in 12.4s"):
+    """A litellm RateLimitError-shaped exception (status_code=429)."""
+    exc = RuntimeError(message)
+    exc.status_code = 429
+    return exc
+
+
+def _fake_answerer(state):
+    """A call_llm fake returning canned pass content, or raising on demand."""
+
+    def fake(prompt, system=None, model=None, **kwargs):
+        state["prompts"].append(prompt)
+        state["models"].append(model)
+        if state.get("raise") is not None:
+            exc = state["raise"]
+            state["raise"] = None
+            raise exc
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    return fake
+
+
+@pytest.fixture
+def design_setup(tmp_path, monkeypatch):
+    """Temp DB + offline grounding + patched sleeps; yields (cid, profile, waits)."""
+    import importlib
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    import praxis.design as design_module
+    import praxis.grounding as grounding_module
+    from praxis.db import Base, Candidate
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'rl.db'}")
+    Base.metadata.create_all(engine)
+    session = Session(bind=engine)
+    candidate = Candidate(
+        source="arxiv",
+        url="https://arxiv.org/abs/2401.12345",
+        title="CPU Fine-Tune",
+        raw_text="Fine-tune a small transformer on CPU.",
+        status="analyzed",
+    )
+    session.add(candidate)
+    session.commit()
+    candidate_id = candidate.id
+    session.close()
+
+    def fresh_session():
+        return Session(bind=engine, expire_on_commit=False)
+
+    for name in ("praxis.db", "praxis.design", "praxis.discover", "praxis.design_io"):
+        module = importlib.import_module(name)
+        monkeypatch.setattr(module, "get_session", fresh_session)
+
+    def fake_ground(candidate):
+        return grounding_module.Grounding(chunks=[], provenance=[], source_kind="none")
+
+    monkeypatch.setattr(grounding_module, "ground_candidate", fake_ground)
+    monkeypatch.setattr(design_module, "ground_candidate", fake_ground)
+
+    waits: list[float] = []
+    monkeypatch.setattr(design_module, "_sleep", lambda s: waits.append(s))
+    return candidate_id, HardwareProfile(), waits
+
+
+# ---------------------------------------------------------------------------
+# retry-after hint parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_retry_after_groq_hint():
+    assert parse_retry_after("Rate limit reached. Please try again in 12.4s") == 12.4
+    assert parse_retry_after("Retry-After: 30") == 30.0
+    assert parse_retry_after("rate limit exceeded (retry after 5 seconds)") == 5.0
+    assert parse_retry_after("no hint here") is None
+    assert parse_retry_after("") is None
+
+
+# ---------------------------------------------------------------------------
+# wait-and-retry on a rate-limited pass
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limited_pass_waits_and_retries_same_call(design_setup, monkeypatch, capsys):
+    """A Groq TPM rejection sleeps the provider's hint, then retries the pass."""
+    import praxis.design as design_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
+
+    state = {"prompts": [], "models": [], "raise": None}
+    fake = _fake_answerer(state)
+    monkeypatch.setattr(design_module, "call_llm", fake)
+    # First call (pass 1) is rate-limited with Groq's hint.
+    state["raise"] = _rate_limit_error("Rate limit reached. Please try again in 12.4s")
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "complete"
+    assert waits == [12.4 + design_module.RATE_LIMIT_WAIT_MARGIN_S]
+    out = capsys.readouterr().out
+    assert "waiting 14s for rate limit (groq)" in out
+    assert "pass 1/5" in out
+
+
+def test_rate_limit_waits_are_bounded(design_setup, monkeypatch):
+    """A huge retry hint is capped at RATE_LIMIT_MAX_WAIT_S."""
+    import praxis.design as design_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
+
+    state = {"prompts": [], "models": [], "raise": None}
+    monkeypatch.setattr(design_module, "call_llm", _fake_answerer(state))
+    state["raise"] = _rate_limit_error("try again in 3600s")
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "complete"
+    assert waits == [RATE_LIMIT_MAX_WAIT_S]
+
+
+def test_rate_limit_fails_after_bounded_retries(design_setup, monkeypatch):
+    """Persistent rate limiting exhausts retries, then the run fails resumably."""
+    import praxis.design as design_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
+
+    attempts = {"n": 0}
+
+    def always_rate_limited(prompt, system=None, model=None, **kwargs):
+        attempts["n"] += 1
+        raise _rate_limit_error("try again in 5s")
+
+    monkeypatch.setattr(design_module, "call_llm", always_rate_limited)
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "failed"
+    assert "try again" in (result.error or "")
+    # Pass 1 made 1 + RATE_LIMIT_MAX_RETRIES attempts; a wait preceded each retry.
+    assert attempts["n"] == 1 + RATE_LIMIT_MAX_RETRIES
+    assert len(waits) == RATE_LIMIT_MAX_RETRIES
+
+
+def test_chain_failover_moves_to_next_provider(design_setup, monkeypatch):
+    """A rate-limited primary fails over to the second chain entry."""
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL",
+        "groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b, openrouter/openai/gpt-oss-120b",
+    )
+
+    attempts = {"groq": 0}
+    models_succeeded = []
+
+    def flaky(prompt, system=None, model=None, **kwargs):
+        if model.startswith("groq"):
+            attempts["groq"] += 1
+            raise _rate_limit_error("try again in 10s")
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                models_succeeded.append(model)
+                return content
+        if "Review it against the defect classes" in prompt:
+            models_succeeded.append(model)  # critic call also succeeded
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    import praxis.design as design_module
+
+    monkeypatch.setattr(design_module, "call_llm", flaky)
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "complete"
+    # Each of the 6 calls (5 passes + critic) retries groq to exhaustion
+    # (1 + RATE_LIMIT_MAX_RETRIES attempts) before failing over to cerebras.
+    assert attempts["groq"] == 6 * (1 + RATE_LIMIT_MAX_RETRIES)
+    assert len(waits) == 6 * RATE_LIMIT_MAX_RETRIES
+    assert len(models_succeeded) == 6
+    assert all(m.startswith("cerebras") for m in models_succeeded)
+
+
+# ---------------------------------------------------------------------------
+# PRAXIS_DESIGN_MODEL chain parsing
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_design_model_chain_parsing(monkeypatch):
+    """The chain env var splits on commas; explicit model replaces the chain."""
+    monkeypatch.delenv("PRAXIS_DESIGN_MODEL", raising=False)
+    assert resolve_design_model_chain(None) == ["groq/openai/gpt-oss-120b"]
+
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL",
+        " groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b , openrouter/openai/gpt-oss-120b ",
+    )
+    chain = resolve_design_model_chain(None)
+    assert chain == [
+        "groq/openai/gpt-oss-120b",
+        "cerebras/gpt-oss-120b",
+        "openrouter/openai/gpt-oss-120b",
+    ]
+    assert resolve_design_model(None) == "groq/openai/gpt-oss-120b"
+    assert resolve_design_model_chain("explicit/model") == ["explicit/model"]
+
+
+# ---------------------------------------------------------------------------
+# proactive TPM pacing
+# ---------------------------------------------------------------------------
+
+
+def test_tpm_pacing_waits_when_window_is_full(monkeypatch):
+    """When used + request exceeds the TPM limit, the call waits."""
+    from praxis.config import FactsSheet
+
+    facts = FactsSheet(provider_limits=["groq gpt-oss-20b: 8000 TPM"])
+    window = _TokenWindow()
+    monkeypatch.setattr("praxis.design._token_window", window)
+    waits: list[float] = []
+    monkeypatch.setattr("praxis.design._sleep", lambda s: waits.append(s))
+
+    # 7000 tokens used in the window; a ~2.5k-token request would not fit.
+    window.record("groq", 7000)
+    _wait_for_tpm_budget("groq/openai/gpt-oss-120b", "x" * 1000, facts, output_tokens=1500)
+    assert waits, "expected a pacing wait when the TPM window is full"
+    assert waits[0] > 0
+
+
+def test_tpm_pacing_skips_when_window_has_room(monkeypatch):
+    """Under the limit: no wait, no sleep."""
+    from praxis.config import FactsSheet
+
+    facts = FactsSheet(provider_limits=["groq gpt-oss-20b: 8000 TPM"])
+    window = _TokenWindow()
+    monkeypatch.setattr("praxis.design._token_window", window)
+    waits: list[float] = []
+    monkeypatch.setattr("praxis.design._sleep", lambda s: waits.append(s))
+
+    window.record("groq", 1000)
+    _wait_for_tpm_budget("groq/openai/gpt-oss-120b", "x" * 400, facts, output_tokens=500)
+    assert waits == []
+
+
+def test_tpm_pacing_ignores_unknown_provider(monkeypatch):
+    """No TPM line for the provider in the facts sheet -> never waits."""
+    from praxis.config import FactsSheet
+
+    monkeypatch.setattr("praxis.design._token_window", _TokenWindow())
+    waits: list[float] = []
+    monkeypatch.setattr("praxis.design._sleep", lambda s: waits.append(s))
+
+    _wait_for_tpm_budget("someprovider/m", "x" * 999999, FactsSheet(), output_tokens=100000)
+    assert waits == []
+
+
+def test_tpm_window_drops_stale_events():
+    """Entries older than the 60s window no longer count against the limit."""
+    window = _TokenWindow()
+    window.record("groq", 5000, now=0.0)
+    assert window.used("groq", now=TPM_WINDOW_S - 1) == 5000
+    assert window.used("groq", now=TPM_WINDOW_S + 5) == 0
+
+
+# ---------------------------------------------------------------------------
+# per-pass request-size cap
+# ---------------------------------------------------------------------------
+
+
+def test_cap_pass_prompt_trims_only_grounding_body():
+    """The cap cuts inside the untrusted block; constraints and tail survive."""
+    prompt = (
+        "Design the technique below.\n\n"
+        "HARD CONSTRAINTS (treat as absolute):\n<constraints>\n\n"
+        f"{UNTRUSTED_START}\nSOURCE MATERIAL:\n{'paper ' * 20000}\n{UNTRUSTED_END}\n\n"
+        "YOUR TASK:\nRespond with the markdown content of the 'Technique' "
+        "section only (start with its '## Technique' heading)."
+    )
+    capped = cap_pass_prompt_chars(prompt, output_tokens=1000, token_cap=3500)
+
+    assert len(capped) < len(prompt)
+    assert "<constraints>" in capped  # constraints untouched
+    assert "start with its '## Technique' heading" in capped  # tail untouched
+    assert "[source material trimmed to fit the token budget]" in capped
+    assert capped.count(UNTRUSTED_START) == 1 and capped.count(UNTRUSTED_END) == 1
+    assert capped.index(UNTRUSTED_START) < capped.index(UNTRUSTED_END)  # framing intact
+
+
+def test_cap_pass_prompt_keeps_small_prompts_intact():
+    """Under the cap: identical prompt object."""
+    assert cap_pass_prompt_chars("small prompt") == "small prompt"
+
+
+def test_cap_pass_prompt_without_grounding_block_returns_unchanged():
+    """No untrusted delimiters to trim: unchanged."""
+    prompt = f"constraints + task only, {'x' * 40000}"
+    assert cap_pass_prompt_chars(prompt) == prompt

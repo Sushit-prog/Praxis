@@ -14,6 +14,7 @@ DOTENV_KEYS = (
     "PRAXIS_OPENROUTER_API_KEY",
     "PRAXIS_CEREBRAS_API_KEY",
     "PRAXIS_MODEL",
+    "PRAXIS_DESIGN_MODEL",
     "PRAXIS_CODER",
     "PRAXIS_DB_URL",
     "PRAXIS_DB_PATH",
@@ -21,7 +22,11 @@ DOTENV_KEYS = (
 
 MODELS_BODIES = {
     "https://api.groq.com/openai/v1/models": {
-        "data": [{"id": "openai/gpt-oss-20b"}, {"id": "llama-3.3-70b-versatile"}]
+        "data": [
+            {"id": "openai/gpt-oss-20b"},
+            {"id": "openai/gpt-oss-120b"},
+            {"id": "llama-3.3-70b-versatile"},
+        ]
     },
     "https://openrouter.ai/api/v1/models": {"data": [{"id": "openai/gpt-oss-20b"}]},
     "https://api.cerebras.ai/v1/models": {"data": [{"id": "llama3.1-8b"}]},
@@ -182,3 +187,58 @@ def test_doctor_reports_coder_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PRAXIS_CODER", "off")
     main(["doctor"])
     assert "PRAXIS_CODER: off (default)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# PRAXIS_DESIGN_MODEL chain verification
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_doctor_warns_when_chain_entry_missing(tmp_path, monkeypatch, capsys):
+    """A design-chain entry the provider does not serve fails with a fix hint."""
+    _isolate(monkeypatch, tmp_path, env_file="GROQ_API_KEY=gsk_k\n")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_k")
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/nonexistent-model")
+    _mock_models_endpoints()
+
+    rc = main(["doctor"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL] design chain groq: groq/nonexistent-model does not exist at groq" in out
+    assert "fix: fix or remove the entry in PRAXIS_DESIGN_MODEL" in out
+
+
+@responses.activate
+def test_doctor_chain_entry_available(tmp_path, monkeypatch, capsys):
+    """Every chain entry present at its provider keeps doctor green."""
+    _isolate(monkeypatch, tmp_path, env_file="GROQ_API_KEY=gsk_k\n")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_k")
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-20b, groq/openai/gpt-oss-120b"
+    )
+    _mock_models_endpoints()
+
+    rc = main(["doctor"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "design chain groq: groq/openai/gpt-oss-20b is available" in out
+    assert "design chain groq: groq/openai/gpt-oss-120b is available" in out
+
+
+@responses.activate
+def test_doctor_chain_entry_without_key_is_skipped(tmp_path, monkeypatch, capsys):
+    """A chain entry at a provider with no key is skipped, not a failure."""
+    _isolate(monkeypatch, tmp_path, env_file="GROQ_API_KEY=gsk_k\n")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_k")
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "cerebras/llama3.1-8b")
+    _mock_models_endpoints()
+
+    rc = main(["doctor"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "design chain cerebras" in out
+    assert "no CEREBRAS_API_KEY configured" in out

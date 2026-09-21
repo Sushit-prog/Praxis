@@ -104,7 +104,9 @@ def _check_env() -> CheckResult:
     )
 
 
-def _check_provider(provider: str, model_id: str | None) -> list[CheckResult]:
+def _check_provider(
+    provider: str, model_id: str | None, fetched: ModelsFetchResult
+) -> list[CheckResult]:
     key = _provider_key(provider)
     if not key:
         return [
@@ -124,7 +126,7 @@ def _check_provider(provider: str, model_id: str | None) -> list[CheckResult]:
         )
     ]
 
-    result = _fetch_model_ids(provider, key)
+    result = fetched
     if result.error_kind is not None:
         hints = {
             "network": "could not reach the provider: check network/VPN/proxy",
@@ -225,6 +227,63 @@ def _check_coder() -> CheckResult:
     )
 
 
+def _check_design_chain(
+    fetched_by_provider: dict[str, ModelsFetchResult],
+) -> list[CheckResult]:
+    """Verify each PRAXIS_DESIGN_MODEL chain entry exists at its provider.
+
+    The chain (comma-separated provider/model ids) fails over on rate limits,
+    so a typo'd entry silently weakens the design run; each entry gets its own
+    warning line. Providers without a configured key are skipped (the
+    per-provider checks above already report that). Model ids are shared with
+    the per-provider checks (one fetch per provider).
+    """
+    from praxis.design import resolve_design_model_chain
+
+    results: list[CheckResult] = []
+    for entry in resolve_design_model_chain(None):
+        provider, _, model_id = entry.partition("/")
+        key = _provider_key(provider)
+        if not key:
+            results.append(
+                CheckResult(
+                    f"design chain {provider}",
+                    skipped=True,
+                    detail=f"{entry}: no {provider.upper()}_API_KEY configured; cannot verify",
+                )
+            )
+            continue
+        fetched = fetched_by_provider.get(provider)
+        if fetched is None or fetched.error_kind is not None or not fetched.model_ids:
+            results.append(
+                CheckResult(
+                    f"design chain {provider}",
+                    skipped=True,
+                    detail=f"{entry}: models endpoint unavailable; cannot verify",
+                )
+            )
+            continue
+        if model_id in fetched.model_ids:
+            results.append(
+                CheckResult(
+                    f"design chain {provider}",
+                    True,
+                    f"{entry} is available",
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    f"design chain {provider}",
+                    False,
+                    f"{entry} does not exist at {provider}",
+                    hint="fix or remove the entry in PRAXIS_DESIGN_MODEL — a bad chain "
+                    "entry silently weakens rate-limit failover",
+                )
+            )
+    return results
+
+
 def run_doctor_checks() -> list[CheckResult]:
     """Run every pre-flight check and return the checklist results in order."""
     from praxis.llm import _resolve_model
@@ -248,10 +307,24 @@ def run_doctor_checks() -> list[CheckResult]:
     else:
         results.append(CheckResult("provider keys", True, "at least one key configured"))
 
+    # One models-endpoint fetch per provider, shared by the per-provider and
+    # design-chain checks.
+    fetched_by_provider: dict[str, ModelsFetchResult] = {}
     for provider in PROVIDER_ORDER:
+        key = _provider_key(provider)
+        if key:
+            fetched_by_provider[provider] = _fetch_model_ids(provider, key)
         membership_id = model_id if (provider == model_provider and model_id) else None
-        results.extend(_check_provider(provider, membership_id))
+        results.extend(
+            _check_provider(
+                provider,
+                membership_id,
+                fetched_by_provider.get(provider)
+                or ModelsFetchResult(error_kind="skip", error_detail="no key"),
+            )
+        )
 
+    results.extend(_check_design_chain(fetched_by_provider))
     results.append(_check_db())
     results.append(_check_coder())
     return results

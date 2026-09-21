@@ -215,7 +215,19 @@ praxis design 42 --resume                 # continue a partial design
 
 The design runs as five paced LLM passes (small, ~2-3k-token calls routed
 through the same provider pool and response cache as the rest of the
-pipeline). Each pass receives the facts sheet (from `hardware_profile.yaml`) as
+pipeline). Rate limits are handled gracefully: when a provider rejects a pass
+with a TPM/429 error, the engine parses the provider's `try again in Ns` hint,
+waits that long (bounded, ~90s max) with a progress line (`pass 2/5: waiting
+13s for rate limit`), and retries the same pass before failing over.
+Proactively, tokens used in the last 60s per provider are tracked against the
+facts sheet's TPM limits, so a pass that would not fit waits before sending.
+`PRAXIS_DESIGN_MODEL` accepts a **comma-separated chain** of provider/model ids
+(`groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b, openrouter/openai/gpt-oss-120b`):
+a provider that keeps rate-limiting the run fails over to the next entry
+instead of ending it, and `praxis doctor` verifies every chain entry exists at
+its provider. Per-pass request size is capped (paper context + max_tokens
+stays under ~3.5k tokens; the paper context is trimmed to fit, hard
+constraints and task instruction are never cut). Each pass receives the facts sheet (from `hardware_profile.yaml`) as
 HARD CONSTRAINTS, the focus note, the relevant paper chunks, and a compact
 summary of the earlier passes; every pass output is persisted as it completes,
 so an interrupted run resumes at the failed pass:
@@ -312,7 +324,7 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CODER_PROVIDER_RETRIES` | max models tried for one coder attempt before the circuit breaker takes over | `3` |
 | `PRAXIS_CODER_OPENCODE_FLAGS` | extra flags after `opencode run`; stock opencode uses `--auto`, set empty for forks that reject it | `--auto` |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
-| `PRAXIS_DESIGN_MODEL` | litellm model id used by the design passes | `groq/openai/gpt-oss-120b` |
+| `PRAXIS_DESIGN_MODEL` | litellm model id(s) for the design passes; comma-separated chain fails over on rate limits | `groq/openai/gpt-oss-120b` |
 | `PRAXIS_MAX_TOKENS` | first-attempt `max_tokens` for LLM calls (unset = provider default) | — |
 | `PRAXIS_MAX_TOKENS_RETRY` | `max_tokens` for the truncation-guard retry (default: 2x first, else 8192) | — |
 | `PRAXIS_GROUNDING_CACHE` | disable the source-grounding disk cache with `0`/`false` | `1` |

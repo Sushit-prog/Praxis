@@ -51,14 +51,291 @@ from praxis.db import (
 )
 from praxis.grounding import ground_candidate
 from praxis.llm import call_llm
+from praxis.providers import classify_exhaustion, provider_of
 
 logger = logging.getLogger(__name__)
 
 DESIGN_MODEL_ENV = "PRAXIS_DESIGN_MODEL"
 DEFAULT_DESIGN_MODEL = "groq/openai/gpt-oss-120b"
 
+# Indirection so tests can neutralize pacing sleeps (patch praxis.design._sleep).
+_sleep = time.sleep
+
 # Pacing between passes: keeps 5+1 calls away from per-minute rate limits.
 PASS_PACING_S = 2.0
+
+# --------------------------------------------------------------------------
+# Rate-limit handling: bounded wait-and-retry + proactive TPM pacing
+# --------------------------------------------------------------------------
+
+# On a rate-limit rejection, wait out the provider's "try again in Ns" hint
+# (bounded) and retry the same call before giving up or failing over.
+RATE_LIMIT_MAX_RETRIES = 2
+RATE_LIMIT_MAX_WAIT_S = 90.0
+RATE_LIMIT_WAIT_MARGIN_S = 2.0
+RATE_LIMIT_DEFAULT_WAIT_S = 60.0
+
+# Proactive pacing: never let input + max_tokens exceed the provider's TPM
+# limit inside a 60s window. Tokens are tracked in-memory (this process only;
+# cross-process accounting would need the ledger and overcounts restarts).
+TPM_WINDOW_S = 60.0
+DEFAULT_PASS_OUTPUT_TOKENS = 2500
+
+_RETRY_HINT_RE = re.compile(
+    r"try again in ([0-9.]+)s|(?:retry-after|retry after)[: ]*([0-9.]+)", re.IGNORECASE
+)
+
+
+def parse_retry_after(message: str) -> float | None:
+    """Extract a wait hint (seconds) from a rate-limit error message.
+
+    Understands Groq-style "Please try again in 12.4s" and generic
+    "Retry-After: N" wording; returns None when no hint is present so the
+    caller falls back to the configured cooldown.
+    """
+    match = _RETRY_HINT_RE.search(message or "")
+    if match is None:
+        return None
+    raw = match.group(1) or match.group(2)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
+
+
+class _TokenWindow:
+    """Sliding-window token usage per provider for proactive TPM pacing."""
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[tuple[float, int]]] = {}
+
+    def record(self, provider: str, tokens: int, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._events.setdefault(provider, []).append((now, tokens))
+
+    def used(self, provider: str, *, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        events = self._events.get(provider, [])
+        fresh = [(ts, n) for ts, n in events if now - ts < TPM_WINDOW_S]
+        self._events[provider] = fresh
+        return sum(n for _, n in fresh)
+
+
+_token_window = _TokenWindow()
+
+
+def _resolve_tpm_limit(provider: str, facts: FactsSheet | None) -> int:
+    """The provider's TPM limit from the facts sheet, or 0 when unknown.
+
+    Looks for "N TPM" in the facts sheet's provider_limits lines (e.g. "groq
+    gpt-oss-20b: 8000 TPM"); the first matching line for this provider wins.
+    """
+    if facts is None:
+        return 0
+    for line in facts.provider_limits:
+        lowered = line.lower()
+        if provider not in lowered:
+            continue
+        match = re.search(r"(\d+)\s*tpm", lowered)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def _seconds_to_wait_for_tpm(
+    used_tokens: int, request_tokens: int, tpm_limit: int, *, now: float | None = None
+) -> float:
+    """Seconds until the sliding window frees enough budget for this request."""
+    if tpm_limit <= 0:
+        return 0.0
+    if used_tokens + request_tokens <= tpm_limit:
+        return 0.0
+    overage = used_tokens + request_tokens - tpm_limit
+    # Conservative drain rate; without per-event timestamps for tokens we
+    # assume the oldest tokens free capacity at a steady rate.
+    return (overage / tpm_limit) * TPM_WINDOW_S
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True when the exception is a provider rate-limit rejection."""
+    return classify_exhaustion(exc) == "rate_limit"
+
+
+def _design_llm_call(
+    prompt: str,
+    *,
+    system: str,
+    model: str,
+    stage: str,
+    candidate_id: int | None,
+    completion=None,
+    facts: FactsSheet | None = None,
+    progress_label: str = "",
+) -> str:
+    """One design LLM call with rate-limit wait-and-retry and TPM accounting.
+
+    ``model`` is the primary of the design chain; the full chain is resolved
+    from ``PRAXIS_DESIGN_MODEL`` (or the default) for failover. On a rate-limit
+    rejection, parses the provider's "try again in Ns" hint (falling back to
+    the default wait), sleeps that long plus a small margin (bounded), prints
+    a progress line, and retries the same call — up to
+    ``RATE_LIMIT_MAX_RETRIES`` times before failing over to the next chain
+    entry. Successful calls record their usage in the sliding-window TPM
+    tracker so subsequent calls are paced proactively.
+
+    The LLM call itself goes through the module-level ``call_llm`` name so
+    tests can keep injecting fakes at ``praxis.design.call_llm``.
+    """
+    chain = resolve_design_model_chain(None)
+    if model != chain[0]:
+        chain = [model]
+    for chain_index, chain_model in enumerate(chain):
+        provider = provider_of(chain_model)
+        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            started = time.monotonic()
+            try:
+                content = call_llm(
+                    prompt,
+                    system=system,
+                    model=chain_model,
+                    stage=stage,
+                    candidate_id=candidate_id,
+                    completion=completion,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if not _is_rate_limit_error(exc) or attempt >= RATE_LIMIT_MAX_RETRIES:
+                    if chain_index + 1 < len(chain):
+                        logger.warning(
+                            "design: %s exhausted (%s); failing over to %s",
+                            provider,
+                            str(exc)[:160],
+                            provider_of(chain[chain_index + 1]),
+                        )
+                        break  # next chain entry
+                    raise
+                hint = parse_retry_after(str(exc))
+                wait_s = hint if hint is not None else RATE_LIMIT_DEFAULT_WAIT_S
+                wait_s = min(wait_s + RATE_LIMIT_WAIT_MARGIN_S, RATE_LIMIT_MAX_WAIT_S)
+                if progress_label:
+                    print(
+                        f"  {progress_label}: waiting {wait_s:.0f}s for rate limit "
+                        f"({provider})",
+                        flush=True,
+                    )
+                logger.warning(
+                    "design: %s rate-limited (%s); waiting %.0fs before retry %d/%d",
+                    provider,
+                    str(exc)[:160],
+                    wait_s,
+                    attempt + 1,
+                    RATE_LIMIT_MAX_RETRIES,
+                )
+                _sleep(wait_s)
+                continue
+            elapsed = time.monotonic() - started
+            _record_usage_estimate(prompt, content, provider, elapsed)
+            return content
+    raise last_exc  # every chain entry exhausted its retries
+
+
+def _record_usage_estimate(prompt: str, content: str, provider: str, elapsed: float) -> None:
+    """Record an estimated token usage of a completed call in the TPM window.
+
+    Uses the 4-chars/token heuristic on prompt + completion; where the real
+    ledger rows exist (litellm reported usage) they are authoritative — this
+    estimate only feeds the in-process pacing window.
+    """
+    estimate = (len(prompt) + len(content)) // _CHARS_PER_TOKEN
+    _token_window.record(provider, estimate)
+
+
+def _wait_for_tpm_budget(
+    model: str,
+    prompt: str,
+    facts: FactsSheet | None,
+    *,
+    output_tokens: int = DEFAULT_PASS_OUTPUT_TOKENS,
+    progress_label: str = "",
+) -> None:
+    """Sleep proactively when input + max_tokens would exceed the TPM limit.
+
+    Tracks tokens used in the last 60s per provider (in-memory sliding
+    window); when the upcoming request would not fit, waits until it does.
+    """
+    tpm_limit = _resolve_tpm_limit(provider_of(model), facts)
+    if tpm_limit <= 0:
+        return
+    request_tokens = len(prompt) // _CHARS_PER_TOKEN + output_tokens
+    used = _token_window.used(provider_of(model))
+    wait_s = _seconds_to_wait_for_tpm(used, request_tokens, tpm_limit)
+    if wait_s <= 0:
+        return
+    wait_s = min(wait_s + 0.5, RATE_LIMIT_MAX_WAIT_S)
+    if progress_label:
+        print(
+            f"  {progress_label}: pacing {wait_s:.0f}s to stay under "
+            f"{tpm_limit} TPM ({provider_of(model)})",
+            flush=True,
+        )
+    logger.info(
+        "design: pacing %.0fs before %s (%d used + %d request vs %d TPM)",
+        wait_s,
+        provider_of(model),
+        used,
+        request_tokens,
+        tpm_limit,
+    )
+    _sleep(wait_s)
+
+
+# 4 chars/token is the classic conservative estimate for English + code.
+_CHARS_PER_TOKEN = 4
+# Per-pass request cap: input + max_tokens stays under ~3.5k tokens.
+DESIGN_REQUEST_TOKEN_CAP = 3500
+DEFAULT_PASS_OUTPUT_TOKENS_ENV = "PRAXIS_DESIGN_OUTPUT_TOKENS"
+
+_TRIM_NOTE = "\n[source material trimmed to fit the token budget]\n"
+
+
+def cap_pass_prompt_chars(
+    prompt: str,
+    *,
+    output_tokens: int = DEFAULT_PASS_OUTPUT_TOKENS,
+    token_cap: int = DESIGN_REQUEST_TOKEN_CAP,
+    chars_per_token: int = _CHARS_PER_TOKEN,
+) -> str:
+    """Trim a pass prompt so input + max_tokens stays under the token cap.
+
+    Only the *content* of the untrusted grounding block is elastic, so the cut
+    lands strictly inside it (between the delimiters); the hard constraints,
+    the focus note, and the task instruction at the tail of the prompt are
+    never touched. When even the whole block cannot fit, the prompt goes out
+    unchanged and the truncation guard in llm.py handles any overflow.
+    """
+    budget_chars = max(0, token_cap - output_tokens) * chars_per_token
+    if len(SYSTEM_PROMPT) + len(prompt) <= budget_chars:
+        return prompt
+    ground_start = prompt.find(UNTRUSTED_START)
+    ground_end = prompt.find(UNTRUSTED_END)
+    if ground_start == -1 or ground_end == -1 or ground_end < ground_start:
+        return prompt  # nothing safely trimmable; send as-is
+    body_start = ground_start + len(UNTRUSTED_START)
+    body_len = ground_end - body_start
+    fixed_chars = len(SYSTEM_PROMPT) + len(prompt) - body_len - len(_TRIM_NOTE)
+    body_budget = budget_chars - fixed_chars
+    if body_budget <= 200:
+        # Constraints + instruction alone bust the cap: keep the block whole
+        # (truncating it would strip the untrusted framing) and let the
+        # truncation guard in llm.py handle any overflow.
+        return prompt
+    body = prompt[body_start:ground_end]
+    trimmed = body[: max(0, int(body_budget))]
+    if len(trimmed) < len(body):
+        cut = trimmed.rfind(" ")
+        if cut > 200:  # avoid cutting mid-word near the start
+            trimmed = trimmed[:cut]
+    return prompt[:body_start] + trimmed + _TRIM_NOTE + prompt[ground_end:]
 
 PASS_IDS = (
     "technique",
@@ -478,13 +755,15 @@ def _regenerate_section(
         f"Respond with the corrected markdown of the '{spec['title']}' section "
         f"only (start with its '## {spec['title']}' heading)."
     )
-    return call_llm(
-        prompt,
+    return _design_llm_call(
+        cap_pass_prompt_chars(prompt),
         system=SYSTEM_PROMPT,
         model=model,
         stage="design",
         candidate_id=getattr(candidate, "id", None),
         completion=completion,
+        facts=facts,
+        progress_label=f"regenerate {spec['title']}",
     )
 
 
@@ -677,12 +956,27 @@ def _finish_design(design_id: int, status: str, *, defects_text: str = "") -> No
 
 
 def resolve_design_model(model: str | None = None) -> str:
+    """Resolve the primary design model (first of the chain, when chained)."""
+    return resolve_design_model_chain(model)[0]
+
+
+def resolve_design_model_chain(model: str | None = None) -> list[str]:
+    """Resolve the design model chain: explicit > env > default.
+
+    ``PRAXIS_DESIGN_MODEL`` accepts a comma-separated list of provider/model
+    ids (e.g. ``groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b``); the first
+    entry is the primary and the rest are failovers. Whitespace and empty
+    entries are ignored; an explicit ``model`` argument replaces the whole
+    chain with that single id.
+    """
     if model:
-        return model
+        return [model.strip()]
     env = os.environ.get(DESIGN_MODEL_ENV)
     if env:
-        return env.strip()
-    return DEFAULT_DESIGN_MODEL
+        chain = [entry.strip() for entry in env.split(",") if entry.strip()]
+        if chain:
+            return chain
+    return [DEFAULT_DESIGN_MODEL]
 
 
 def generate_design(
@@ -729,17 +1023,27 @@ def generate_design(
 
     try:
         # -- content passes ---------------------------------------------------
-        for pass_id in _PASS_ORDER:
+        for pass_index, pass_id in enumerate(_PASS_ORDER, start=1):
             if pass_id in done and done[pass_id].strip():
                 continue
-            prompt = _pass_prompt(pass_id, candidate, facts, done, grounding_text, focus)
-            content = call_llm(
+            prompt = cap_pass_prompt_chars(
+                _pass_prompt(pass_id, candidate, facts, done, grounding_text, focus)
+            )
+            _wait_for_tpm_budget(
+                model,
+                prompt,
+                facts,
+                progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
+            )
+            content = _design_llm_call(
                 prompt,
                 system=SYSTEM_PROMPT,
                 model=model,
                 stage="design",
                 candidate_id=candidate_id,
                 completion=completion,
+                facts=facts,
+                progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
             )
             done[pass_id] = content
             save_design_pass(design.id, pass_id, content)
@@ -749,13 +1053,17 @@ def generate_design(
 
         # -- critic pass ------------------------------------------------------
         design_md = assemble_design_md(done, profile, candidate, facts=facts)
-        critic_response = call_llm(
-            _critic_prompt(design_md, facts),
+        critic_prompt = _critic_prompt(design_md, facts)
+        _wait_for_tpm_budget(model, critic_prompt, facts, progress_label="critic")
+        critic_response = _design_llm_call(
+            critic_prompt,
             system=CRITIC_SYSTEM_PROMPT,
             model=model,
             stage="design_critic",
             candidate_id=candidate_id,
             completion=completion,
+            facts=facts,
+            progress_label="critic",
         )
         defects = _parse_defects(critic_response)
         # History of every defect the critic raised across rounds (even ones a
@@ -790,13 +1098,19 @@ def generate_design(
                 design_md = assemble_design_md(
                     done, profile, candidate, facts=facts
                 )
-                critic_response = call_llm(
-                    _critic_prompt(design_md, facts),
+                critic_retry_prompt = _critic_prompt(design_md, facts)
+                _wait_for_tpm_budget(
+                    model, critic_retry_prompt, facts, progress_label="critic"
+                )
+                critic_response = _design_llm_call(
+                    critic_retry_prompt,
                     system=CRITIC_SYSTEM_PROMPT,
                     model=model,
                     stage="design_critic",
                     candidate_id=candidate_id,
                     completion=completion,
+                    facts=facts,
+                    progress_label="critic",
                 )
                 defects = _parse_defects(critic_response)
                 found_defects.extend(defects)

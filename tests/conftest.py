@@ -32,6 +32,14 @@ def _hermetic_model_env(monkeypatch):
     # hardware-profile overrides into facts-sheet/profile loading.
     for var in ("PRAXIS_RAM_GB", "PRAXIS_CPU_ONLY", "PRAXIS_GPU", "PRAXIS_MONTHLY_BUDGET_USD"):
         monkeypatch.delenv(var, raising=False)
+    # The design engine's TPM pacing window is process-global; a fresh window
+    # per test keeps paced sleeps (bounded, but up to ~90s) out of the suite.
+    # The sleeps themselves are neutralized: rate-limit waiting is covered by
+    # dedicated tests that patch praxis.design._sleep and assert the waits.
+    import praxis.design as design_module
+
+    design_module._token_window = design_module._TokenWindow()
+    monkeypatch.setattr(design_module, "_sleep", lambda _s: None)
 
 
 @pytest.fixture
