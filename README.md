@@ -211,26 +211,46 @@ praxis design 42                          # full design, writes designs/042-<slu
 praxis design 42 --focus "skip the UI"    # steer scope with a focus note
 praxis design 42 --pass 4                 # re-run only the plan pass
 praxis design 42 --resume                 # continue a partial design
+praxis design 42 --no-critic              # skip the critic review calls
+praxis design 42 --show                   # print completed passes (even mid-run)
 ```
 
-The design runs as five paced LLM passes (small, ~2-3k-token calls routed
-through the same provider pool and response cache as the rest of the
-pipeline). Rate limits are handled gracefully: when a provider rejects a pass
-with a TPM/429 error, the engine parses the provider's `try again in Ns` hint,
-waits that long (bounded, ~90s max) with a progress line (`pass 2/5: waiting
-13s for rate limit`), and retries the same pass before failing over.
-Proactively, tokens used in the last 60s per provider are tracked against the
-facts sheet's TPM limits, so a pass that would not fit waits before sending.
+The design runs as five paced LLM passes (small calls routed through the same
+provider pool and response cache as the rest of the pipeline). Rate limits are
+handled gracefully: when a provider rejects a pass with a TPM/429 error, the
+engine parses the provider's `try again in Ns` hint, waits that long (bounded,
+~90s max) with a progress line (`pass 2/5: waiting 13s for rate limit`), and
+retries the same pass before failing over.
+
+**Per-model limits.** `hardware_profile.yaml` carries structured limits per
+provider/model — `tpm` (total tokens/min), `itpm` (input) and `otpm` (output),
+each optional; a model with no entry is not throttled. Seeded values are
+labelled `observed on the free tier, Sep 2026, may change`. Pacing checks every
+applicable axis over the 60s sliding window, and each call's `max_tokens` is
+clamped to the model's `otpm`.
+
+**"Request too large" is permanent.** A provider rejecting a pass as too large
+(HTTP 413 / token-window breach) is never waited on or retried at that size,
+and the provider is *not* put into a cooldown — smaller requests may still
+succeed there. The chain entry is skipped instantly; if every entry rejects
+the size, the prompt is shrunk once and retried, then the run fails with a
+clear message listing which limit blocked which entry.
+
+**Compact context.** Passes exchange a structured design state (decisions,
+component list, key parameters, ~600-800 tokens) instead of full text of
+earlier passes; paper chunks are dropped entirely for the hardware-fit pass
+and capped for the plan pass. Per-pass `max_tokens` is ~2000 and gpt-oss
+models get `reasoning_effort="low"`; every call targets input + output
+≤ ~5000 tokens.
+
 `PRAXIS_DESIGN_MODEL` accepts a **comma-separated chain** of provider/model ids
 (`groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b, openrouter/openai/gpt-oss-120b`):
-a provider that keeps rate-limiting the run fails over to the next entry
-instead of ending it, and `praxis doctor` verifies every chain entry exists at
-its provider. Per-pass request size is capped (paper context + max_tokens
-stays under ~3.5k tokens; the paper context is trimmed to fit, hard
-constraints and task instruction are never cut). Each pass receives the facts sheet (from `hardware_profile.yaml`) as
-HARD CONSTRAINTS, the focus note, the relevant paper chunks, and a compact
-summary of the earlier passes; every pass output is persisted as it completes,
-so an interrupted run resumes at the failed pass:
+a provider that keeps failing the run fails over to the next entry instead of
+ending it, and `praxis doctor` verifies every chain entry exists at its
+provider. Each pass receives the facts sheet (from `hardware_profile.yaml`) as
+HARD CONSTRAINTS, the focus note, the relevant paper chunks, and the design
+state; every pass output is persisted as it completes, so an interrupted run
+resumes at the failed pass:
 
 1. **Technique** — the paper's core method as precisely as the source text
    allows: inputs, outputs, algorithm steps, formulas, thresholds, and the
@@ -249,12 +269,15 @@ so an interrupted run resumes at the failed pass:
    facts sheet with totals vs headroom, alternatives "rejected because they
    don't fit", a degradation plan, risks, and cuts.
 
-A skeptical critic pass reviews the assembled document and flags defects
-(budget-table drift, unsourced claims, uncovered components, hidden
-assumptions, scope realism); flagged sections are regenerated in bounded
-rounds. A deterministic anchor (hard constraints, checkable total rule,
-Windows pitfalls) is appended inside the hardware-fit section so the rubric
-keeps verifying the sums.
+A skeptical critic reviews the design **per section** (one call per pass
+output plus a compact digest of the other sections, each call under ~5000
+tokens) and flags defects (budget-table drift, unsourced claims, uncovered
+components, hidden assumptions, scope realism); only flagged sections are
+regenerated in bounded rounds. `--no-critic` skips the review; when no chain
+entry can fit a critic call, the run completes with a `critic skipped:
+<reason>` note in DESIGN.md. A deterministic anchor (hard constraints,
+checkable total rule, Windows pitfalls) is appended inside the hardware-fit
+section so the rubric keeps verifying the sums.
 
 Every pass prompt carries the facts sheet and the **UNVERIFIED rule**: never
 state prices, model sizes or library capabilities that are not in the facts
@@ -272,9 +295,19 @@ Output is saved to the DB and written to `designs/<NNN>-<slug>/`:
 - **`TASKS.md`** — a checkbox list with the plan pass's `TASK-001...` ids
   (bare tasks are numbered automatically).
 - **`AGENT_PROMPT.md`** — a paste-ready Phase 1 prompt for any coding agent.
+- **`DESIGN.partial.md`** — written when a run fails or is incomplete: every
+  completed pass, the failure reason, and the missing passes with the resume
+  hint.
 
-The command prints the file paths plus a usage footer (`LLM usage: N calls, T
+`praxis design <id> --show` prints the completed passes of the candidate's
+newest design — in-progress designs included — without calling the LLM. The
+command prints the file paths plus a usage footer (`LLM usage: N calls, T
 tokens, $C`) aggregated from the ledger.
+
+**Windows/UTF-8.** Every artifact is written with `encoding="utf-8"`, the CLI
+reconfigures stdout/stderr to UTF-8 (with replacement) at startup so legacy
+console code pages cannot kill a run, and stored model text is normalized
+(non-breaking hyphens/spaces and smart quotes become plain ASCII).
 
 Track LLM token spend against the budget:
 
@@ -324,13 +357,19 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_CODER_PROVIDER_RETRIES` | max models tried for one coder attempt before the circuit breaker takes over | `3` |
 | `PRAXIS_CODER_OPENCODE_FLAGS` | extra flags after `opencode run`; stock opencode uses `--auto`, set empty for forks that reject it | `--auto` |
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
-| `PRAXIS_DESIGN_MODEL` | litellm model id(s) for the design passes; comma-separated chain fails over on rate limits | `groq/openai/gpt-oss-120b` |
+| `PRAXIS_DESIGN_MODEL` | litellm model id(s) for the design passes; comma-separated chain fails over on rate limits and request-too-large rejections | `groq/openai/gpt-oss-120b` |
 | `PRAXIS_MAX_TOKENS` | first-attempt `max_tokens` for LLM calls (unset = provider default) | — |
 | `PRAXIS_MAX_TOKENS_RETRY` | `max_tokens` for the truncation-guard retry (default: 2x first, else 8192) | — |
 | `PRAXIS_GROUNDING_CACHE` | disable the source-grounding disk cache with `0`/`false` | `1` |
 | `PRAXIS_GROUNDING_CACHE_DIR` | directory for the grounding disk cache | `./.praxis-cache/grounding` |
 
 ## Provider failover (3 keys, 2 jobs, instant switch)
+
+Before a long run, `praxis doctor` checks keys, models endpoints, the DB and
+the coder setup; `praxis doctor --deep` additionally sends a 1-token
+completion to every `PRAXIS_DESIGN_MODEL` chain entry and reports real
+failures (payment required, auth, model unavailable) with a fix hint — plain
+`praxis doctor` is unchanged.
 
 Job A consumes three free providers — **Groq, OpenRouter, Cerebras** — directly
 via litellm. Job B routes every Coder call through the local **omniroute
