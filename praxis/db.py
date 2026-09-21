@@ -236,6 +236,45 @@ def save_design_pass(design_id: int, pass_id: str, content: str) -> None:
         session.close()
 
 
+def clear_design_pass(design_id: int, pass_id: str) -> None:
+    """Drop one pass output so the next run regenerates it (--pass N)."""
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        if row is None:
+            return
+        passes = json.loads(row.passes_json or "{}")
+        passes.pop(pass_id, None)
+        row.passes_json = json.dumps(passes)
+        session.commit()
+    finally:
+        session.close()
+
+
+def design_usage_totals(candidate_id: int) -> tuple[int, int, float]:
+    """LLM calls, total tokens, and estimated cost for one candidate's designs.
+
+    Covers the design and design_critic stages, excluding cache hits, so the
+    CLI can print a per-design spend footer like the pipeline's.
+    """
+    session = get_session()
+    try:
+        count, tokens, cost = session.execute(
+            select(
+                func.count(LLMUsage.id),
+                func.coalesce(func.sum(LLMUsage.total_tokens), 0),
+                func.coalesce(func.sum(LLMUsage.cost_usd), 0.0),
+            ).where(
+                LLMUsage.candidate_id == candidate_id,
+                LLMUsage.stage.in_(("design", "design_critic")),
+                LLMUsage.cached.is_(False),
+            )
+        ).one()
+        return int(count), int(tokens), float(cost)
+    finally:
+        session.close()
+
+
 def design_status_counts() -> dict[str, int]:
     """Return counts of designs grouped by status."""
     session = get_session()

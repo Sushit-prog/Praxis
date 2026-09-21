@@ -330,3 +330,189 @@ def test_cli_design_missing_candidate(tmp_path, monkeypatch):
     monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{tmp_path / 'none.db'}")
     code = main(["design", "999"])
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# praxis design flags: --pass N, --resume, usage footer
+# ---------------------------------------------------------------------------
+
+
+def test_cli_design_resume_continues_partial(cli_discover_env, monkeypatch, capsys):
+    """--resume continues an in_progress design instead of discarding it."""
+    import json
+
+    import praxis.design as design_module
+    from praxis.db import Design, get_session, latest_design, save_design_pass
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+
+    # Simulate a design interrupted after pass 1.
+    session = get_session()
+    design = Design(candidate_id=cid, status="in_progress")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    save_design_pass(design_id, "technique", GOOD_PASSES["technique"])
+
+    calls = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        calls.append(prompt)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    code = main(["design", str(cid), "--resume"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "DESIGN.md" in out
+    assert "LLM usage:" in out
+    # The stored technique pass was reused, not regenerated: only the other 4
+    # content passes + critic were called.
+    assert len(calls) == 5
+    stored = latest_design(cid)
+    assert stored.status == "complete"
+    assert json.loads(stored.passes_json)["technique"] == GOOD_PASSES["technique"]
+
+
+def test_cli_design_without_resume_discards_partial(cli_discover_env, monkeypatch, capsys):
+    """A fresh run (no --resume) abandons the stale partial design."""
+    import json
+
+    import praxis.design as design_module
+    from praxis.db import Design, get_session, latest_design, save_design_pass
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+
+    session = get_session()
+    design = Design(candidate_id=cid, status="in_progress")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    save_design_pass(design_id, "technique", "old partial technique")
+
+    regenerated = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                regenerated.append(title)
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    code = main(["design", str(cid)])
+    assert code == 0
+    assert "Technique" in regenerated  # pass 1 re-ran
+    stored = latest_design(cid)
+    assert stored.status == "complete"
+    assert "old partial technique" not in stored.passes_json
+
+
+def test_cli_design_rerun_single_pass(cli_discover_env, monkeypatch, capsys):
+    """--pass N regenerates only pass N, keeping the other stored passes."""
+    import json
+
+    import praxis.design as design_module
+    from praxis.db import Design, get_session, latest_design, save_design_pass
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+
+    session = get_session()
+    design = Design(candidate_id=cid, status="complete")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    for pass_id in ("technique", "architecture", "data_contracts", "plan", "hardware_fit"):
+        save_design_pass(design_id, pass_id, GOOD_PASSES[pass_id])
+    # A completed design is reused as-is by --resume; to force a --pass rerun we
+    # mark it in_progress like the generator would leave it mid-run.
+    session = get_session()
+    row = session.get(Design, design_id)
+    row.status = "in_progress"
+    session.commit()
+    session.close()
+
+    called_titles = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                called_titles.append(title)
+                return content.replace("top_k = 20", "top_k = 25")
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    code = main(["design", str(cid), "--pass", "3"])
+    assert code == 0
+    assert "re-running pass 3 (data_contracts)" in capsys.readouterr().out
+    # Only the data_contracts pass and the critic ran.
+    assert called_titles == ["Data Model & Contracts"]
+    stored = latest_design(cid)
+    passes = json.loads(stored.passes_json)
+    assert "top_k = 25" in passes["data_contracts"]  # pass 3 regenerated
+    assert passes["data_contracts"] != GOOD_PASSES["data_contracts"]
+    assert passes["technique"] == GOOD_PASSES["technique"]  # other passes untouched
+
+
+def test_cli_design_usage_footer_prints_totals(cli_discover_env, monkeypatch, capsys):
+    """The design command prints token/cost totals from the usage ledger."""
+    import json
+
+    import praxis.design as design_module
+    from praxis.db import LLMUsage, get_session
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    # The fake replaced call_llm itself (no usage rows), so seed the ledger to
+    # verify the aggregation printed in the footer.
+    session = get_session()
+    session.add(
+        LLMUsage(
+            model="groq/openai/gpt-oss-20b",
+            stage="design",
+            candidate_id=cid,
+            total_tokens=1234,
+            cost_usd=0.0025,
+        )
+    )
+    session.commit()
+    session.close()
+
+    code = main(["design", str(cid), "--resume"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "LLM usage:" in out
+    assert "1 calls, 1,234 tokens, $0.0025" in out

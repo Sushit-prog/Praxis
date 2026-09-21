@@ -41,7 +41,14 @@ from dataclasses import dataclass, field
 
 from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START, _strip_delimiters
 from praxis.config import FactsSheet, HardwareProfile, load_facts, render_facts_sheet
-from praxis.db import Candidate, Design, get_session, save_design_pass
+from praxis.db import (
+    Candidate,
+    Design,
+    clear_design_pass,
+    design_usage_totals,
+    get_session,
+    save_design_pass,
+)
 from praxis.grounding import ground_candidate
 from praxis.llm import call_llm
 
@@ -108,6 +115,9 @@ class DesignResult:
     defects: list[dict[str, str]] = field(default_factory=list)
     design_md: str = ""
     error: str | None = None
+    calls: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -686,14 +696,16 @@ def generate_design(
     completion=None,
     pace_seconds: float | None = None,
     max_regeneration_rounds: int = 2,
+    rerun_passes: list[str] | None = None,
 ) -> DesignResult:
     """Run the multi-pass design generation for one candidate.
 
     Resumable: pass outputs are persisted after each pass, so a failure
     mid-run leaves an in_progress design whose missing passes are regenerated
-    on the next call. The critic pass runs once the 5 content passes are done;
-    flagged sections are regenerated (bounded rounds), then the design is
-    finalized.
+    on the next call. ``rerun_passes`` forces regeneration of specific passes
+    (from ``--pass N``) even if they are already stored; the rest are reused.
+    The critic pass runs once the 5 content passes are done; flagged sections
+    are regenerated (bounded rounds), then the design is finalized.
     """
     candidate_id = getattr(candidate, "id", None)
     if candidate_id is None:
@@ -704,6 +716,14 @@ def generate_design(
 
     design = _get_or_create_design(candidate_id, depth, model, focus)
     done = _load_passes(design)
+    for pass_id in rerun_passes or []:
+        if pass_id not in _PASS_ORDER:
+            raise ValueError(
+                f"unknown pass {pass_id!r}; choose one of: {', '.join(_PASS_ORDER)}"
+            )
+        done.pop(pass_id, None)
+        if design.id is not None:
+            clear_design_pass(design.id, pass_id)
     grounding = ground_candidate(candidate)
     grounding_text = grounding.prompt_block()
 
@@ -801,6 +821,7 @@ def generate_design(
         logger.info(
             "design: complete for candidate %s (%d defect(s) addressed)", candidate_id, len(defects)
         )
+        calls, total_tokens, cost_usd = design_usage_totals(candidate_id)
         return DesignResult(
             candidate_id=candidate_id,
             design_id=design.id,
@@ -808,11 +829,15 @@ def generate_design(
             completed_passes=list(done),
             defects=found_defects,
             design_md=final_md,
+            calls=calls,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
         )
     except Exception as exc:  # noqa: BLE001 - partial progress must remain resumable
         logger.warning("design: failed for candidate %s: %s", candidate_id, exc)
         if design.id is not None:
             _finish_design(design.id, "in_progress")
+        calls, total_tokens, cost_usd = design_usage_totals(candidate_id)
         return DesignResult(
             candidate_id=candidate_id,
             design_id=design.id,
@@ -820,6 +845,9 @@ def generate_design(
             completed_passes=list(done),
             design_md=assemble_design_md(done, profile, candidate, facts=facts) if done else "",
             error=str(exc),
+            calls=calls,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
         )
 
 

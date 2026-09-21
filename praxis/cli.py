@@ -7,6 +7,8 @@ import logging
 import sys
 from collections.abc import Sequence
 
+from praxis.design import PASS_IDS
+
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
@@ -139,6 +141,26 @@ def build_parser() -> argparse.ArgumentParser:
     design_parser.add_argument(
         "--model",
         help="Design model override (default: PRAXIS_DESIGN_MODEL or groq/openai/gpt-oss-120b).",
+    )
+    design_parser.add_argument(
+        "--pass",
+        dest="rerun_pass",
+        type=int,
+        default=None,
+        metavar="N",
+        choices=range(1, len(PASS_IDS) + 1),
+        help=(
+            "Re-run only pass N (1=technique, 2=architecture, 3=data_contracts, "
+            "4=plan, 5=hardware_fit), keeping the other stored passes."
+        ),
+    )
+    design_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue a partial (in_progress) design from the last completed "
+            "pass instead of starting a new one."
+        ),
     )
 
     return parser
@@ -423,13 +445,52 @@ def _cmd_review(args) -> int:
     return 0
 
 
-def _design_and_write(candidate, profile, *, focus, depth="standard", model=None) -> int:
-    """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
-    from praxis.db import Design, get_session
-    from praxis.design import generate_design
-    from praxis.design_io import load_passes, write_design_files
+def _discard_partial_design(candidate_id: int) -> None:
+    """Mark a stale in_progress design failed so a fresh run starts clean.
 
-    result = generate_design(candidate, profile, depth=depth, focus=focus, model=model)
+    Without --resume, a re-run of `praxis design` starts over instead of
+    silently continuing a partial design; --resume keeps it.
+    """
+    from sqlalchemy import select
+
+    from praxis.db import Design, get_session
+
+    session = get_session()
+    try:
+        row = session.scalars(
+            select(Design)
+            .where(Design.candidate_id == candidate_id, Design.status == "in_progress")
+            .order_by(Design.id.desc())
+            .limit(1)
+        ).first()
+        if row is not None:
+            row.status = "failed"
+            session.commit()
+    finally:
+        session.close()
+
+
+def _design_and_write(
+    candidate,
+    profile,
+    *,
+    focus,
+    depth="standard",
+    model=None,
+    rerun_passes=None,
+) -> int:
+    """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
+    from praxis.design import generate_design
+    from praxis.design_io import write_design_files
+
+    result = generate_design(
+        candidate,
+        profile,
+        depth=depth,
+        focus=focus,
+        model=model,
+        rerun_passes=rerun_passes,
+    )
     if result.status != "complete" or not result.design_md:
         completed = ", ".join(result.completed_passes) or "none"
         print(
@@ -440,10 +501,15 @@ def _design_and_write(candidate, profile, *, focus, depth="standard", model=None
         )
         return 1
 
+    from praxis.db import get_session
+    from praxis.design_io import load_passes as _load_passes
+
     session = get_session()
     try:
+        from praxis.db import Design
+
         row = session.get(Design, result.design_id)
-        passes = load_passes(row) if row is not None else {}
+        passes = _load_passes(row) if row is not None else {}
     finally:
         session.close()
 
@@ -455,6 +521,10 @@ def _design_and_write(candidate, profile, *, focus, depth="standard", model=None
     print(f"  {out_dir / 'DESIGN.md'}")
     print(f"  {out_dir / 'TASKS.md'}")
     print(f"  {out_dir / 'AGENT_PROMPT.md'}")
+    print(
+        f"  LLM usage: {result.calls} calls, {result.total_tokens:,} tokens, "
+        f"${result.cost_usd:.4f}"
+    )
     for defect in result.defects:
         print(
             f"  critic: [{defect.get('class', '?')}] {defect.get('section', '?')}: "
@@ -500,6 +570,7 @@ def _cmd_discover(args) -> int:
 
 def _cmd_design(args) -> int:
     from praxis.config import load_config
+    from praxis.design import PASS_IDS
     from praxis.discover import get_candidate
 
     candidate = get_candidate(args.candidate_id)
@@ -507,9 +578,20 @@ def _cmd_design(args) -> int:
         print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
         return 1
     profile = load_config()
+    rerun_passes = None
+    if args.rerun_pass is not None:
+        rerun_passes = [PASS_IDS[args.rerun_pass - 1]]
+        print(f"re-running pass {args.rerun_pass} ({rerun_passes[0]}) only")
+    elif not args.resume:
+        _discard_partial_design(args.candidate_id)
     print(f"designing candidate {args.candidate_id}: {candidate.title}")
     return _design_and_write(
-        candidate, profile, focus=args.focus, depth=args.depth, model=args.model
+        candidate,
+        profile,
+        focus=args.focus,
+        depth=args.depth,
+        model=args.model,
+        rerun_passes=rerun_passes,
     )
 
 
