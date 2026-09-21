@@ -82,6 +82,45 @@ RATE_LIMIT_MAX_WAIT_S = 90.0
 RATE_LIMIT_WAIT_MARGIN_S = 2.0
 RATE_LIMIT_DEFAULT_WAIT_S = 60.0
 
+# Groq's "request too large" (HTTP 413 / token-window breach): permanent at
+# that size. Never waited on, never retried, and the provider is NOT put into
+# a cooldown — smaller requests may still succeed there.
+REQUEST_TOO_LARGE_MARKERS = re.compile(
+    r"request too large|too large for model|reduce the (?:length|size) of the "
+    r"(?:messages|input)|number of (?:tokens|bytes) is larger than the limit|"
+    r"maximum context length|context length exceeded|input is too long|"
+    r"exceeds the maximum allowed|http.{0,3}413",
+    re.IGNORECASE,
+)
+
+
+class RequestTooLargeError(RuntimeError):
+    """The request can never fit this chain entry at its current size.
+
+    Distinct from a rate limit: waiting cannot help because the limit is on
+    the request size, not on tokens per minute. The caller either sends a
+    smaller request to this entry or moves to the next chain entry.
+    """
+
+    def __init__(self, message: str, blocked_entries: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.blocked_entries = blocked_entries or []
+
+
+def is_request_too_large_error(exc: Exception) -> bool:
+    """True when the exception means "this request is too big for this model".
+
+    Groq answers an oversized prompt with HTTP 413 "request too large"; other
+    providers phrase it as a context-length breach. Unlike a rate limit this
+    is permanent at the current size — retrying or waiting cannot help.
+    """
+    if getattr(exc, "status_code", None) == 413:
+        return True
+    exc_class = type(exc).__name__.lower()
+    if "contextwindow" in exc_class.replace("_", "") or "toolarge" in exc_class:
+        return True
+    return bool(REQUEST_TOO_LARGE_MARKERS.search(str(exc)))
+
 # Proactive pacing: never let a request exceed any of the model's free-tier
 # limits (total TPM, input ITPM, output OTPM) inside a 60s window. Tokens are
 # tracked in-memory per provider and axis (this process only; cross-process
@@ -271,72 +310,125 @@ def _design_llm_call(
     progress_label: str = "",
     max_tokens: int | None = None,
 ) -> str:
-    """One design LLM call with rate-limit wait-and-retry and TPM accounting.
+    """One design LLM call with rate-limit wait-and-retry and chain failover.
 
     ``model`` is the primary of the design chain; the full chain is resolved
-    from ``PRAXIS_DESIGN_MODEL`` (or the default) for failover. On a rate-limit
-    rejection, parses the provider's "try again in Ns" hint (falling back to
-    the default wait), sleeps that long plus a small margin (bounded), prints
-    a progress line, and retries the same call — up to
-    ``RATE_LIMIT_MAX_RETRIES`` times before failing over to the next chain
-    entry. Successful calls record their usage in the sliding-window TPM
-    tracker so subsequent calls are paced proactively.
+    from ``PRAXIS_DESIGN_MODEL`` (or the default) for failover. Error handling
+    per chain entry:
 
+    * *rate limit* — wait out the provider's "try again in Ns" hint (bounded)
+      and retry the same call up to ``RATE_LIMIT_MAX_RETRIES`` times.
+    * *request too large* — permanent at this size: skip this entry instantly
+      (no wait, no retry, no provider cooldown) and try the next one. When
+      every entry rejects the size, the prompt is shrunk once via
+      ``cap_pass_prompt_chars`` with a tighter cap and the chain is retried;
+      failing again, :class:`RequestTooLargeError` lists which limit blocked
+      which entry.
+
+    Successful calls record their usage in the sliding-window pacing tracker.
     The LLM call itself goes through the module-level ``call_llm`` name so
     tests can keep injecting fakes at ``praxis.design.call_llm``.
     """
     chain = resolve_design_model_chain(None)
     if model != chain[0]:
         chain = [model]
-    for chain_index, chain_model in enumerate(chain):
-        provider = provider_of(chain_model)
-        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
-            started = time.monotonic()
-            try:
-                content = call_llm(
-                    prompt,
-                    system=system,
-                    model=chain_model,
-                    stage=stage,
-                    candidate_id=candidate_id,
-                    completion=completion,
-                    max_tokens=max_tokens,
-                )
-            except Exception as exc:
-                last_exc = exc
-                if not _is_rate_limit_error(exc) or attempt >= RATE_LIMIT_MAX_RETRIES:
-                    if chain_index + 1 < len(chain):
+    blocked: list[str] = []
+    shrunk_once = False
+    attempt_prompt = prompt
+    while True:
+        last_exc: Exception | None = None
+        for chain_index, chain_model in enumerate(chain):
+            provider = provider_of(chain_model)
+            in_tok = len(attempt_prompt) // _CHARS_PER_TOKEN
+            out_tok = max_tokens or DEFAULT_PASS_OUTPUT_TOKENS
+            entry = f"{chain_model} (input ~{in_tok} + output ~{out_tok} tokens)"
+            for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+                started = time.monotonic()
+                try:
+                    content = call_llm(
+                        attempt_prompt,
+                        system=system,
+                        model=chain_model,
+                        stage=stage,
+                        candidate_id=candidate_id,
+                        completion=completion,
+                        max_tokens=max_tokens,
+                    )
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    last_exc = exc
+                    if is_request_too_large_error(exc):
+                        # Permanent at this size: skip the entry instantly.
+                        # No wait, no retry, and deliberately NO pool cooldown —
+                        # smaller requests may still succeed at this provider.
+                        blocked.append(entry)
                         logger.warning(
-                            "design: %s exhausted (%s); failing over to %s",
-                            provider,
+                            "design: request too large for %s (%s); skipping to next "
+                            "chain entry without cooldown",
+                            chain_model,
                             str(exc)[:160],
-                            provider_of(chain[chain_index + 1]),
                         )
-                        break  # next chain entry
-                    raise
-                hint = parse_retry_after(str(exc))
-                wait_s = hint if hint is not None else RATE_LIMIT_DEFAULT_WAIT_S
-                wait_s = min(wait_s + RATE_LIMIT_WAIT_MARGIN_S, RATE_LIMIT_MAX_WAIT_S)
+                        if progress_label:
+                            print(
+                                f"  {progress_label}: request too large for {chain_model}, "
+                                "trying next model",
+                                flush=True,
+                            )
+                        break
+                    if not _is_rate_limit_error(exc) or attempt >= RATE_LIMIT_MAX_RETRIES:
+                        if chain_index + 1 < len(chain):
+                            logger.warning(
+                                "design: %s exhausted (%s); failing over to %s",
+                                provider,
+                                str(exc)[:160],
+                                provider_of(chain[chain_index + 1]),
+                            )
+                            break  # next chain entry
+                        raise
+                    hint = parse_retry_after(str(exc))
+                    wait_s = hint if hint is not None else RATE_LIMIT_DEFAULT_WAIT_S
+                    wait_s = min(wait_s + RATE_LIMIT_WAIT_MARGIN_S, RATE_LIMIT_MAX_WAIT_S)
+                    if progress_label:
+                        print(
+                            f"  {progress_label}: waiting {wait_s:.0f}s for rate limit "
+                            f"({provider})",
+                            flush=True,
+                        )
+                    logger.warning(
+                        "design: %s rate-limited (%s); waiting %.0fs before retry %d/%d",
+                        provider,
+                        str(exc)[:160],
+                        wait_s,
+                        attempt + 1,
+                        RATE_LIMIT_MAX_RETRIES,
+                    )
+                    _sleep(wait_s)
+                    continue
+                elapsed = time.monotonic() - started
+                _record_usage_estimate(attempt_prompt, content, provider, elapsed)
+                return content
+        # Every chain entry was tried at this size.
+        if blocked and len(blocked) == len(chain) and not shrunk_once:
+            shrunk_once = True
+            attempt_prompt = cap_pass_prompt_chars(
+                prompt,
+                output_tokens=max_tokens or DEFAULT_PASS_OUTPUT_TOKENS,
+                token_cap=_SHRUNKEN_REQUEST_TOKEN_CAP,
+            )
+            if len(attempt_prompt) < len(prompt):
+                blocked = []
                 if progress_label:
                     print(
-                        f"  {progress_label}: waiting {wait_s:.0f}s for rate limit "
-                        f"({provider})",
+                        f"  {progress_label}: request too large for every chain entry; "
+                        "shrinking the source material and trying once more",
                         flush=True,
                     )
-                logger.warning(
-                    "design: %s rate-limited (%s); waiting %.0fs before retry %d/%d",
-                    provider,
-                    str(exc)[:160],
-                    wait_s,
-                    attempt + 1,
-                    RATE_LIMIT_MAX_RETRIES,
-                )
-                _sleep(wait_s)
                 continue
-            elapsed = time.monotonic() - started
-            _record_usage_estimate(prompt, content, provider, elapsed)
-            return content
-    raise last_exc  # every chain entry exhausted its retries
+        raise RequestTooLargeError(
+            "request too large for every design model entry: "
+            + "; ".join(blocked)
+            + (f" (last error: {last_exc})" if last_exc else ""),
+            blocked_entries=blocked,
+        ) from last_exc
 
 
 def _record_usage_estimate(
@@ -360,6 +452,9 @@ def _record_usage_estimate(
 _CHARS_PER_TOKEN = 4
 # Per-pass request cap: input + max_tokens stays under ~3.5k tokens.
 DESIGN_REQUEST_TOKEN_CAP = 3500
+# One-shot shrink target when every chain entry rejects the request as too
+# large (item 2): retry once with input + output bounded to ~5k tokens total.
+_SHRUNKEN_REQUEST_TOKEN_CAP = 5000
 DEFAULT_PASS_OUTPUT_TOKENS_ENV = "PRAXIS_DESIGN_OUTPUT_TOKENS"
 
 _TRIM_NOTE = "\n[source material trimmed to fit the token budget]\n"

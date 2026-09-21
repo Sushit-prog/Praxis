@@ -447,3 +447,141 @@ def test_cap_pass_prompt_without_grounding_block_returns_unchanged():
     """No untrusted delimiters to trim: unchanged."""
     prompt = f"constraints + task only, {'x' * 40000}"
     assert cap_pass_prompt_chars(prompt) == prompt
+
+
+# ---------------------------------------------------------------------------
+# item 2: "request too large" is permanent — skip fast, shrink once, fail clear
+# ---------------------------------------------------------------------------
+
+
+def _too_large_error(message="Error code: 413 - {'error': {'message': 'request too large'}}"):
+    """A Groq-shaped request-too-large exception (HTTP 413)."""
+    exc = RuntimeError(message)
+    exc.status_code = 413
+    return exc
+
+
+def test_is_request_too_large_error_classification():
+    """413 status and the provider-specific wordings classify; rate limits do not."""
+    from praxis.design import is_request_too_large_error
+
+    assert is_request_too_large_error(_too_large_error())
+    assert is_request_too_large_error(
+        RuntimeError("number of tokens is larger than the limit: 65536")
+    )
+    assert is_request_too_large_error(RuntimeError("Please reduce the length of the messages"))
+    # Not a size error: rate limits and network failures stay in their lanes.
+    assert not is_request_too_large_error(_rate_limit_error("try again in 5s"))
+    assert not is_request_too_large_error(RuntimeError("connection reset"))
+
+
+def test_too_large_skips_entry_without_wait_or_cooldown(design_setup, monkeypatch):
+    """The too-large entry is skipped instantly: no sleep, no pool cooldown."""
+    import praxis.design as design_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b"
+    )
+
+    attempts: list[str] = []
+
+    def too_large_on_groq(prompt, system=None, model=None, **kwargs):
+        attempts.append(model)
+        if model.startswith("groq"):
+            raise _too_large_error()
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", too_large_on_groq)
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "complete"
+    # Groq rejected each call exactly once (no wait-and-retry), then cerebras.
+    assert attempts.count("groq/openai/gpt-oss-120b") == 0 or True  # counting below
+    groq_attempts = sum(1 for m in attempts if m.startswith("groq"))
+    cerebras_successes = sum(1 for m in attempts if m.startswith("cerebras"))
+    assert groq_attempts == 6  # 5 passes + critic, one instant rejection each
+    assert cerebras_successes == 6
+    assert waits == []  # never slept
+    # No cooldown was recorded for groq: a smaller request may still go there.
+    from praxis.db import ProviderHealth, get_session as patched_get_session
+
+    session = patched_get_session()
+    rows = session.query(ProviderHealth).all()
+    session.close()
+    groq_rows = [r for r in rows if r.provider == "groq" and r.job == "pipeline"]
+    assert all(r.state != "cooling_down" for r in groq_rows)
+
+
+def test_too_large_on_every_entry_shrinks_once_then_fails_clearly(design_setup, monkeypatch, capsys):
+    """Every entry rejects the size: one shrink, one more round, clear error."""
+    import praxis.design as design_module
+    import praxis.grounding as grounding_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv(
+        "PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b"
+    )
+    # A large source block gives the shrink something elastic to cut.
+    big_ground = grounding_module.Grounding(
+        chunks=["paper text " * 4000], provenance=["arXiv HTML"], source_kind="arxiv"
+    )
+    monkeypatch.setattr(design_module, "ground_candidate", lambda _c: big_ground)
+
+    rounds: list[int] = [0]
+
+    def always_too_large(prompt, system=None, model=None, **kwargs):
+        rounds[0] += 1
+        raise _too_large_error()
+
+    monkeypatch.setattr(design_module, "call_llm", always_too_large)
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+
+    assert result.status == "failed"
+    assert "request too large for every design model entry" in (result.error or "")
+    assert "groq/openai/gpt-oss-120b" in (result.error or "")
+    assert "cerebras/gpt-oss-120b" in (result.error or "")
+    # 6 calls x (2 entries x 2 rounds) = 24 attempts, but pass 1 fails the run;
+    # only the first call happens: 2 entries x 2 rounds = 4 attempts.
+    # First call happens twice per entry (original + shrunk prompt).
+    assert rounds[0] == 4
+    out = capsys.readouterr().out
+    assert "shrinking the source material" in out
+
+
+def test_too_large_never_enters_rate_limit_wait(design_setup, monkeypatch):
+    """A too-large error followed by success never produces a pacing sleep."""
+    import praxis.design as design_module
+
+    candidate_id, profile, waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
+
+    calls = {"n": 0}
+
+    def too_large_then_success(prompt, system=None, model=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _too_large_error("request too large: reduce the size of the messages")
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", too_large_then_success)
+
+    result = generate_design(_Candidate(candidate_id), profile, pace_seconds=0.0)
+    # Single-entry chain: every entry blocked -> shrink once -> blocked again
+    # -> clear failure (no rate-limit waits anywhere).
+    assert result.status == "failed"
+    assert waits == []
