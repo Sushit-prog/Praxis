@@ -126,7 +126,10 @@ def is_request_too_large_error(exc: Exception) -> bool:
 # tracked in-memory per provider and axis (this process only; cross-process
 # accounting would need the ledger and overcounts restarts).
 TPM_WINDOW_S = 60.0
-DEFAULT_PASS_OUTPUT_TOKENS = 2500
+# Per-pass output budget (~2000 tokens); clamped further by a model's OTPM.
+DEFAULT_PASS_OUTPUT_TOKENS = 2000
+# Target total request size: input + max_tokens <= ~5000 tokens per call.
+DESIGN_REQUEST_TOKEN_CAP = 5000
 
 _RETRY_HINT_RE = re.compile(
     r"try again in ([0-9.]+)s|(?:retry-after|retry after)[: ]*([0-9.]+)", re.IGNORECASE
@@ -298,6 +301,15 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return classify_exhaustion(exc) == "rate_limit"
 
 
+def _supports_reasoning_effort(model: str) -> bool:
+    """True when the model accepts litellm's reasoning_effort parameter.
+
+    Only gpt-oss models expose the low/medium/high effort knob; other models
+    would reject (or ignore) the parameter, so it is not sent to them.
+    """
+    return "gpt-oss" in (model or "").lower()
+
+
 def _design_llm_call(
     prompt: str,
     *,
@@ -353,6 +365,9 @@ def _design_llm_call(
                         candidate_id=candidate_id,
                         completion=completion,
                         max_tokens=max_tokens,
+                        reasoning_effort=(
+                            "low" if _supports_reasoning_effort(chain_model) else None
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 - classified below
                     last_exc = exc
@@ -450,8 +465,6 @@ def _record_usage_estimate(
 
 # 4 chars/token is the classic conservative estimate for English + code.
 _CHARS_PER_TOKEN = 4
-# Per-pass request cap: input + max_tokens stays under ~3.5k tokens.
-DESIGN_REQUEST_TOKEN_CAP = 3500
 # One-shot shrink target when every chain entry rejects the request as too
 # large (item 2): retry once with input + output bounded to ~5k tokens total.
 _SHRUNKEN_REQUEST_TOKEN_CAP = 5000
@@ -642,10 +655,56 @@ def _constraints_block(facts: FactsSheet) -> str:
     return render_facts_sheet(facts)
 
 
-def _grounding_block(grounding_text: str, focus: str | None) -> str:
+# Per-pass source-material budgets (chars of the untrusted grounding block):
+# the hardware_fit pass needs no paper context (it works from the facts sheet
+# and the design state) and the plan pass only needs a reminder of it.
+GROUNDING_CHAR_BUDGETS: dict[str, int | None] = {
+    "technique": None,  # unlimited (the request cap trims it as usual)
+    "architecture": 8000,
+    "data_contracts": 6000,
+    "plan": 3000,
+    "hardware_fit": 0,  # paper chunks dropped entirely
+}
+
+
+_CLIP_NOTE = "\n[source material clipped for this pass]"
+
+
+def _clip_grounding_to_budget(grounding_text: str, budget: int | None) -> str:
+    """Head-clip the grounding block to a per-pass char budget.
+
+    Only the source text between the untrusted markers is elastic; the
+    markers themselves always survive so the framing stays intact.
+    """
+    if budget is None:
+        return grounding_text
+    if budget <= 0:
+        return ""
+    start = grounding_text.find(UNTRUSTED_START)
+    end = grounding_text.rfind(UNTRUSTED_END)
+    if start == -1 or end == -1 or end < start:
+        return grounding_text
+    header = grounding_text[: start + len(UNTRUSTED_START)]
+    footer = grounding_text[end:]
+    inner = grounding_text[start + len(UNTRUSTED_START) : end]
+    allowed = budget - len(header) - len(footer) - len(_CLIP_NOTE)
+    if allowed <= 0 or len(inner) <= allowed:
+        return grounding_text
+    cut = inner[:allowed]
+    keep = cut.rfind("\n")
+    if keep > 200:
+        cut = cut[:keep]
+    return header + cut + _CLIP_NOTE + footer
+
+
+def _grounding_block(
+    grounding_text: str, focus: str | None, *, char_budget: int | None = None
+) -> str:
     parts = []
     if grounding_text:
-        parts.append(grounding_text)
+        clipped = _clip_grounding_to_budget(grounding_text, char_budget)
+        if clipped:
+            parts.append(clipped)
     if focus:
         parts.append(
             f"{UNTRUSTED_START}\n"
@@ -761,6 +820,51 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
 _PASS_ORDER = list(_PASS_SPECS)
 
 
+def _extract_json_block(content: str, fence: str) -> str:
+    """The first fenced block whose opening line contains ``fence`` marker."""
+    lines = content.splitlines()
+    collecting = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not collecting and stripped.startswith("```") and fence in stripped:
+            collecting = True
+            continue
+        if collecting and stripped.startswith("```"):
+            break
+        if collecting:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _extract_heading_section(content: str, heading: str) -> str:
+    """Lines of the `### <heading>` subsection, or '' when absent.
+
+    Fenced code blocks inside the subsection are skipped (they carry
+    diagrams/JSON, not the structured facts the design state needs).
+    """
+    out: list[str] = []
+    collecting = False
+    in_fence = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            if collecting:
+                continue
+        if stripped.startswith("### "):
+            collecting = heading.lower() in stripped.lower()
+            if collecting:
+                out.append(stripped)
+            continue
+        if collecting:
+            if stripped.startswith("## "):
+                break
+            if not in_fence:
+                out.append(line)
+    return "\n".join(line for line in out if line.strip())
+
+
 def _summary_of(pass_id: str, content: str) -> str:
     """Compact digest of a completed pass for inclusion in later prompts."""
     if pass_id == "technique":
@@ -770,13 +874,53 @@ def _summary_of(pass_id: str, content: str) -> str:
     return digest if len(digest) < 1500 else digest[:1470] + "\n[truncated]"
 
 
+def _design_state_entry(pass_id: str, content: str) -> str:
+    """The structured design-state entry one pass contributes.
+
+    Carries decisions, the component list, and key parameters between passes
+    (~600-800 tokens for the whole state) instead of the full pass text.
+    """
+    if pass_id == "technique":
+        # Method essentials: inputs/outputs/algorithm bullets stay compact.
+        return _summary_of(pass_id, content)[:1200]
+    if pass_id == "architecture":
+        components = _extract_heading_section(content, "Components")
+        decisions = _extract_heading_section(content, "Decision records")
+        parts = [p for p in (components, decisions) if p]
+        return "\n".join(parts)[:1800]
+    if pass_id == "data_contracts":
+        # Key parameters live in the pseudocode block's concrete defaults.
+        pseudo = _extract_json_block(content, "pseudocode") or _extract_json_block(content, "text")
+        contracts = _extract_heading_section(content, "Contracts")
+        parts = [p for p in (contracts, pseudo) if p]
+        return "\n".join(parts)[:1500]
+    if pass_id == "plan":
+        # Phase headings + task ids only (acceptance criteria stay in TASKS.md).
+        lines = [
+            ln.strip()
+            for ln in content.splitlines()
+            if ln.strip().startswith("### Phase") or re.match(r"^- \[[ xX]\] TASK-\d+", ln.strip())
+        ]
+        return "\n".join(lines)[:1500]
+    if pass_id == "hardware_fit":
+        table = _extract_heading_section(content, "Per-component")
+        rows = [ln for ln in table.splitlines() if ln.strip().startswith("|")]
+        return "\n".join(rows)[:1000]
+    return content[:800]
+
+
 def _context_summary(done: dict[str, str]) -> str:
+    """Structured design state carried between passes.
+
+    Decisions, component list, and key parameters (~600-800 tokens total) —
+    not the full text of earlier passes.
+    """
     parts = []
     for pass_id in _PASS_ORDER:
         if pass_id in done:
             title = _PASS_SPECS[pass_id]["title"]
-            summary = _summary_of(pass_id, done[pass_id])
-            parts.append(f"## {title} (written)\n{summary}")
+            entry = _design_state_entry(pass_id, done[pass_id])
+            parts.append(f"## {title} (state)\n{entry}")
     return "\n\n".join(parts)
 
 
@@ -801,9 +945,17 @@ def _pass_prompt(
         f"Design the technique below for a single developer. Write ONLY the "
         f"'{spec['title']}' section.\n\n"
         f"HARD CONSTRAINTS (treat as absolute):\n{_constraints_block(facts)}\n\n"
-        + (_grounding_block(grounding_text, focus) + "\n\n" if (grounding_text or focus) else "")
         + (
-            f"SECTIONS ALREADY WRITTEN (context; do not repeat them):\n{_context_summary(done)}\n\n"
+            _grounding_block(
+                grounding_text, focus, char_budget=GROUNDING_CHAR_BUDGETS.get(pass_id)
+            )
+            + "\n\n"
+            if (grounding_text or focus)
+            else ""
+        )
+        + (
+            f"DESIGN STATE (decisions, components, key parameters; do not repeat them):\n"
+            f"{_context_summary(done)}\n\n"
             if done
             else ""
         )
@@ -1044,7 +1196,7 @@ def _regenerate_section(
         f"found defective. Rewrite ONLY this section, fixing the defect.\n\n"
         f"HARD CONSTRAINTS (treat as absolute):\n{_constraints_block(facts)}\n\n"
         + (_grounding_block(grounding_text, focus) + "\n\n" if (grounding_text or focus) else "")
-        + f"SECTIONS ALREADY WRITTEN (context; do not repeat them):\n"
+        + f"DESIGN STATE (decisions, components, key parameters; do not repeat them):\n"
         f"{_context_summary({k: v for k, v in done.items() if k != pass_id})}\n\n"
         f"PREVIOUS '{spec['title']}' SECTION:\n{done.get(pass_id, '')[:4000]}\n\n"
         f"DEFECT FOUND ({defect['class']} in {defect['section'] or spec['title']}):\n"

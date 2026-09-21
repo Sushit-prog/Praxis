@@ -139,6 +139,7 @@ class LLMClient:
         stage: str | None = None,
         candidate_id: int | None = None,
         max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         model = _resolve_model(model) or self._model
         kwargs: dict[str, Any] = {
@@ -191,6 +192,10 @@ class LLMClient:
         for attempt_model in attempt_chain:
             kwargs["model"] = attempt_model
             _inject_provider_key(kwargs, attempt_model)
+            if reasoning_effort:
+                kwargs["reasoning_effort"] = reasoning_effort
+            else:
+                kwargs.pop("reasoning_effort", None)
             # An explicit caller max_tokens (e.g. the design engine clamping to
             # the model's OTPM limit) wins over the global PRAXIS_MAX_TOKENS.
             first_tokens = max_tokens if max_tokens is not None else _initial_max_tokens()
@@ -323,6 +328,7 @@ def call_llm(
     candidate_id: int | None = None,
     completion: Callable[..., Any] | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Call an LLM, optionally injecting a completion function for tests.
 
@@ -330,6 +336,8 @@ def call_llm(
     recorded alongside the call so spend can be attributed per stage and per
     candidate. ``max_tokens`` caps the output size for this call only (the
     design engine uses it to respect a model's OTPM free-tier limit).
+    ``reasoning_effort`` (``low``/``medium``/``high``) is passed to models that
+    support it (gpt-oss) to keep hidden reasoning tokens small.
     """
     client = LLMClient(completion=completion) if completion else get_client()
     return client.call(
@@ -339,6 +347,7 @@ def call_llm(
         stage=stage,
         candidate_id=candidate_id,
         max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
     )
 
 

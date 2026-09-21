@@ -612,9 +612,9 @@ def test_passes_run_in_specified_order(design_db, no_grounding, monkeypatch):
     generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
 
     assert titles_seen == list(PASS_IDS)  # technique, architecture, ... in order
-    # The plan pass prompt already contained the technique and architecture.
-    # (Verified structurally: later pass prompts embed an earlier summary.)
-    assert "SECTIONS ALREADY WRITTEN" in design_module._pass_prompt(
+    # The plan pass prompt already contained the design state (decisions,
+    # components, key parameters) from the earlier passes.
+    assert "DESIGN STATE" in design_module._pass_prompt(
         "plan",
         _Candidate(design_db),
         __import__("praxis.config", fromlist=["FactsSheet"]).FactsSheet(),
@@ -755,7 +755,11 @@ def test_injection_in_paper_does_not_alter_prompt_structure(
 
     assert len(prompts) == 10
     for prompt in prompts[:5]:
-        # Exactly one begin/end pair (ours); embedded markers were neutralized.
+        # The hardware_fit pass drops the paper chunks entirely (item 4); all
+        # other passes carry exactly one begin/end pair (ours), with embedded
+        # markers neutralized.
+        if "Hardware & Budget Fit" in prompt and start not in prompt:
+            continue
         assert prompt.count(start) == 1
         assert prompt.count(end) == 1
         assert "[untrusted-marker removed]" in prompt
@@ -883,3 +887,177 @@ def test_critic_auto_skip_note_on_request_too_large(design_db, no_grounding, mon
     assert "critic skipped:" in result.design_md
     # The content passes were stored; nothing was lost by the critic skip.
     assert set(result.completed_passes) == set(PASS_IDS)
+
+
+# ---------------------------------------------------------------------------
+# Item 4: compact design state, grounding budgets, reasoning_effort, 5k target
+# ---------------------------------------------------------------------------
+
+
+def test_design_state_is_structured_and_compact(design_db, no_grounding, monkeypatch):
+    """Later prompts carry decisions/components/params, not full pass text."""
+    import praxis.design as design_module
+
+    # A deliberately huge architecture pass: full text would blow the budget.
+    big_arch = GOOD_PASSES["architecture"] + ("\nPadding prose about nothing.\n" * 400)
+    passes = dict(GOOD_PASSES)
+    passes["architecture"] = big_arch
+    state = design_module._context_summary(passes)
+
+    assert "DR-1" in state  # decision records carried
+    assert "Retriever" in state  # component list carried
+    # The architecture entry is capped (per-pass), so bulk prose cannot blow
+    # up the state even when it hides inside a requested subsection.
+    arch_entry = design_module._design_state_entry("architecture", big_arch)
+    assert len(arch_entry) <= 1800
+    assert "Padding prose" not in design_module._design_state_entry(
+        "plan", GOOD_PASSES["plan"]
+    )
+    # Whole state stays within the ~600-800 token target.
+    assert len(state) <= 800 * 4 + 200
+
+
+def test_hardware_fit_pass_drops_paper_chunks(design_db, monkeypatch, tmp_path):
+    """The hardware_fit prompt contains no untrusted paper block."""
+    import praxis.design as design_module
+    import praxis.grounding as grounding_module
+
+    big_ground = grounding_module.Grounding(
+        chunks=["paper text " * 3000], provenance=["arXiv HTML"], source_kind="arxiv"
+    )
+    monkeypatch.setattr(design_module, "ground_candidate", lambda _c: big_ground)
+    monkeypatch.setenv("PRAXIS_GROUNDING_CACHE_DIR", str(tmp_path / "cache"))
+
+    prompts = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        prompts.append(prompt)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    fit_prompt = next(p for p in prompts if "## Hardware & Budget Fit" in p and "YOUR TASK" in p)
+    assert design_module.UNTRUSTED_START not in fit_prompt
+
+
+def test_plan_pass_grounding_is_capped(design_db, monkeypatch, tmp_path):
+    """The plan pass sees only a capped reminder of the source material."""
+    import praxis.design as design_module
+    import praxis.grounding as grounding_module
+
+    big_ground = grounding_module.Grounding(
+        chunks=["paper text " * 3000], provenance=["arXiv HTML"], source_kind="arxiv"
+    )
+    monkeypatch.setattr(design_module, "ground_candidate", lambda _c: big_ground)
+    monkeypatch.setenv("PRAXIS_GROUNDING_CACHE_DIR", str(tmp_path / "cache"))
+
+    prompts = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        prompts.append(prompt)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    plan_prompt = next(p for p in prompts if "Phased Implementation Plan" in p and "YOUR TASK" in p)
+    body = plan_prompt.split(design_module.UNTRUSTED_START, 1)[1]
+    body = body.split(design_module.UNTRUSTED_END, 1)[0]
+    assert len(body) <= design_module.GROUNDING_CHAR_BUDGETS["plan"] + 200
+    assert "[source material clipped for this pass]" in plan_prompt
+
+
+def test_gpt_oss_models_get_reasoning_effort_low(design_db, no_grounding, monkeypatch):
+    """gpt-oss calls carry reasoning_effort='low'; other models get none."""
+    import praxis.design as design_module
+
+    efforts = []
+
+    def fake_call_llm(prompt, system=None, model=None, reasoning_effort=None, **kwargs):
+        efforts.append((model, reasoning_effort))
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+    assert efforts, "expected design calls"
+    assert all(effort == "low" for _, effort in efforts)  # default model is gpt-oss
+
+
+def test_non_gpt_oss_model_gets_no_reasoning_effort(design_db, no_grounding, monkeypatch):
+    """A model without the knob never receives the parameter."""
+    import praxis.design as design_module
+
+    efforts = []
+
+    def fake_call_llm(prompt, system=None, model=None, reasoning_effort=None, **kwargs):
+        efforts.append(reasoning_effort)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/qwen/qwen3.8-27b")
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+    assert efforts and all(e is None for e in efforts)
+
+
+def test_pass_calls_target_5000_token_request(design_db, no_grounding, monkeypatch):
+    """With a large grounding block, prompts stay under the ~5k request target."""
+    import praxis.design as design_module
+
+    # 40k chars of source: bigger than the 5k-target budget, so the cap trims.
+    big_ground_text = "paper text " * 4000
+    prompts = []
+
+    def fake_call_llm(prompt, system=None, model=None, max_tokens=None, **kwargs):
+        prompts.append((prompt, max_tokens))
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        design_module,
+        "ground_candidate",
+        lambda _c: __import__("praxis.grounding", fromlist=["Grounding"]).Grounding(
+            chunks=[big_ground_text], provenance=["arXiv HTML"], source_kind="arxiv"
+        ),
+    )
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    for prompt, max_tokens in prompts[:5]:
+        input_tokens = len(prompt) // 4
+        assert input_tokens + (max_tokens or 0) <= design_module.DESIGN_REQUEST_TOKEN_CAP + 300
+    assert all(mt == design_module.DEFAULT_PASS_OUTPUT_TOKENS for _, mt in prompts[:5])
