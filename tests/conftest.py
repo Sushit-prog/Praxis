@@ -29,8 +29,14 @@ def _hermetic_model_env(monkeypatch):
     monkeypatch.delenv("PRAXIS_MODEL", raising=False)
     monkeypatch.delenv("PRAXIS_FALLBACK_MODELS", raising=False)
     # litellm's import side-effect also loads the project .env, which leaks
-    # hardware-profile overrides into facts-sheet/profile loading.
-    for var in ("PRAXIS_RAM_GB", "PRAXIS_CPU_ONLY", "PRAXIS_GPU", "PRAXIS_MONTHLY_BUDGET_USD"):
+    # hardware-profile overrides and the design model chain into tests.
+    for var in (
+        "PRAXIS_RAM_GB",
+        "PRAXIS_CPU_ONLY",
+        "PRAXIS_GPU",
+        "PRAXIS_MONTHLY_BUDGET_USD",
+        "PRAXIS_DESIGN_MODEL",
+    ):
         monkeypatch.delenv(var, raising=False)
     # The design engine's TPM pacing window is process-global; a fresh window
     # per test keeps paced sleeps (bounded, but up to ~90s) out of the suite.
