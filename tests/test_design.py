@@ -161,6 +161,7 @@ def design_db(db_engine, monkeypatch):
             "praxis.design",
             "praxis.discover",
             "praxis.design_io",
+            "praxis.export",
         )
     ]
     for module in modules:
