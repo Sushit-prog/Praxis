@@ -5,13 +5,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from praxis.config import HardwareProfile
+from praxis.config import FactsSheet, HardwareProfile, load_facts
 from praxis.db import BuildMemory, Candidate, Design, get_session
 from praxis.design import (
     PASS_IDS,
     DesignResult,
     render_agent_prompt,
     render_tasks_md,
+    target_machine_summary,
 )
 
 DESIGNS_DIR = Path("designs")
@@ -34,6 +35,7 @@ def write_design_files(
     profile: HardwareProfile,
     *,
     passes: dict[str, str] | None = None,
+    facts: FactsSheet | None = None,
     root: Path | None = None,
 ) -> Path:
     """Write DESIGN.md, TASKS.md, AGENT_PROMPT.md; return the design directory.
@@ -45,12 +47,13 @@ def write_design_files(
     title = (getattr(candidate, "title", "") or f"candidate-{result.candidate_id}").strip()
     out_dir = design_dir(result.candidate_id, title, root)
     out_dir.mkdir(parents=True, exist_ok=True)
+    facts = facts or load_facts()
 
     (out_dir / "DESIGN.md").write_text(result.design_md or "", encoding="utf-8")
     passes = passes or {}
-    (out_dir / "TASKS.md").write_text(render_tasks_md(passes), encoding="utf-8")
+    (out_dir / "TASKS.md").write_text(render_tasks_md(passes, facts=facts), encoding="utf-8")
     (out_dir / "AGENT_PROMPT.md").write_text(
-        render_agent_prompt(passes, profile, candidate), encoding="utf-8"
+        render_agent_prompt(passes, profile, candidate, facts=facts), encoding="utf-8"
     )
     return out_dir
 
@@ -59,6 +62,7 @@ def render_partial_md(
     passes: dict[str, str],
     candidate: Candidate,
     *,
+    facts: FactsSheet | None = None,
     error: str | None = None,
 ) -> str:
     """Render DESIGN.partial.md: every completed pass + the missing ones.
@@ -67,6 +71,7 @@ def render_partial_md(
     inspectable on disk (and resumable via ``praxis design <id> --resume``).
     """
     title = (getattr(candidate, "title", "") or "Design").strip()
+    facts = facts or FactsSheet()
     completed = [p for p in PASS_IDS if (passes.get(p) or "").strip()]
     missing = [p for p in PASS_IDS if p not in completed]
     lines = [
@@ -74,6 +79,8 @@ def render_partial_md(
         "",
         f"_Candidate #{getattr(candidate, 'id', '?')} · "
         f"{getattr(candidate, 'url', '') or 'n/a'}_",
+        "",
+        f"**Target machine:** {target_machine_summary(facts)}",
         "",
         f"**Incomplete design — {len(completed)} of {len(PASS_IDS)} passes done.**",
     ]
@@ -95,6 +102,7 @@ def write_partial_design(
     candidate: Candidate,
     passes: dict[str, str],
     *,
+    facts: FactsSheet | None = None,
     error: str | None = None,
     root: Path | None = None,
 ) -> Path:
@@ -105,7 +113,9 @@ def write_partial_design(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "DESIGN.partial.md"
-    path.write_text(render_partial_md(passes, candidate, error=error), encoding="utf-8")
+    path.write_text(
+        render_partial_md(passes, candidate, facts=facts, error=error), encoding="utf-8"
+    )
     return path
 
 

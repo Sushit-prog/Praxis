@@ -29,6 +29,25 @@ def _force_utf8_stdio() -> None:
                 pass
 
 
+def _add_hardware_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--hardware",
+        metavar="PATH",
+        help="Use a specific hardware profile instead of detecting the current host.",
+    )
+    parser.add_argument(
+        "--no-detect",
+        action="store_true",
+        help="Disable host detection and use PRAXIS_CONFIG or hardware_profile.yaml.",
+    )
+
+
+def _hardware_detect_arg(args) -> bool | None:
+    if args.no_detect or args.hardware:
+        return False
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="praxis",
@@ -38,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=False)
 
     run = sub.add_parser("run", help="Run the Scout -> Analyst -> Architect -> Coder pipeline.")
+    _add_hardware_options(run)
     run.add_argument("--source", choices=["arxiv", "github", "hn"], default="arxiv")
     run.add_argument("--topic", required=True, help="Topic to scout for candidates.")
     run.add_argument("--limit", type=int, default=20, help="Max candidates to scout (default: 20).")
@@ -116,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    specs_parser = sub.add_parser(
+        "specs", help="Show detected host hardware and effective design constraints."
+    )
+    specs_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+
     review = sub.add_parser("review", help="Review borderline candidates (human-in-the-loop gate).")
     review_sub = review.add_subparsers(dest="review_action")
     approve_parser = review_sub.add_parser(
@@ -158,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     design_parser = sub.add_parser(
         "design", help="Generate a multi-pass design document for a candidate."
     )
+    _add_hardware_options(design_parser)
     design_parser.add_argument("candidate_id", type=int, help="Candidate id to design.")
     design_parser.add_argument("--focus", help="Optional focus note steering the design.")
     design_parser.add_argument(
@@ -253,14 +279,17 @@ def _ensure_schema() -> None:
 
 
 def _cmd_run(args) -> int:
+    from praxis.config import load_config
     from praxis.pipeline import format_summary, run
 
+    detect = _hardware_detect_arg(args)
     result = run(
         source=args.source,
         topic=args.topic,
         limit=args.limit,
         resume=args.resume,
         prototype=args.prototype,
+        config=load_config(args.hardware, detect=detect),
     )
     print(format_summary(result))
     # A batch-level stage failure (e.g. scout) must be visible in the exit code.
@@ -438,6 +467,56 @@ def _cmd_doctor(args) -> int:
     return 0
 
 
+def _cmd_specs(args) -> int:
+    import json
+    import os
+    from dataclasses import asdict
+
+    from praxis.config import load_facts
+    from praxis.hardware import detect_host_hardware, format_host_hardware
+
+    configured = os.environ.get("PRAXIS_DETECT_HW")
+    detect = configured is None or configured.strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    host = detect_host_hardware() if detect else None
+    facts = load_facts(detect=detect, detected_host=host)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "detected_host": asdict(host) if host is not None else None,
+                    "effective_facts": asdict(facts),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print("Detected host:")
+    print(format_host_hardware(host) if host is not None else "  detection disabled")
+    print("\nEffective design constraints:")
+    source = "detected host + policy profile" if facts.detected else "configured profile"
+    print(f"  Source: {source}")
+    print(f"  OS: {facts.os}")
+    print(f"  CPU: {facts.cpu} ({facts.cpu_cores or 'unknown'} logical cores)")
+    print(f"  CPU-only: {'yes' if facts.cpu_only else 'no'}")
+    print(f"  GPU: {facts.gpu_name} ({'available' if facts.gpu else 'unavailable'})")
+    print(
+        f"  RAM: {facts.ram_gb} GB total / {facts.usable_ram_gb} GB usable"
+    )
+    storage = facts.storage_free_gb if facts.storage_free_gb is not None else "unknown"
+    print(f"  Free storage: {storage} GB")
+    print(f"  Monthly budget: ${facts.monthly_budget_usd:.2f}")
+    print(f"  Local only: {'yes' if facts.local_only else 'no'}")
+    if facts.preferred_stack:
+        print(f"  Preferred stack: {', '.join(facts.preferred_stack)}")
+    return 0
+
+
 def _cmd_review(args) -> int:
     from praxis.review import approve, pending_candidates, reject
 
@@ -513,18 +592,22 @@ def _design_and_write(
     profile,
     *,
     focus,
+    facts=None,
     depth="standard",
     model=None,
     rerun_passes=None,
     run_critic=True,
 ) -> int:
     """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
+    from praxis.config import load_facts
     from praxis.design import generate_design
     from praxis.design_io import write_design_files, write_partial_design
 
+    facts = facts or load_facts()
     result = generate_design(
         candidate,
         profile,
+        facts=facts,
         depth=depth,
         focus=focus,
         model=model,
@@ -546,7 +629,7 @@ def _design_and_write(
         finally:
             session.close()
         partial_path = write_partial_design(
-            candidate, stored_passes, error=result.error
+            candidate, stored_passes, facts=facts, error=result.error
         )
         print(
             f"error: design failed for candidate {result.candidate_id}: "
@@ -569,7 +652,7 @@ def _design_and_write(
     finally:
         session.close()
 
-    out_dir = write_design_files(result, candidate, profile, passes=passes)
+    out_dir = write_design_files(result, candidate, profile, passes=passes, facts=facts)
     print(
         f"design complete: candidate {result.candidate_id} "
         f"({len(result.defects)} critic defect(s) addressed)"
@@ -590,11 +673,17 @@ def _design_and_write(
 
 
 def _cmd_discover(args) -> int:
-    from praxis.config import load_config
+    from praxis.config import HardwareProfile, load_facts
     from praxis.design_io import record_pick
     from praxis.discover import discover, focus_note, format_table, prompt_pick
 
-    profile = load_config()
+    facts = load_facts()
+    profile = HardwareProfile(
+        cpu_only=facts.cpu_only,
+        ram_gb=facts.ram_gb,
+        gpu=facts.gpu,
+        monthly_budget_usd=facts.monthly_budget_usd,
+    )
     result = discover(args.source, args.topic, limit=args.limit, profile=profile)
     print(format_table(result))
     if not result.pickable:
@@ -621,7 +710,7 @@ def _cmd_discover(args) -> int:
         print("error: picked candidate is not persisted", file=sys.stderr)
         return 1
     record_pick(candidate_id, row.technique, focus)
-    return _design_and_write(row.candidate, profile, focus=focus)
+    return _design_and_write(row.candidate, profile, focus=focus, facts=facts)
 
 
 def _print_design_passes(candidate_id: int) -> int:
@@ -657,7 +746,7 @@ def _print_design_passes(candidate_id: int) -> int:
 
 
 def _cmd_design(args) -> int:
-    from praxis.config import load_config
+    from praxis.config import HardwareProfile, load_facts
     from praxis.design import PASS_IDS
     from praxis.discover import get_candidate
 
@@ -668,7 +757,14 @@ def _cmd_design(args) -> int:
     if candidate is None:
         print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
         return 1
-    profile = load_config()
+    detect = _hardware_detect_arg(args)
+    facts = load_facts(args.hardware, detect=detect)
+    profile = HardwareProfile(
+        cpu_only=facts.cpu_only,
+        ram_gb=facts.ram_gb,
+        gpu=facts.gpu,
+        monthly_budget_usd=facts.monthly_budget_usd,
+    )
     rerun_passes = None
     if args.rerun_pass is not None:
         rerun_passes = [PASS_IDS[args.rerun_pass - 1]]
@@ -680,6 +776,7 @@ def _cmd_design(args) -> int:
         candidate,
         profile,
         focus=args.focus,
+        facts=facts,
         depth=args.depth,
         model=args.model,
         rerun_passes=rerun_passes,
@@ -729,7 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Every command reads or writes the ledger; make sure the tables exist so a
     # fresh checkout gets clean empty output instead of "no such table" errors.
-    if args.command is not None:
+    if args.command is not None and args.command != "specs":
         _ensure_schema()
 
     if args.command == "run":
@@ -751,6 +848,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_providers(args)
     if args.command == "doctor":
         return _cmd_doctor(args)
+    if args.command == "specs":
+        return _cmd_specs(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "export":

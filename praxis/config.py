@@ -1,4 +1,4 @@
-"""Hardware profile + budget loading from YAML and environment variables."""
+"""Hardware facts, policy, and budget loading for detected and configured hosts."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+from praxis.hardware import HostHardware
+from praxis.hardware import detect_host_hardware as _detect_host_hardware
 
 DEFAULT_CONFIG_PATH = "hardware_profile.yaml"
 
@@ -73,24 +76,19 @@ def _load_yaml(path: str | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def load_config(path: str | None = None) -> HardwareProfile:
-    """Load a HardwareProfile, preferring env vars over YAML over defaults."""
-    data = _load_yaml(path)
-
-    cpu_only_raw = _env("CPU_ONLY") if _env("CPU_ONLY") is not None else data.get("cpu_only", True)
-    ram_raw = _env("RAM_GB") if _env("RAM_GB") is not None else data.get("ram_gb", 8)
-    gpu_raw = _env("GPU") if _env("GPU") is not None else data.get("gpu", False)
-    budget_raw = (
-        _env("MONTHLY_BUDGET_USD")
-        if _env("MONTHLY_BUDGET_USD") is not None
-        else data.get("monthly_budget_usd", 15.0)
-    )
-
+def load_config(
+    path: str | None = None,
+    *,
+    detect: bool | None = None,
+    detected_host: HostHardware | None = None,
+) -> HardwareProfile:
+    """Load the effective target profile from env, detection, YAML, then defaults."""
+    facts = load_facts(path, detect=detect, detected_host=detected_host)
     return HardwareProfile(
-        cpu_only=_to_bool(cpu_only_raw),
-        ram_gb=_to_int(ram_raw, default=8),
-        gpu=_to_bool(gpu_raw),
-        monthly_budget_usd=_to_float(budget_raw, default=15.0),
+        cpu_only=facts.cpu_only,
+        ram_gb=facts.ram_gb,
+        gpu=facts.gpu,
+        monthly_budget_usd=facts.monthly_budget_usd,
     )
 
 
@@ -117,6 +115,13 @@ class FactsSheet:
     preferred_stack: list[str] = field(default_factory=list)
     stack_notes: list[str] = field(default_factory=list)
     avoid: list[str] = field(default_factory=list)
+    cpu_cores: int | None = None
+    gpu_name: str = "unknown"
+    gpu_note: str = ""
+    ram_note: str = ""
+    storage_free_gb: int | None = None
+    detected: bool = False
+    detection_note: str = ""
 
 
 @dataclass
@@ -179,28 +184,153 @@ def _as_list(value: Any) -> list[str]:
     return []
 
 
-def load_facts(path: str | None = None) -> FactsSheet:
-    """Load the facts sheet: env vars > YAML > defaults, tolerant of missing keys."""
-    data = _load_yaml(path)
+def _detection_enabled(path: str | None, detect: bool | None) -> bool:
+    """Should the host be probed? Env flag > explicit arg > default on.
 
-    ram_raw = _env("RAM_GB") if _env("RAM_GB") is not None else data.get("ram_gb", 8)
-    cpu_only_raw = _env("CPU_ONLY") if _env("CPU_ONLY") is not None else data.get("cpu_only", True)
-    gpu_raw = _env("GPU") if _env("GPU") is not None else data.get("gpu", False)
+    ``PRAXIS_CONFIG`` only selects the fallback facts file; it does NOT disable
+    detection. Probing is off when an explicit ``detect`` is passed (CLI
+    ``--hardware``/``--no-detect``), when ``PRAXIS_DETECT_HW`` is falsy, or
+    when the caller passed an explicit file path (that file is the record).
+    """
+    if detect is not None:
+        return detect
+    configured = _env("DETECT_HW")
+    if configured is not None:
+        return _to_bool(configured)
+    return path is None
+
+
+def _resolve_host(
+    path: str | None,
+    detect: bool | None,
+    detected_host: HostHardware | None,
+) -> HostHardware | None:
+    if detected_host is not None:
+        return detected_host
+    if not _detection_enabled(path, detect):
+        return None
+    try:
+        return _detect_host_hardware()
+    except Exception:
+        return None
+
+
+def _effective_str(
+    env_name: str,
+    preferred: Any,
+    fallback: str | None,
+    default: str,
+) -> str:
+    """Precedence: env > preferred (YAML record) > fallback (probe) > default."""
+    env_value = _env(env_name)
+    if env_value is not None:
+        return env_value
+    for candidate in (preferred, fallback):
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if text and text.lower() != "unknown":
+            return text
+    return default
+
+
+def _effective_int(
+    env_name: str,
+    preferred: Any,
+    fallback: int | None,
+    default: int,
+) -> int:
+    """Precedence: env > preferred (YAML record) > fallback (probe) > default."""
+    env_value = _env(env_name)
+    raw = env_value if env_value is not None else preferred
+    if raw is None:
+        raw = fallback
+    return _to_int(raw, default=default)
+
+
+def _effective_optional_int(
+    env_name: str,
+    preferred: Any,
+    fallback: Any,
+) -> int | None:
+    """Precedence: env > preferred (YAML record) > fallback (probe)."""
+    env_value = _env(env_name)
+    raw = env_value if env_value is not None else preferred
+    if raw is None:
+        raw = fallback
+    return _to_int(raw, default=0) if raw is not None else None
+
+
+def load_facts(
+    path: str | None = None,
+    *,
+    detect: bool | None = None,
+    detected_host: HostHardware | None = None,
+) -> FactsSheet:
+    """Load env > YAML > detected host > defaults, tolerant of missing keys.
+
+    The YAML file is the curated record, so it wins over the live probe for
+    stable facts (OS, CPU, GPU identity, RAM ceiling). Free storage and the
+    usable-RAM headroom are volatile: a live probe overrides the YAML snapshot,
+    which goes stale. Env vars always win; the probe fills whatever neither
+    specifies.
+    """
+    data = _load_yaml(path)
+    host = _resolve_host(path, detect, detected_host)
+
+    ram_gb = _effective_int("RAM_GB", data.get("ram_gb"), host.ram_gb if host else None, 8)
+    # Volatile: the live probe beats the YAML snapshot (it goes stale).
+    if _env("USABLE_RAM_GB") is not None:
+        usable_ram_gb = _effective_optional_int("USABLE_RAM_GB", None, None)
+    else:
+        usable_ram_gb = _effective_optional_int(
+            "USABLE_RAM_GB",
+            host.usable_ram_gb if host else None,
+            data.get("usable_ram_gb"),
+        )
+    if usable_ram_gb is None:
+        usable_ram_gb = max(1, ram_gb - 4)
+
+    # cpu_only/gpu: an explicit YAML value wins over the probe; a missing or
+    # null key defers to detection (falling back to the CPU-only defaults).
+    if _env("CPU_ONLY") is not None:
+        cpu_only = _to_bool(_env("CPU_ONLY"))
+    elif data.get("cpu_only") is not None:
+        cpu_only = _to_bool(data["cpu_only"])
+    elif host is not None and host.gpu is not None:
+        cpu_only = not host.gpu
+    else:
+        cpu_only = True
+
+    if _env("GPU") is not None:
+        gpu = _to_bool(_env("GPU"))
+    elif data.get("gpu") is not None:
+        gpu = _to_bool(data["gpu"])
+    elif host is not None and host.gpu is not None:
+        gpu = host.gpu
+    else:
+        gpu = False
+
+    if host is not None and host.gpu is not None:
+        detected_gpu_name = host.gpu_name
+        detected_gpu_note = host.gpu_note
+    else:
+        detected_gpu_name = None
+        detected_gpu_note = None
+
     budget_raw = (
         _env("MONTHLY_BUDGET_USD")
         if _env("MONTHLY_BUDGET_USD") is not None
         else data.get("monthly_budget_usd", 15.0)
     )
-
-    ram_gb = _to_int(ram_raw, default=8)
-    default_headroom = max(1, ram_gb - 4)
     return FactsSheet(
-        os=str(data.get("os") or "Windows 11"),
-        cpu=str(data.get("cpu") or "unknown"),
-        cpu_only=_to_bool(cpu_only_raw),
-        gpu=_to_bool(gpu_raw),
+        os=_effective_str("OS", data.get("os"), host.os if host else None, "Windows 11"),
+        cpu=_effective_str("CPU", data.get("cpu"), host.cpu if host else None, "unknown"),
+        cpu_only=cpu_only,
+        gpu=gpu,
+        gpu_name=_effective_str("GPU_NAME", data.get("gpu_name"), detected_gpu_name, "unknown"),
         ram_gb=ram_gb,
-        usable_ram_gb=_to_int(data.get("usable_ram_gb"), default=default_headroom),
+        usable_ram_gb=usable_ram_gb,
         monthly_budget_usd=_to_float(budget_raw, default=15.0),
         local_only=_to_bool(data.get("local_only", True)),
         provider_limits=_as_list(data.get("provider_limits")),
@@ -208,6 +338,21 @@ def load_facts(path: str | None = None) -> FactsSheet:
         preferred_stack=_as_list(data.get("preferred_stack")),
         stack_notes=_as_list(data.get("stack_notes")),
         avoid=_as_list(data.get("avoid")),
+        cpu_cores=_effective_optional_int(
+            "CPU_CORES", data.get("cpu_cores"), host.cpu_cores if host else None
+        ),
+        gpu_note=_effective_str("GPU_NOTE", data.get("gpu_note"), detected_gpu_note, ""),
+        ram_note=_effective_str(
+            "RAM_NOTE", data.get("ram_note"), host.ram_note if host else None, ""
+        ),
+        # Volatile: the live probe beats the YAML snapshot.
+        storage_free_gb=_effective_optional_int(
+            "STORAGE_FREE_GB",
+            host.storage_free_gb if host else None,
+            data.get("storage_free_gb"),
+        ),
+        detected=host is not None,
+        detection_note=host.detection_note if host else "",
     )
 
 
@@ -229,16 +374,44 @@ def resolve_model_limits(facts: FactsSheet, model: str) -> ModelLimits | None:
 
 def render_facts_sheet(facts: FactsSheet) -> str:
     """Render the facts sheet as a hard-constraints block for every design pass."""
-    gpu_line = "GPU available" if facts.gpu else "no GPU (CPU-only)"
+    if facts.gpu:
+        gpu_line = f"{facts.gpu_name} (GPU available)"
+    elif facts.gpu_name.lower() != "unknown":
+        gpu_line = f"{facts.gpu_name} (no GPU available; CPU-only)"
+    else:
+        gpu_line = "no GPU (CPU-only)"
     lines = [
         "## Hardware & budget facts (HARD CONSTRAINTS)",
         f"- OS: {facts.os}",
-        f"- CPU: {facts.cpu} — {gpu_line}",
+        f"- CPU: {facts.cpu}"
+        + (f" ({facts.cpu_cores} logical cores)" if facts.cpu_cores is not None else ""),
+        f"- CPU-only execution: {'yes' if facts.cpu_only else 'no'}",
+        f"- GPU: {gpu_line}",
         f"- RAM: {facts.ram_gb} GB total, shared with the OS — plan for about "
         f"{facts.usable_ram_gb} GB usable headroom for the app",
-        f"- Monthly budget: ${facts.monthly_budget_usd:.2f} (hard limit)",
-        f"- Runs locally: {'yes (no VPS unless justified)' if facts.local_only else 'no'}",
     ]
+    if facts.storage_free_gb is not None:
+        lines.append(
+            f"- Free storage: {facts.storage_free_gb} GB on the current working volume"
+        )
+    if facts.ram_note:
+        lines.append(f"- RAM detail: {facts.ram_note}")
+    if facts.gpu_note:
+        lines.append(f"- GPU detail: {facts.gpu_note}")
+    if facts.detected:
+        lines.append(
+            "- Host probe: succeeded - live free-storage and usable-RAM readings "
+            "override this file's snapshot"
+        )
+    if facts.detection_note:
+        lines.append(f"- Runtime note: {facts.detection_note}")
+    lines.extend(
+        [
+            f"- Monthly budget: ${facts.monthly_budget_usd:.2f} (hard limit)",
+            f"- Runs locally: "
+            f"{'yes (no VPS unless justified)' if facts.local_only else 'no'}",
+        ]
+    )
     if facts.provider_limits:
         lines.append("- Provider free-tier limits:")
         lines.extend(f"  - {limit}" for limit in facts.provider_limits)

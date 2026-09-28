@@ -6,10 +6,11 @@ import json
 
 import pytest
 
-from praxis.config import HardwareProfile
+from praxis.config import FactsSheet, HardwareProfile
 from praxis.db import Candidate, Design
 from praxis.design import (
     PASS_IDS,
+    _hard_constraint_lines,
     assemble_design_md,
     build_hardware_fit_anchor,
     generate_design,
@@ -106,7 +107,7 @@ def test_hardware_fit_anchor_contains_profile_values(hardware_profile):
     from praxis.config import load_facts
 
     md = build_hardware_fit_anchor(load_facts(), hardware_profile)
-    assert "### Hard constraints (from hardware_profile.yaml)" in md
+    assert "### Target machine (effective constraints)" in md
     assert f"{hardware_profile.ram_gb} GB" in md
     assert f"${hardware_profile.monthly_budget_usd:.2f}" in md
     assert "Windows" in md
@@ -233,7 +234,7 @@ def test_generate_design_runs_all_passes_and_critic(design_db, no_grounding, mon
     assert set(result.completed_passes) == set(PASS_IDS)
     assert result.design_md.startswith("# Design: CPU Fine-Tune")
     assert "## Hardware & Budget Fit" in result.design_md
-    assert "### Hard constraints (from hardware_profile.yaml)" in result.design_md
+    assert "### Target machine (effective constraints)" in result.design_md
     assert "Critic pass completed with no defects." in result.design_md
     # 5 content passes + 5 chunked critic calls (one per section), all on the
     # resolved default design model.
@@ -421,6 +422,21 @@ def test_design_rubric_passes_good_doc(hardware_profile):
     } <= names
 
 
+def test_hard_constraint_lines_include_fact_notes():
+    facts = FactsSheet(
+        gpu_name="Intel Iris Xe Graphics",
+        gpu_note="Iris Xe integrated graphics, not CUDA-capable",
+        ram_note="8 GB total / about 4 GB headroom",
+        storage_free_gb=7,
+    )
+    lines = _hard_constraint_lines(facts)
+    gpu_line = next(line for line in lines if line.startswith("- GPU:"))
+    assert "none usable (Intel Iris Xe Graphics is integrated; CPU-only)" in gpu_line
+    assert "not CUDA-capable" in gpu_line
+    assert any(line.startswith("- RAM detail: 8 GB total") for line in lines)
+    assert "- Free storage: 7 GB" in lines
+
+
 def test_design_rubric_flags_missing_sections_and_unlabelled_claims(hardware_profile):
     md = (
         "# Design: X\n\n"
@@ -536,10 +552,10 @@ def test_assembled_hardware_fit_keeps_anchor_after_pass_content(hardware_profile
     md = assemble_design_md(GOOD_PASSES, hardware_profile, _Candidate(1), facts=load_facts())
     fit = md.split("## Hardware & Budget Fit", 1)[1]
     assert "### Per-component RAM/CPU/$ table" in fit  # from the pass
-    assert "### Hard constraints (from hardware_profile.yaml)" in fit  # anchor
-    assert "### Windows-specific pitfalls" in fit  # anchor
+    assert "### Target machine (effective constraints)" in fit  # anchor
+    assert "### OS-specific pitfalls" in fit  # anchor
     # The anchor lands before the next pass heading, inside the section.
-    assert fit.index("Hard constraints") < fit.index("## Critic review")
+    assert fit.index("### Target machine") < fit.index("## Critic review")
 
 
 def test_system_prompt_is_staff_engineer_persona():

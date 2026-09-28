@@ -3,13 +3,26 @@
 # Missing keys fall back to defaults in praxis/config.py::load_facts. Every
 # value here is rendered into design passes as a hard constraint, so keep it
 # accurate; label anything you have not verified.
-os: Windows 11
-cpu: Intel i5
+#
+# Precedence: env > this file > live host detection > defaults, EXCEPT the
+# volatile readings (storage_free_gb, usable_ram_gb) where a live probe
+# overrides this file's snapshot, which goes stale.
+os: Windows 11 + WSL2
+# Probed Sep 2026: "Intel64 Family 6 Model 154 Stepping 4, GenuineIntel",
+# 12 logical cores.
+cpu: Intel Core (HP 15s laptop)
+cpu_cores: 12
 cpu_only: true
 gpu: null
+gpu_name: Intel Iris Xe Graphics
+gpu_note: "Intel Iris Xe integrated graphics, ~4 GB shared memory - not CUDA-capable; CPU-only execution"
 ram_gb: 8
 # RAM is shared with the OS: the app should plan for this much usable headroom.
 usable_ram_gb: 4
+ram_note: "8 GB total / 7.68 GB reported / about 4 GB app headroom (shared with Windows)"
+# Snapshot of free space on the working volume (Sep 2026); a live probe
+# overrides this value, so treat it as a fallback only.
+storage_free_gb: 46
 monthly_budget_usd: 15.0
 # Runs locally; a VPS is out unless the design explicitly justifies one.
 local_only: true
@@ -19,11 +32,13 @@ preferred_stack:
   - SQLite
   - Groq API
 stack_notes:
-  - "Local generative models: llama.cpp with GGUF quantized weights (CPU), sized to the usable-RAM headroom"
+  - "Local generative models: Ollama serving a 2B-class model (e.g. llama3.2:3b), llama.cpp with GGUF quantized weights (CPU), sized to the usable-RAM headroom"
+  - "Runtime: Python 3.13 on Windows"
   - "Embeddings: use a small dedicated embedding model (e.g. a compact sentence-transformer), not the generative LLM"
   - "Persistence: prefer SQLite unless the design proves it insufficient"
   - "Avoid CUDA-only libraries entirely — the machine is CPU-only"
   - "Docker / WSL2 only if the design explicitly justifies it; otherwise plain Python on Windows"
+  - "If local 2B quality is insufficient, an OPTIONAL hosted 70B-class fallback exists (see provider_limits): a rate-limited free endpoint; the design must remain fully functional without it"
 avoid:
   - Docker-heavy pipelines
   - local GPU-required models
@@ -33,6 +48,7 @@ avoid:
 provider_limits:
   - "openrouter: UNVERIFIED: check before relying"
   - "cerebras: UNVERIFIED: check before relying"
+  - "nvidia_nim: OPTIONAL hosted 70B-class fallback (litellm id nvidia_nim/nvidia/nemotron-3-super-120b-a12b, needs NVIDIA_NIM_API_KEY) - rate-limited free endpoint; designs must not depend on it"
 # Per-model free-tier rate limits; each limit is optional and a model with no
 # entry here (or a missing limit) is NOT throttled by the design engine.
 model_limits:

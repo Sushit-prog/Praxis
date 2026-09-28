@@ -31,13 +31,27 @@ def _hermetic_model_env(monkeypatch):
     # litellm's import side-effect also loads the project .env, which leaks
     # hardware-profile overrides and the design model chain into tests.
     for var in (
+        "PRAXIS_CONFIG",
+        "PRAXIS_DETECT_HW",
+        "PRAXIS_OS",
+        "PRAXIS_CPU",
+        "PRAXIS_CPU_CORES",
         "PRAXIS_RAM_GB",
+        "PRAXIS_USABLE_RAM_GB",
         "PRAXIS_CPU_ONLY",
         "PRAXIS_GPU",
+        "PRAXIS_GPU_NAME",
+        "PRAXIS_GPU_NOTE",
+        "PRAXIS_RAM_NOTE",
+        "PRAXIS_STORAGE_FREE_GB",
         "PRAXIS_MONTHLY_BUDGET_USD",
         "PRAXIS_DESIGN_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Host detection stays off by default so the suite is host-independent;
+    # detection tests opt in via PRAXIS_DETECT_HW / detected_host= with a
+    # mocked probe (see tests/test_facts.py and tests/test_hardware.py).
+    monkeypatch.setenv("PRAXIS_DETECT_HW", "0")
     # The design engine's TPM pacing window is process-global; a fresh window
     # per test keeps paced sleeps (bounded, but up to ~90s) out of the suite.
     # The sleeps themselves are neutralized: rate-limit waiting is covered by
