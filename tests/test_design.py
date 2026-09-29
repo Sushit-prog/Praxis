@@ -291,6 +291,88 @@ def test_generate_design_regenerates_flagged_sections(design_db, no_grounding, m
     assert md.count("## Critic review") == 1
 
 
+def test_regenerate_section_is_paced_and_ceiling_clamped(design_db, no_grounding, monkeypatch):
+    import praxis.design as design_module
+    from praxis.config import load_facts
+
+    defect_json = json.dumps(
+        {
+            "defects": [
+                {
+                    "class": "UNCOVERED_COMPONENT",
+                    "section": "Architecture",
+                    "defect": "Retriever has no task.",
+                    "fix": "Add a Retriever task to Phase 1.",
+                }
+            ]
+        }
+    )
+    facts = load_facts()
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/qwen/qwen3.8-27b")
+    expected = design_module.resolve_pass_output_tokens("groq/qwen/qwen3.8-27b", facts)
+
+    pace_calls: list[tuple[str, int]] = []
+    orig_pace = design_module._wait_for_tpm_budget
+
+    def spy_pace(
+        model,
+        prompt,
+        facts,
+        *,
+        output_tokens=design_module.DEFAULT_PASS_OUTPUT_TOKENS,
+        progress_label="",
+    ):
+        pace_calls.append((progress_label, output_tokens))
+        return orig_pace(
+            model, prompt, facts, output_tokens=output_tokens, progress_label=progress_label
+        )
+
+    monkeypatch.setattr(design_module, "_wait_for_tpm_budget", spy_pace)
+
+    regen_max_tokens: list[int | None] = []
+
+    def fake_call_llm(prompt, system=None, model=None, max_tokens=None, **kwargs):
+        if "REQUIRED FIX" in prompt:  # the regenerate prompt, unique to it
+            regen_max_tokens.append(max_tokens)
+        if "Review it against the defect classes" in prompt:
+            # Flag Architecture the first time it is reviewed, then clear.
+            if "SECTION UNDER REVIEW: 'Architecture'" in prompt:
+                if not hasattr(fake_call_llm, "flagged"):
+                    fake_call_llm.flagged = True
+                    return defect_json
+                return json.dumps({"defects": []})
+            return json.dumps({"defects": []})
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    monkeypatch.setattr(design_module, "PASS_PACING_S", 0.0)
+
+    result = generate_design(
+        _Candidate(design_db), HardwareProfile(), facts=facts, pace_seconds=0.0
+    )
+
+    assert result.status == "complete"
+    assert len(result.defects) == 1  # the section was flagged and really regenerated
+
+    # The regenerate call is paced like the content and critic calls...
+    regen_pace = [
+        (label, tokens) for label, tokens in pace_calls if label.startswith("regenerate ")
+    ]
+    assert regen_pace, (
+        f"expected a paced regenerate call; labels={[label for label, _ in pace_calls]}"
+    )
+    assert all(tokens == expected for _, tokens in regen_pace)
+
+    # ...and its max_tokens is ceiling-clamped like the other passes.
+    assert regen_max_tokens, "expected a regenerate call"
+    assert all(t == expected for t in regen_max_tokens)
+    assert expected == 1000  # otpm=1000 fallback from the repo YAML
+
+
 def test_generate_design_failure_mid_pass_is_resumable(design_db, no_grounding, monkeypatch):
     import praxis.design as design_module
 

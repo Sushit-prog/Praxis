@@ -1297,8 +1297,19 @@ def _regenerate_section(
         f"Respond with the corrected markdown of the '{spec['title']}' section "
         f"only (start with its '## {spec['title']}' heading)."
     )
+    prompt = cap_pass_prompt_chars(prompt)
+    # Same treatment as the content passes: pace the request, and clamp the
+    # output budget to the model's per-request ceiling (max_output, else otpm).
+    regen_max_tokens = resolve_pass_output_tokens(model, facts)
+    _wait_for_tpm_budget(
+        model,
+        prompt,
+        facts,
+        output_tokens=regen_max_tokens,
+        progress_label=f"regenerate {spec['title']}",
+    )
     return _design_llm_call(
-        cap_pass_prompt_chars(prompt),
+        prompt,
         system=SYSTEM_PROMPT,
         model=model,
         stage="design",
@@ -1306,6 +1317,7 @@ def _regenerate_section(
         completion=completion,
         facts=facts,
         progress_label=f"regenerate {spec['title']}",
+        max_tokens=regen_max_tokens,
     )
 
 
