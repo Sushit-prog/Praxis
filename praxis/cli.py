@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from praxis.design import PASS_IDS
+from praxis.planning import PACK_PASS_IDS
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -226,6 +227,50 @@ def build_parser() -> argparse.ArgumentParser:
             "(works for in-progress designs too) instead of generating."
         ),
     )
+
+    plan_parser = sub.add_parser(
+        "plan",
+        help=(
+            "Generate the coding-agent docs pack (PRD, TASKS, README, ...) "
+            "for a designed candidate."
+        ),
+    )
+    _add_hardware_options(plan_parser)
+    plan_parser.add_argument("candidate_id", type=int, help="Candidate id to plan.")
+    plan_parser.add_argument(
+        "--pass",
+        dest="rerun_pass",
+        type=int,
+        default=None,
+        metavar="N",
+        choices=range(1, len(PACK_PASS_IDS) + 1),
+        help=(
+            "Re-run only pack pass N (1=prd, 2=rules, 3=test_plan, "
+            "4=security, 5=readme, 6=env_example), keeping the other stored "
+            "pack documents."
+        ),
+    )
+    plan_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue a partial docs pack from the stored pack documents "
+            "instead of restarting it."
+        ),
+    )
+    plan_parser.add_argument(
+        "--critic",
+        dest="run_critic",
+        action="store_true",
+        help="Run the chunked critic over the pack documents (off by default).",
+    )
+    plan_parser.add_argument(
+        "--no-critic",
+        dest="run_critic",
+        action="store_false",
+        help="Skip the pack critic (default).",
+    )
+    plan_parser.set_defaults(run_critic=False)
 
     return parser
 
@@ -587,6 +632,26 @@ def _discard_partial_design(candidate_id: int) -> None:
         session.close()
 
 
+def _discard_partial_pack(design) -> None:
+    """Clear stored pack documents so a fresh `praxis plan` run starts over.
+
+    Without --resume, a re-run restarts a PARTIAL pack instead of silently
+    continuing it (the mirror of _discard_partial_design, which discards
+    in_progress designs). An absent or complete pack is left alone: there is
+    nothing to restart, and a complete pack re-renders the docs files with
+    zero LLM calls.
+    """
+    from praxis.db import clear_design_pass
+    from praxis.design_io import load_passes as _load_passes
+
+    passes = _load_passes(design)
+    stored = [p for p in PACK_PASS_IDS if (passes.get(p) or "").strip()]
+    if not stored or len(stored) == len(PACK_PASS_IDS):
+        return
+    for pass_id in PACK_PASS_IDS:
+        clear_design_pass(design.id, pass_id)
+
+
 def _design_and_write(
     candidate,
     profile,
@@ -784,6 +849,91 @@ def _cmd_design(args) -> int:
     )
 
 
+def _cmd_plan(args) -> int:
+    from praxis.config import HardwareProfile, load_facts
+    from praxis.db import latest_design
+    from praxis.design import PASS_IDS
+    from praxis.design_io import load_passes as _load_passes
+    from praxis.design_io import write_docs_pack
+    from praxis.discover import get_candidate
+    from praxis.planning import generate_doc_pack
+
+    candidate = get_candidate(args.candidate_id)
+    if candidate is None:
+        print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
+        return 1
+    design = latest_design(args.candidate_id)
+    if design is None:
+        print(
+            f"error: candidate {args.candidate_id} has no design; "
+            f"run `praxis design {args.candidate_id}` first",
+            file=sys.stderr,
+        )
+        return 1
+    passes = _load_passes(design)
+    missing_core = [p for p in PASS_IDS if not (passes.get(p) or "").strip()]
+    if missing_core:
+        print(
+            f"error: design incomplete (missing: {', '.join(missing_core)}); "
+            f"run `praxis design {args.candidate_id} --resume` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    detect = _hardware_detect_arg(args)
+    facts = load_facts(args.hardware, detect=detect)
+    profile = HardwareProfile(
+        cpu_only=facts.cpu_only,
+        ram_gb=facts.ram_gb,
+        gpu=facts.gpu,
+        monthly_budget_usd=facts.monthly_budget_usd,
+    )
+    rerun_passes = None
+    if args.rerun_pass is not None:
+        rerun_passes = [PACK_PASS_IDS[args.rerun_pass - 1]]
+        print(f"re-running pass {args.rerun_pass} ({rerun_passes[0]}) only")
+    elif not args.resume:
+        # Partial packs restart by default; --resume keeps the stored ones.
+        _discard_partial_pack(design)
+
+    print(f"planning candidate {args.candidate_id}: {candidate.title}")
+    result = generate_doc_pack(
+        candidate,
+        profile,
+        facts=facts,
+        run_critic=args.run_critic,
+        rerun_passes=rerun_passes,
+    )
+    if result.status != "complete":
+        completed = ", ".join(result.completed_passes) or "none"
+        print(
+            f"error: plan failed for candidate {result.candidate_id}: "
+            f"{result.error or 'incomplete pack passes'} "
+            f"(completed pack passes: {completed}; "
+            f"re-run the same command with --resume to continue)",
+            file=sys.stderr,
+        )
+        return 1
+
+    design = latest_design(args.candidate_id)
+    passes = _load_passes(design)
+    docs_dir = write_docs_pack(candidate, profile, passes=passes, facts=facts)
+    print(f"plan complete: candidate {result.candidate_id}")
+    print(f"  {docs_dir}")
+    print(
+        f"  LLM usage: {result.calls} calls, {result.total_tokens:,} tokens, "
+        f"${result.cost_usd:.4f}"
+    )
+    if args.run_critic and result.critic_skip_note:
+        print(f"  {result.critic_skip_note}")
+    for defect in result.defects:
+        print(
+            f"  critic: [{defect.get('class', '?')}] "
+            f"{defect.get('section', '?')}: {defect.get('defect', '')}"
+        )
+    return 0
+
+
 def _cmd_show(args) -> int:
     from praxis.db import Candidate, get_session, latest_blueprint
 
@@ -873,6 +1023,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_design(args)
         except Exception as exc:  # noqa: BLE001 - CLI boundary
             logging.error("praxis design failed: %s", exc)
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "plan":
+        try:
+            return _cmd_plan(args)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            logging.error("praxis plan failed: %s", exc)
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
