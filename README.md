@@ -257,7 +257,8 @@ clear message listing which limit blocked which entry.
 component list, key parameters, ~600-800 tokens) instead of full text of
 earlier passes; paper chunks are dropped entirely for the hardware-fit pass
 and capped for the plan pass. Per-pass `max_tokens` is ~2000 and gpt-oss
-models get `reasoning_effort="low"`; every call targets input + output
+models on Groq/Cerebras get `reasoning_effort="low"` (other providers and
+non-gpt-oss models are never sent the parameter); every call targets input + output
 ≤ ~5000 tokens.
 
 `PRAXIS_DESIGN_MODEL` accepts a **comma-separated chain** of provider/model ids

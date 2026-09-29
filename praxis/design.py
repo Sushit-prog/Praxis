@@ -302,13 +302,19 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return classify_exhaustion(exc) == "rate_limit"
 
 
+REASONING_EFFORT_PROVIDERS = frozenset({"groq", "cerebras"})
+
+
 def _supports_reasoning_effort(model: str) -> bool:
     """True when the model accepts litellm's reasoning_effort parameter.
 
-    Only gpt-oss models expose the low/medium/high effort knob; other models
-    would reject (or ignore) the parameter, so it is not sent to them.
+    Both conditions required: the provider must be in
+    REASONING_EFFORT_PROVIDERS (verified via litellm.get_supported_openai_params)
+    and the model must be a gpt-oss variant. openrouter lists the parameter but
+    is excluded by this rule; nvidia_nim does not support it at all.
     """
-    return "gpt-oss" in (model or "").lower()
+    lowered = (model or "").lower()
+    return provider_of(lowered) in REASONING_EFFORT_PROVIDERS and "gpt-oss" in lowered
 
 
 def _design_llm_call(
@@ -579,6 +585,12 @@ class DesignResult:
 # --------------------------------------------------------------------------
 
 
+# The GPU wording produced here is load-bearing for the no_gpu_requirement
+# rubric check: praxis/eval.py scans with _GPU_PATTERNS inside a
+# _GPU_GUARD_BEFORE/_GPU_GUARD_AFTER window (30/25 chars) and skips any
+# mention carrying a _NEGATOR_RE word. If these strings change, keep a negator
+# ("none"/"not") within that window or the rubric flags the facts as a GPU
+# requirement (see tests/test_design.py::test_design_rubric_passes_good_doc).
 def _gpu_summary(facts: FactsSheet) -> str:
     if facts.gpu:
         return f"{facts.gpu_name} (available)"

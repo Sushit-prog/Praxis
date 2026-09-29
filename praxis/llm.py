@@ -336,8 +336,9 @@ def call_llm(
     recorded alongside the call so spend can be attributed per stage and per
     candidate. ``max_tokens`` caps the output size for this call only (the
     design engine uses it to respect a model's OTPM free-tier limit).
-    ``reasoning_effort`` (``low``/``medium``/``high``) is passed to models that
-    support it (gpt-oss) to keep hidden reasoning tokens small.
+    ``reasoning_effort`` (``low``/``medium``/``high``) is passed through for
+    models the caller approves (the design engine sends it only for gpt-oss on
+    Groq/Cerebras) to keep hidden reasoning tokens small.
     """
     client = LLMClient(completion=completion) if completion else get_client()
     return client.call(

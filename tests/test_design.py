@@ -1045,6 +1045,40 @@ def test_non_gpt_oss_model_gets_no_reasoning_effort(design_db, no_grounding, mon
     assert efforts and all(e is None for e in efforts)
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("cerebras/gpt-oss-120b", "low"),
+        ("openrouter/openai/gpt-oss-120b:free", None),
+        ("nvidia_nim/openai/gpt-oss-120b", None),
+    ],
+)
+def test_reasoning_effort_gated_to_groq_cerebras_gpt_oss(
+    design_db, no_grounding, monkeypatch, model, expected
+):
+    """reasoning_effort='low' only for groq/cerebras gpt-oss; None elsewhere."""
+    import praxis.design as design_module
+
+    efforts = []
+
+    def fake_call_llm(prompt, system=None, model=None, reasoning_effort=None, **kwargs):
+        efforts.append((model, reasoning_effort))
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", model)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+    assert efforts, "expected design calls"
+    assert all(e == expected for _, e in efforts)
+
+
 def test_pass_calls_target_5000_token_request(design_db, no_grounding, monkeypatch):
     """With a large grounding block, prompts stay under the ~5k request target."""
     import praxis.design as design_module
