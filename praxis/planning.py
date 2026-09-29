@@ -98,7 +98,7 @@ PACK_OUTPUT_TOKENS = {
     "test_plan": 1800,
     "security": 1500,
     "readme": 1200,
-    "env_example": 600,
+    "env_example": 1500,
 }
 
 # Passes whose output is a raw file (.env.example), not markdown: the prompt

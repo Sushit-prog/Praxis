@@ -65,3 +65,6 @@ model_limits:
     itpm: 7000
     otpm: 1000
     note: "observed on the free tier, Sep 2026, may change"
+  - model: nvidia_nim/nvidia/nemotron-3-super-120b-a12b
+    max_output: 4096
+    note: "observed Sep 2026: pack pass env_example truncated twice at 1200 output tokens; 4096 covers current pass budgets - pacing (tpm/otpm) not yet observed"
