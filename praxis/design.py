@@ -127,7 +127,8 @@ def is_request_too_large_error(exc: Exception) -> bool:
 # tracked in-memory per provider and axis (this process only; cross-process
 # accounting would need the ledger and overcounts restarts).
 TPM_WINDOW_S = 60.0
-# Per-pass output budget (~2000 tokens); clamped further by a model's OTPM.
+# Per-pass output budget (~2000 tokens); clamped further by the model's
+# per-request output ceiling (max_output when set, else its per-minute OTPM).
 DEFAULT_PASS_OUTPUT_TOKENS = 2000
 # Target total request size: input + max_tokens <= ~5000 tokens per call.
 DESIGN_REQUEST_TOKEN_CAP = 5000
@@ -187,18 +188,37 @@ class _TokenWindow:
 _token_window = _TokenWindow()
 
 
+def resolve_output_ceiling(model: str, facts: FactsSheet | None) -> int | None:
+    """Per-request output ceiling for ``model``: max_output, else otpm, else None.
+
+    ``max_output`` (when set in YAML) is the declared per-request ceiling;
+    otherwise the model's per-minute ``otpm`` budget doubles as one, so a
+    single request can never spend more output than the whole minute's
+    budget. A model with neither is not clamped.
+    """
+    if facts is None:
+        return None
+    limits = resolve_model_limits(facts, model)
+    if limits is None:
+        return None
+    if limits.max_output is not None:
+        return limits.max_output
+    return limits.otpm
+
+
 def resolve_pass_output_tokens(
     model: str, facts: FactsSheet | None, planned: int | None = None
 ) -> int:
-    """max_tokens for a design call: the planned size clamped to OTPM.
+    """max_tokens for a design call: the planned size clamped to the ceiling.
 
-    The model's ``otpm`` limit (if known) caps the output budget; a model with
-    no known limits is not clamped at all.
+    The per-request ceiling is ``max_output`` when set, else the model's
+    per-minute ``otpm`` budget (see :func:`resolve_output_ceiling`); a model
+    with neither known limit is not clamped at all.
     """
     planned = DEFAULT_PASS_OUTPUT_TOKENS if planned is None else planned
-    limits = resolve_model_limits(facts, model) if facts is not None else None
-    if limits is not None and limits.otpm is not None:
-        return min(planned, limits.otpm)
+    ceiling = resolve_output_ceiling(model, facts)
+    if ceiling is not None:
+        return min(planned, ceiling)
     return planned
 
 
@@ -372,6 +392,7 @@ def _design_llm_call(
                         candidate_id=candidate_id,
                         completion=completion,
                         max_tokens=max_tokens,
+                        max_tokens_ceiling=resolve_output_ceiling(chain_model, facts),
                         reasoning_effort=(
                             "low" if _supports_reasoning_effort(chain_model) else None
                         ),

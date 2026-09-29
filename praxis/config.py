@@ -131,12 +131,18 @@ class ModelLimits:
     ``tpm`` caps total tokens (input + output), ``itpm`` input tokens only,
     ``otpm`` output tokens only. A model with no entry — or a missing limit
     within its entry — is not throttled on that axis.
+
+    ``max_output`` is a different kind of number: a per-request output
+    ceiling, not a per-minute budget, and unverified until set in YAML.
+    When absent, ``otpm`` doubles as the ceiling so no single request can
+    spend more output than the whole minute's budget.
     """
 
     model: str
     tpm: int | None = None
     itpm: int | None = None
     otpm: int | None = None
+    max_output: int | None = None
     note: str = ""
 
 
@@ -167,6 +173,7 @@ def _load_model_limits(value: Any) -> list[ModelLimits]:
                 tpm=_opt("tpm"),
                 itpm=_opt("itpm"),
                 otpm=_opt("otpm"),
+                max_output=_opt("max_output"),
                 note=str(item.get("note") or ""),
             )
         )
@@ -425,6 +432,8 @@ def render_facts_sheet(facts: FactsSheet) -> str:
                 parts.append(f"{entry.itpm} ITPM input")
             if entry.otpm is not None:
                 parts.append(f"{entry.otpm} OTPM output")
+            if entry.max_output is not None:
+                parts.append(f"{entry.max_output} max output/request")
             note = f" ({entry.note})" if entry.note else ""
             lines.append(f"  - {entry.model}: {', '.join(parts)}{note}")
     if facts.preferred_stack:

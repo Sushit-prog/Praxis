@@ -243,8 +243,9 @@ retries the same pass before failing over.
 provider/model — `tpm` (total tokens/min), `itpm` (input) and `otpm` (output),
 each optional; a model with no entry is not throttled. Seeded values are
 labelled `observed on the free tier, Sep 2026, may change`. Pacing checks every
-applicable axis over the 60s sliding window, and each call's `max_tokens` is
-clamped to the model's `otpm`.
+applicable axis over the 60s sliding window, and each call's `max_tokens` —
+including the truncation retry — is clamped to the model's per-request output
+ceiling (`max_output` when set, else its per-minute `otpm`).
 
 **"Request too large" is permanent.** A provider rejecting a pass as too large
 (HTTP 413 / token-window breach) is never waited on or retried at that size,
@@ -377,7 +378,7 @@ Defaults live in `praxis/config.py`; the default YAML file is `hardware_profile.
 | `PRAXIS_BORDERLINE_MARGIN` | feasibility-score band above the threshold treated as `borderline` | `1` |
 | `PRAXIS_DESIGN_MODEL` | litellm model id(s) for the design passes; comma-separated chain fails over on rate limits and request-too-large rejections | `groq/openai/gpt-oss-120b` |
 | `PRAXIS_MAX_TOKENS` | first-attempt `max_tokens` for LLM calls (unset = provider default) | — |
-| `PRAXIS_MAX_TOKENS_RETRY` | `max_tokens` for the truncation-guard retry (default: 2x first, else 8192) | — |
+| `PRAXIS_MAX_TOKENS_RETRY` | `max_tokens` for the truncation-guard retry (default: 2x first, else 8192; clamped to the caller's per-request output ceiling — design: `max_output`/`otpm` — and skipped entirely when the ceiling leaves no room) | — |
 | `PRAXIS_GROUNDING_CACHE` | disable the source-grounding disk cache with `0`/`false` | `1` |
 | `PRAXIS_GROUNDING_CACHE_DIR` | directory for the grounding disk cache | `./.praxis-cache/grounding` |
 

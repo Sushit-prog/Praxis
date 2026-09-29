@@ -49,8 +49,11 @@ provider_limits:
   - "openrouter: UNVERIFIED: check before relying"
   - "cerebras: UNVERIFIED: check before relying"
   - "nvidia_nim: OPTIONAL hosted 70B-class fallback (litellm id nvidia_nim/nvidia/nemotron-3-super-120b-a12b, needs NVIDIA_NIM_API_KEY) - rate-limited free endpoint; designs must not depend on it"
-# Per-model free-tier rate limits; each limit is optional and a model with no
-# entry here (or a missing limit) is NOT throttled by the design engine.
+# Per-model free-tier rate limits (tpm/itpm/otpm are PER-MINUTE pacing
+# budgets); each limit is optional and a model with no entry here (or a
+# missing limit) is NOT throttled by the design engine. Optional max_output
+# is a per-request output ceiling (unverified until set); when absent, otpm
+# doubles as the ceiling and the truncation retry never exceeds it.
 model_limits:
   - model: groq/openai/gpt-oss-120b
     tpm: 8000

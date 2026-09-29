@@ -40,7 +40,8 @@ CACHE_ENV = "PRAXIS_LLM_CACHE"
 
 # Truncation guard: max_tokens for the first attempt (unset = provider default)
 # and for the one retry after a truncated response (default: 2x the first
-# attempt when set, else DEFAULT_RETRY_MAX_TOKENS).
+# attempt when set, else DEFAULT_RETRY_MAX_TOKENS), clamped to the caller's
+# max_tokens_ceiling when one is given (see call_llm).
 MAX_TOKENS_ENV = "PRAXIS_MAX_TOKENS"
 MAX_TOKENS_RETRY_ENV = "PRAXIS_MAX_TOKENS_RETRY"
 DEFAULT_RETRY_MAX_TOKENS = 8192
@@ -139,6 +140,7 @@ class LLMClient:
         stage: str | None = None,
         candidate_id: int | None = None,
         max_tokens: int | None = None,
+        max_tokens_ceiling: int | None = None,
         reasoning_effort: str | None = None,
     ) -> str:
         model = _resolve_model(model) or self._model
@@ -197,7 +199,8 @@ class LLMClient:
             else:
                 kwargs.pop("reasoning_effort", None)
             # An explicit caller max_tokens (e.g. the design engine clamping to
-            # the model's OTPM limit) wins over the global PRAXIS_MAX_TOKENS.
+            # the model's per-request output ceiling) wins over the global
+            # PRAXIS_MAX_TOKENS.
             first_tokens = max_tokens if max_tokens is not None else _initial_max_tokens()
             if first_tokens is not None:
                 kwargs["max_tokens"] = first_tokens
@@ -218,7 +221,27 @@ class LLMClient:
                         candidate_id=candidate_id,
                         latency_ms=_elapsed_ms(started),
                     )
-                    retry_tokens = _retry_max_tokens(kwargs.get("max_tokens"))
+                    first_attempt_tokens = kwargs.get("max_tokens")
+                    retry_tokens = _retry_max_tokens(first_attempt_tokens)
+                    if max_tokens_ceiling is not None:
+                        # The retry never spends more output than the caller's
+                        # per-request ceiling (the design engine passes the
+                        # model's max_output/otpm budget).
+                        retry_tokens = min(retry_tokens, max_tokens_ceiling)
+                        if (
+                            first_attempt_tokens is not None
+                            and retry_tokens <= first_attempt_tokens
+                        ):
+                            # A retry at or below the failed budget would fail
+                            # identically: fail fast instead of a wasted call.
+                            raise TruncatedOutputError(
+                                f"LLM output truncated from {attempt_model} ({reason}) "
+                                f"at max_tokens={first_attempt_tokens}: the model's "
+                                f"output ceiling is {max_tokens_ceiling} tokens, so a "
+                                "higher-budget retry is impossible. Use a model with a "
+                                "higher output ceiling (max_output/otpm in "
+                                "hardware_profile.yaml) or target a shorter output."
+                            )
                     logger.warning(
                         "llm: %s output truncated (%s); retrying once with "
                         "max_tokens=%s",
@@ -328,17 +351,23 @@ def call_llm(
     candidate_id: int | None = None,
     completion: Callable[..., Any] | None = None,
     max_tokens: int | None = None,
+    max_tokens_ceiling: int | None = None,
     reasoning_effort: str | None = None,
 ) -> str:
     """Call an LLM, optionally injecting a completion function for tests.
 
-    ``stage`` (e.g. ``\"analyst\"`` or ``\"architect\"``) and ``candidate_id`` are
+    ``stage`` (e.g. ``\\\"analyst\\\"`` or ``\\\"architect\\\"``) and ``candidate_id`` are
     recorded alongside the call so spend can be attributed per stage and per
     candidate. ``max_tokens`` caps the output size for this call only (the
-    design engine uses it to respect a model's OTPM free-tier limit).
-    ``reasoning_effort`` (``low``/``medium``/``high``) is passed through for
-    models the caller approves (the design engine sends it only for gpt-oss on
-    Groq/Cerebras) to keep hidden reasoning tokens small.
+    design engine uses it to respect a model's per-request output ceiling).
+    ``max_tokens_ceiling`` additionally clamps the truncation retry so it can
+    never exceed the caller's per-request output budget (the design engine
+    passes the model's ``max_output``/``otpm``); when clamped retry would not
+    exceed the failed attempt, a :class:`TruncatedOutputError` is raised
+    instead of making a doomed second call. ``reasoning_effort``
+    (``low``/``medium``/``high``) is passed through for models the caller
+    approves (the design engine sends it only for gpt-oss on Groq/Cerebras)
+    to keep hidden reasoning tokens small.
     """
     client = LLMClient(completion=completion) if completion else get_client()
     return client.call(
@@ -348,6 +377,7 @@ def call_llm(
         stage=stage,
         candidate_id=candidate_id,
         max_tokens=max_tokens,
+        max_tokens_ceiling=max_tokens_ceiling,
         reasoning_effort=reasoning_effort,
     )
 

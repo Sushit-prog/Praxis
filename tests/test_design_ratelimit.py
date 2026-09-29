@@ -383,6 +383,30 @@ def test_resolve_pass_output_tokens_clamps_to_otpm():
     assert resolve_pass_output_tokens("any/model", None) > 1000
 
 
+def test_resolve_output_ceiling_prefers_max_output_then_falls_back_to_otpm():
+    """max_output (per-request) wins; otpm (per-minute) is the fallback."""
+    from praxis.config import FactsSheet, ModelLimits
+    from praxis.design import resolve_output_ceiling, resolve_pass_output_tokens
+
+    facts = FactsSheet(
+        model_limits=[
+            ModelLimits(model="groq/qwen/qwen3.8-27b", otpm=1000),
+            ModelLimits(model="cerebras/gpt-oss-120b", otpm=4000, max_output=3000),
+        ]
+    )
+    # No max_output: the per-minute otpm doubles as the per-request ceiling.
+    assert resolve_output_ceiling("groq/qwen/qwen3.8-27b", facts) == 1000
+    assert resolve_pass_output_tokens("groq/qwen/qwen3.8-27b", facts) == 1000
+    # max_output wins when set: a declared per-request ceiling is honored.
+    assert resolve_output_ceiling("cerebras/gpt-oss-120b", facts) == 3000
+    assert resolve_pass_output_tokens("cerebras/gpt-oss-120b", facts) == 2000  # planned fits
+    assert resolve_pass_output_tokens("cerebras/gpt-oss-120b", facts, planned=5000) == 3000
+    # No entry, or no facts: no ceiling and no clamping.
+    assert resolve_output_ceiling("unknown/model", facts) is None
+    assert resolve_output_ceiling("groq/qwen/qwen3.8-27b", None) is None
+    assert resolve_pass_output_tokens("unknown/model", facts, planned=5000) == 5000
+
+
 def test_pass_call_carries_otpm_clamped_max_tokens(design_setup, monkeypatch):
     """The design calls pass max_tokens through to call_llm, clamped to OTPM."""
     import praxis.design as design_module
@@ -412,6 +436,36 @@ def test_pass_call_carries_otpm_clamped_max_tokens(design_setup, monkeypatch):
     # Every call's max_tokens is clamped to qwen3.8-27b's otpm=1000 from the YAML.
     assert max(t for t in captured if t is not None) == 1000
     assert all(t is not None and t <= 1000 for t in captured)
+
+
+def test_pass_call_carries_output_ceiling_to_call_llm(design_setup, monkeypatch):
+    """Every design call carries the model's per-request output ceiling."""
+    import praxis.design as design_module
+
+    candidate_id, profile, _waits = design_setup
+    monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/qwen/qwen3.8-27b")
+    ceilings: list[int | None] = []
+
+    def fake_call_llm(prompt, system=None, model=None, max_tokens_ceiling=None, **kwargs):
+        ceilings.append(max_tokens_ceiling)
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+    from praxis.config import load_facts
+
+    result = generate_design(
+        _Candidate(candidate_id), profile, facts=load_facts(), pace_seconds=0.0
+    )
+    assert result.status == "complete"
+    assert ceilings, "expected design calls"
+    # otpm=1000 fallback from the YAML (no max_output entry) on every pass/critic call.
+    assert all(c == 1000 for c in ceilings)
 
 
 # ---------------------------------------------------------------------------

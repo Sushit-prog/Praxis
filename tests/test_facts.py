@@ -242,7 +242,7 @@ def test_detect_hw_zero_keeps_detection_off(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Per-model rate limits (tpm / itpm / otpm), each optional
+# Per-model rate limits (tpm / itpm / otpm per-minute, max_output per-request)
 # ---------------------------------------------------------------------------
 
 
@@ -256,6 +256,19 @@ def test_model_limits_default_empty_and_entry_fields_optional():
     limits = resolve_model_limits(facts, "m/one")
     assert limits is not None
     assert limits.tpm is None and limits.itpm is None and limits.otpm is None
+    assert limits.max_output is None
+
+
+def test_model_limits_yaml_max_output_parses(tmp_path):
+    """max_output is a separate per-request key alongside the rate axes."""
+    p = tmp_path / "l.yaml"
+    p.write_text(
+        "model_limits:\n  - model: a/b\n    otpm: 1000\n    max_output: 2500\n",
+        encoding="utf-8",
+    )
+    limits = resolve_model_limits(load_facts(str(p)), "a/b")
+    assert limits is not None
+    assert limits.otpm == 1000 and limits.max_output == 2500
 
 
 def test_resolve_model_limits_exact_and_suffix_match():
@@ -303,9 +316,11 @@ def test_render_facts_sheet_lists_per_model_limits():
                 note="observed on the free tier, Sep 2026, may change",
             ),
             ModelLimits(model="groq/qwen/qwen3.8-27b", itpm=7000, otpm=1000),
+            ModelLimits(model="cerebras/gpt-oss-120b", max_output=3000),
         ]
     )
     md = render_facts_sheet(facts)
     assert "groq/openai/gpt-oss-120b: 8000 TPM total" in md
     assert "groq/qwen/qwen3.8-27b: 7000 ITPM input, 1000 OTPM output" in md
+    assert "cerebras/gpt-oss-120b: 3000 max output/request" in md
     assert "Sep 2026" in md

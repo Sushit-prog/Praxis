@@ -563,6 +563,84 @@ def test_truncated_twice_raises_and_never_caches(db_session, monkeypatch):
     assert rows and rows[0].error and "truncated" in rows[0].error  # ledger shows it
 
 
+def test_truncation_retry_fails_fast_when_ceiling_equals_first(db_session, monkeypatch):
+    """Already at the output ceiling: immediate error, no doomed second call."""
+    from praxis import llm as llm_module
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    calls = {"n": 0}
+
+    def completion(**kwargs):
+        calls["n"] += 1
+        return {"choices": [{"message": {"content": "partial..."}, "finish_reason": "length"}]}
+
+    with pytest.raises(llm_module.TruncatedOutputError, match="output ceiling"):
+        llm_module.call_llm(
+            "hello",
+            model="groq/x",
+            completion=completion,
+            max_tokens=1000,
+            max_tokens_ceiling=1000,
+        )
+
+    assert calls["n"] == 1  # the clamped retry never fires
+
+
+def test_truncation_retry_clamped_by_ceiling(db_session, monkeypatch):
+    """Retry grows to 2x but stops at the caller's per-request ceiling."""
+    from praxis import llm as llm_module
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    seen = []
+
+    def completion(**kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        if kwargs.get("max_tokens") == 1000:
+            return {"choices": [{"message": {"content": "full output"}, "finish_reason": "stop"}]}
+        return {"choices": [{"message": {"content": "partial..."}, "finish_reason": "length"}]}
+
+    out = llm_module.call_llm(
+        "hello",
+        model="groq/x",
+        completion=completion,
+        max_tokens=500,
+        max_tokens_ceiling=1000,
+    )
+
+    assert out == "full output"
+    assert seen == [500, 1000]  # 2x500, clamped to the ceiling — never unbounded
+
+
+def test_truncation_retry_default_8192_clamped_by_ceiling(db_session, monkeypatch):
+    """No first-attempt max_tokens: the 8192 default retry is ceiling-clamped."""
+    from praxis import llm as llm_module
+
+    monkeypatch.delenv(llm_module.MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(llm_module.MAX_TOKENS_RETRY_ENV, raising=False)
+    monkeypatch.setattr(llm_module, "_pool", None)
+
+    seen = []
+
+    def completion(**kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        if kwargs.get("max_tokens") == 2000:
+            return {"choices": [{"message": {"content": "full output"}, "finish_reason": "stop"}]}
+        return {"choices": [{"message": {"content": "partial..."}, "finish_reason": "length"}]}
+
+    out = llm_module.call_llm(
+        "hello", model="groq/x", completion=completion, max_tokens_ceiling=2000
+    )
+
+    assert out == "full output"
+    assert seen == [None, 2000]  # DEFAULT_RETRY_MAX_TOKENS=8192, clamped down
+
+
 def test_empty_content_from_reasoning_model_triggers_retry(db_session, monkeypatch):
     """A reasoning model that spent everything on reasoning: retry once."""
     from praxis import llm as llm_module
