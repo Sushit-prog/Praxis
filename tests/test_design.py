@@ -417,6 +417,120 @@ def test_generate_design_failure_mid_pass_is_resumable(design_db, no_grounding, 
 
 
 # ---------------------------------------------------------------------------
+# Core pass scope: out-of-scope keys in passes_json are inert
+# ---------------------------------------------------------------------------
+
+
+def _seed_design_with_extras(design_db, extra_passes):
+    """Store a completed core design plus out-of-scope pass keys."""
+    import praxis.design as design_module
+    from praxis.db import save_design_pass
+
+    design = design_module._get_or_create_design(design_db, "standard", None, None)
+    for pass_id in PASS_IDS:
+        save_design_pass(design.id, pass_id, GOOD_PASSES[pass_id])
+    for pass_id, content in extra_passes.items():
+        save_design_pass(design.id, pass_id, content)
+    return design
+
+
+def test_design_ignores_pass_keys_outside_core_scope(design_db, no_grounding, monkeypatch):
+    """Stored out-of-scope keys neither regenerate, nor appear in DESIGN.md,
+    nor leak into completed_passes."""
+    import praxis.design as design_module
+
+    _seed_design_with_extras(
+        design_db, {"prd": "## Product Requirements\n\nextraneous pack section\n"}
+    )
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("no LLM call expected: every core pass is stored")
+
+    monkeypatch.setattr(design_module, "call_llm", unexpected_call)
+
+    result = generate_design(
+        _Candidate(design_db), HardwareProfile(), pace_seconds=0.0, run_critic=False
+    )
+
+    assert result.status == "complete"
+    assert result.completed_passes == list(PASS_IDS)
+    assert "## Product Requirements" not in result.design_md
+    assert "extraneous pack section" not in result.design_md
+    assert "## Hardware & Budget Fit" in result.design_md
+
+
+def test_critic_targets_only_core_passes_with_extraneous_keys(
+    design_db, no_grounding, monkeypatch
+):
+    """The chunked critic reviews exactly the core sections, even when
+    passes_json carries out-of-scope keys."""
+    import praxis.design as design_module
+
+    _seed_design_with_extras(
+        design_db, {"prd": "## Product Requirements\n\nextraneous pack section\n"}
+    )
+
+    done = {p: GOOD_PASSES[p] for p in PASS_IDS}
+    done["prd"] = "## Product Requirements\n\nextraneous pack section\n"
+    assert design_module._critic_section_pass_ids(done) == list(PASS_IDS)
+
+    seen_sections = []
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        if kwargs.get("stage") == "design_critic":
+            line = next(
+                ln for ln in prompt.splitlines() if ln.startswith("SECTION UNDER REVIEW")
+            )
+            seen_sections.append(line)
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected call: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+
+    assert result.status == "complete"
+    assert len(seen_sections) == len(PASS_IDS)
+    assert not any("Product Requirements" in s for s in seen_sections)
+
+
+def test_pass_progress_label_counts_core_passes_only(design_db, no_grounding, monkeypatch):
+    """Progress labels show the core pass count (pass 5/5), not a superset."""
+    import praxis.design as design_module
+    from praxis.db import save_design_pass
+
+    design = design_module._get_or_create_design(design_db, "standard", None, None)
+    for pass_id in list(PASS_IDS)[:4]:
+        save_design_pass(design.id, pass_id, GOOD_PASSES[pass_id])
+    save_design_pass(design.id, "prd", "## Product Requirements\n\nextraneous\n")
+
+    labels = []
+
+    def spy_wait(*args, **kwargs):
+        labels.append(kwargs.get("progress_label", ""))
+
+    monkeypatch.setattr(design_module, "_wait_for_tpm_budget", spy_wait)
+    monkeypatch.setattr(
+        design_module, "call_llm", _completion_returning_passes(GOOD_PASSES)
+    )
+
+    result = generate_design(
+        _Candidate(design_db), HardwareProfile(), pace_seconds=0.0, run_critic=False
+    )
+
+    assert result.status == "complete"
+    assert labels == ["pass 5/5"]
+
+
+def test_assemble_design_md_ignores_out_of_scope_pass_keys(hardware_profile):
+    passes = {**GOOD_PASSES, "prd": "## Product Requirements\n\nextraneous\n"}
+    md = assemble_design_md(passes, hardware_profile, _Candidate(1))
+    assert "## Technique" in md
+    assert "## Product Requirements" not in md
+    assert "### Target machine (effective constraints)" in md
+
+
+# ---------------------------------------------------------------------------
 # File writers
 # ---------------------------------------------------------------------------
 

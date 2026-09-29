@@ -1208,7 +1208,7 @@ def _chunked_critic_prompt(
 
 def _critic_section_pass_ids(done: dict[str, str]) -> list[str]:
     """The pass ids eligible for a chunked-critic call, in pass order."""
-    return [p for p in _PASS_ORDER if (done.get(p) or "").strip()]
+    return [p for p in PASS_IDS if (done.get(p) or "").strip()]
 
 
 def _run_chunked_critic(
@@ -1349,7 +1349,7 @@ def assemble_design_md(
     ]
     if technique:
         lines += ["## Technique summary", "", technique, ""]
-    for pass_id in _PASS_ORDER:
+    for pass_id in PASS_IDS:
         content = (passes.get(pass_id) or "").strip()
         if not content:
             continue
@@ -1589,9 +1589,9 @@ def generate_design(
     design = _get_or_create_design(candidate_id, depth, model, focus)
     done = _load_passes(design)
     for pass_id in rerun_passes or []:
-        if pass_id not in _PASS_ORDER:
+        if pass_id not in PASS_IDS:
             raise ValueError(
-                f"unknown pass {pass_id!r}; choose one of: {', '.join(_PASS_ORDER)}"
+                f"unknown pass {pass_id!r}; choose one of: {', '.join(PASS_IDS)}"
             )
         done.pop(pass_id, None)
         if design.id is not None:
@@ -1601,7 +1601,7 @@ def generate_design(
 
     try:
         # -- content passes ---------------------------------------------------
-        for pass_index, pass_id in enumerate(_PASS_ORDER, start=1):
+        for pass_index, pass_id in enumerate(PASS_IDS, start=1):
             if pass_id in done and done[pass_id].strip():
                 continue
             prompt = cap_pass_prompt_chars(
@@ -1613,7 +1613,7 @@ def generate_design(
                 prompt,
                 facts,
                 output_tokens=pass_max_tokens,
-                progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
+                progress_label=f"pass {pass_index}/{len(PASS_IDS)}",
             )
             content = _design_llm_call(
                 prompt,
@@ -1623,14 +1623,14 @@ def generate_design(
                 candidate_id=candidate_id,
                 completion=completion,
                 facts=facts,
-                progress_label=f"pass {pass_index}/{len(_PASS_ORDER)}",
+                progress_label=f"pass {pass_index}/{len(PASS_IDS)}",
                 max_tokens=pass_max_tokens,
             )
             content = _store_pass_content(content)
             done[pass_id] = content
             save_design_pass(design.id, pass_id, content)
             logger.info("design: pass %s complete for candidate %s", pass_id, candidate_id)
-            if pace > 0 and pass_id != _PASS_ORDER[-1]:
+            if pace > 0 and pass_id != PASS_IDS[-1]:
                 time.sleep(pace)
 
         # -- chunked critic: one call per section ------------------------------
@@ -1735,7 +1735,7 @@ def generate_design(
             candidate_id=candidate_id,
             design_id=design.id,
             status="complete",
-            completed_passes=list(done),
+            completed_passes=[p for p in PASS_IDS if p in done],
             defects=found_defects,
             design_md=final_md,
             critic_skip_note=critic_skipped_reason,
@@ -1752,7 +1752,7 @@ def generate_design(
             candidate_id=candidate_id,
             design_id=design.id,
             status="failed",
-            completed_passes=list(done),
+            completed_passes=[p for p in PASS_IDS if p in done],
             design_md=assemble_design_md(done, profile, candidate, facts=facts) if done else "",
             error=str(exc),
             calls=calls,
