@@ -192,6 +192,19 @@ praxis export 42 --out my-kit.md
 
 The exported markdown contains the goal, the hardware constraints from your profile (CPU-only, RAM, GPU, budget), the phased build plan, deterministic acceptance checks, and a ready-to-paste prompt for a coding agent — usable with Freebuff, Claude Code, OpenCode, or any other agent, with no API keys or gateways required. This is the intended path when the Coder stage is off.
 
+Generate the coding-agent docs pack for a finished design:
+
+```bash
+praxis plan 42                            # writes designs/042-<slug>/docs/
+praxis plan 42 --resume                   # continue a partial pack (default restarts it)
+praxis plan 42 --pass 3                   # re-run only pass 3 (1=prd ... 6=env_example)
+praxis plan 42 --critic                   # opt into critic review of the pack (off by default)
+praxis plan 42 --no-critic                # explicitly skip the pack critic (the default)
+praxis plan 42 --hardware mine.yaml       # pin a hardware profile; --no-detect skips host detection
+```
+
+`praxis plan` requires a completed `praxis design <id>` — a missing or partial design fails fast with the exact command to run first (`praxis design <id>` or `praxis design <id> --resume`). It generates the pack's LLM documents as paced calls in their own `plan` stage, renders the rest deterministically, then prints the docs directory and an `LLM usage:` footer. The full file list and pack behavior are covered under [Design engine](#design-engine-multi-pass-designmd) below.
+
 Evaluate the Analyst and Architect against the hand-labeled golden set:
 
 ```bash
@@ -328,6 +341,30 @@ reconfigures stdout/stderr to UTF-8 (with replacement) at startup so legacy
 console code pages cannot kill a run, and stored model text is normalized
 (non-breaking hyphens/spaces and smart quotes become plain ASCII).
 
+### Planning docs pack (praxis plan)
+
+`praxis plan <id>` turns a finished design into the hand-off bundle a coding
+agent implements from: eleven files under `designs/<NNN>-<slug>/docs/` —
+`PRD.md`, `ARCHITECTURE.md`, `DESIGN.md`, `RULES.md`, `TASKS.md`,
+`TEST_PLAN.md`, `SECURITY.md`, `DECISIONS.md`, `MEMORY.md`, `README.md`, and
+`.env.example`. Six of them are paced LLM passes in their own `plan` stage
+(PRD, rules, test plan, security, README, env example), reusing the design
+engine's prompts, grounding, pacing, and response cache; the other five are
+rendered deterministically from the stored design passes — `DESIGN.md` and
+`TASKS.md` as stamped copies of the canonical files, `ARCHITECTURE.md` and
+`README.md` with their title heading promoted to `#`, `DECISIONS.md`
+extracting the decision records, and `MEMORY.md` seeded from the candidate,
+facts sheet, and build memory. Everything is written into the same Design row
+(no second row), so `--pass N` regenerates individual documents and an
+interrupted pack resumes where it stopped.
+
+The pack critic is **off by default** (`--critic` opts in): its defect classes
+are tuned on design sections and tend to false-positive on pack documents.
+
+**`MEMORY.md` is seed-only.** Praxis writes it once — candidate, target
+machine, phases, decision records, build history — and the coding agent is
+expected to maintain it from then on; there is no auto-refresh yet.
+
 Track LLM token spend against the budget:
 
 ```bash
@@ -444,6 +481,7 @@ Everything else in the pipeline is implemented:
 
 - Optional Coder stage (`PRAXIS_CODER=off|opencode`, `praxis run --prototype`) with `blueprinted` as a first-class terminal state
 - Multi-pass design engine (`praxis design`) with facts-sheet constraints, source grounding, truncation guard, per-pass resume (`--pass N`, `--resume`), critic review, and `DESIGN.md`/`TASKS.md`/`AGENT_PROMPT.md` output
+- Planning docs pack (`praxis plan <id>`) — eleven-file hand-off bundle (PRD, ARCHITECTURE, ... `.env.example`) for a coding agent
 - Build-kit export (`praxis export <id>`) for building blueprints with any external coding agent
 - Golden-set evaluation (`praxis eval`) with adversarial prompt-injection fixtures
 - Prompt-injection hardening (untrusted-content delimiters in Analyst/Architect)
