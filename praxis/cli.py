@@ -662,6 +662,7 @@ def _design_and_write(
     model=None,
     rerun_passes=None,
     run_critic=True,
+    reuse_complete=False,
 ) -> int:
     """Run the design generator, write DESIGN/TASKS/AGENT_PROMPT, print paths."""
     from praxis.config import load_facts
@@ -678,6 +679,7 @@ def _design_and_write(
         model=model,
         rerun_passes=rerun_passes,
         run_critic=run_critic,
+        reuse_complete=reuse_complete,
     )
     if result.status != "complete" or not result.design_md:
         completed = ", ".join(result.completed_passes) or "none"
@@ -846,6 +848,7 @@ def _cmd_design(args) -> int:
         model=args.model,
         rerun_passes=rerun_passes,
         run_critic=not args.no_critic,
+        reuse_complete=args.resume or args.rerun_pass is not None,
     )
 
 

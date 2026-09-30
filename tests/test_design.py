@@ -416,6 +416,27 @@ def test_generate_design_failure_mid_pass_is_resumable(design_db, no_grounding, 
     assert json.loads(latest_design(design_db).passes_json)["technique"] == done["technique"]
 
 
+def test_get_or_create_design_reuse_complete(design_db):
+    """reuse_complete reuses the finished row; a plain run still starts over."""
+    import praxis.design as design_module
+    from praxis.db import Design, get_session
+
+    session = get_session()
+    design = Design(candidate_id=design_db, status="complete")
+    session.add(design)
+    session.commit()
+    complete_id = design.id
+    session.close()
+
+    reused = design_module._get_or_create_design(
+        design_db, "standard", None, None, reuse_complete=True
+    )
+    assert reused.id == complete_id
+
+    fresh = design_module._get_or_create_design(design_db, "standard", None, None)
+    assert fresh.id != complete_id
+
+
 # ---------------------------------------------------------------------------
 # Core pass scope: out-of-scope keys in passes_json are inert
 # ---------------------------------------------------------------------------

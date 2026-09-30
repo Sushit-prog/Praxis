@@ -385,6 +385,51 @@ def test_cli_design_resume_continues_partial(cli_discover_env, monkeypatch, caps
     assert json.loads(stored.passes_json)["technique"] == GOOD_PASSES["technique"]
 
 
+def test_cli_design_resume_reuses_complete_design(cli_discover_env, monkeypatch, capsys):
+    """--resume on a complete design re-renders it instead of spawning a new row."""
+    import json
+
+    import praxis.design as design_module
+    from praxis.db import Design, get_session, latest_design, save_design_pass
+    from praxis.design import PASS_IDS
+    from tests.test_design import GOOD_PASSES
+
+    cid = cli_discover_env
+
+    session = get_session()
+    design = Design(candidate_id=cid, status="complete")
+    session.add(design)
+    session.commit()
+    design_id = design.id
+    session.close()
+    for pass_id in PASS_IDS:
+        save_design_pass(design_id, pass_id, GOOD_PASSES[pass_id])
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("no LLM call expected: the complete design is reused")
+
+    monkeypatch.setattr(design_module, "call_llm", unexpected_call)
+
+    code = main(["design", str(cid), "--resume", "--no-critic"])
+    assert code == 0
+    assert "DESIGN.md" in capsys.readouterr().out
+
+    from sqlalchemy import func, select
+
+    session = get_session()
+    try:
+        count = session.scalar(
+            select(func.count()).select_from(Design).where(Design.candidate_id == cid)
+        )
+    finally:
+        session.close()
+    assert count == 1  # the complete row was reused, not replaced
+    stored = latest_design(cid)
+    assert stored is not None and stored.id == design_id
+    assert stored.status == "complete"
+    assert json.loads(stored.passes_json)["technique"] == GOOD_PASSES["technique"]
+
+
 def test_cli_design_without_resume_discards_partial(cli_discover_env, monkeypatch, capsys):
     """A fresh run (no --resume) abandons the stale partial design."""
     import json

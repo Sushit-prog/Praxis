@@ -1593,16 +1593,30 @@ def _store_pass_content(content: str) -> str:
 
 
 def _get_or_create_design(
-    candidate_id: int, depth: str | None, model: str | None, focus: str | None
+    candidate_id: int,
+    depth: str | None,
+    model: str | None,
+    focus: str | None,
+    *,
+    reuse_complete: bool = False,
 ) -> Design:
-    """Resume the newest in_progress design for the candidate, else create one."""
+    """Resume the newest resumable design for the candidate, else create one.
+
+    Resumable is ``in_progress`` (continue a partial run) plus ``complete``
+    when ``reuse_complete`` is set: ``--resume`` and ``--pass N`` operate on
+    the candidate's stored design, so a finished row must be reused (re-render
+    it, or regenerate one pass) instead of spawning an empty duplicate that
+    silently starts the whole design from scratch. Newest wins when both a
+    complete and a later in_progress row exist.
+    """
     from sqlalchemy import select
 
     session = get_session()
     try:
+        statuses = ("in_progress", "complete") if reuse_complete else ("in_progress",)
         existing = session.scalars(
             select(Design)
-            .where(Design.candidate_id == candidate_id, Design.status == "in_progress")
+            .where(Design.candidate_id == candidate_id, Design.status.in_(statuses))
             .order_by(Design.id.desc())
             .limit(1)
         ).first()
@@ -1680,13 +1694,16 @@ def generate_design(
     max_regeneration_rounds: int = 2,
     rerun_passes: list[str] | None = None,
     run_critic: bool = True,
+    reuse_complete: bool = False,
 ) -> DesignResult:
     """Run the multi-pass design generation for one candidate.
 
     Resumable: pass outputs are persisted after each pass, so a failure
-    mid-run leaves an in_progress design whose missing passes are regenerated
+    mid-run leaves a in_progress design whose missing passes are regenerated
     on the next call. ``rerun_passes`` forces regeneration of specific passes
     (from ``--pass N``) even if they are already stored; the rest are reused.
+    ``reuse_complete`` reuses an existing complete design row instead of
+    starting a new one (what ``--resume`` / ``--pass N`` intend).
     The critic pass runs once the 5 content passes are done; flagged sections
     are regenerated (bounded rounds), then the design is finalized.
     """
@@ -1697,7 +1714,9 @@ def generate_design(
     pace = PASS_PACING_S if pace_seconds is None else pace_seconds
     facts = facts or load_facts()
 
-    design = _get_or_create_design(candidate_id, depth, model, focus)
+    design = _get_or_create_design(
+        candidate_id, depth, model, focus, reuse_complete=reuse_complete
+    )
     done = _load_passes(design)
     for pass_id in rerun_passes or []:
         if pass_id not in PASS_IDS:

@@ -49,6 +49,11 @@ provider_limits:
   - "openrouter: UNVERIFIED: check before relying"
   - "cerebras: UNVERIFIED: check before relying"
   - "nvidia_nim: OPTIONAL hosted 70B-class fallback (litellm id nvidia_nim/nvidia/nemotron-3-super-120b-a12b, needs NVIDIA_NIM_API_KEY) - rate-limited free endpoint; designs must not depend on it"
+# Chain health (observed Sep 29, 2026): openrouter/openai/gpt-oss-120b:free
+# is dead (404, free tier withdrawn - paid slug only) and cerebras rejects
+# with "Payment required"; the effective design/plan chain today is
+# nvidia_nim -> groq only. Re-probe (praxis doctor --deep) before relying
+# on the later chain entries.
 # Per-model free-tier rate limits (tpm/itpm/otpm are PER-MINUTE pacing
 # budgets); each limit is optional and a model with no entry here (or a
 # missing limit) is NOT throttled by the design engine. Optional max_output
@@ -61,6 +66,12 @@ model_limits:
   - model: groq/openai/gpt-oss-20b
     tpm: 8000
     note: "observed on the free tier, Sep 2026, may change"
+  # KNOWN LIMITATION (flagged Sep 29, 2026, not fixed): otpm=1000 doubles as
+  # this model's per-request output ceiling, but design-pass budgets (2000
+  # tokens) are resolved against the chain LEAD (nvidia_nim, unclamped). A
+  # failover here truncates and fails fast: min(2x retry, ceiling=1000) can
+  # never exceed the failed 2000-token attempt. Fix later: re-clamp pass
+  # budgets per chain entry, or raise otpm/max_output.
   - model: groq/qwen/qwen3.8-27b
     itpm: 7000
     otpm: 1000
