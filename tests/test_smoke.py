@@ -33,7 +33,7 @@ def test_config_loads_env_override(monkeypatch):
     assert profile.gpu is True
 
 
-def test_call_llm_with_fake_completion(completion_func):
+def test_call_llm_with_fake_completion(db_session, completion_func):
     from praxis.llm import call_llm
 
     result = call_llm("hello", completion=completion_func)
