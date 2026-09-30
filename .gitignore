@@ -13,6 +13,7 @@ env/
 
 # Databases
 *.db
+praxis.db.bak-*
 
 # Env files
 .env
