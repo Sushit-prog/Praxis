@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="Print the blueprint markdown for a candidate.")
     show.add_argument("candidate_id", type=int, help="Candidate id to show.")
 
+    check_parser = sub.add_parser(
+        "check", help="Flag internally inconsistent content in a stored design."
+    )
+    check_parser.add_argument(
+        "candidate_id", type=int, help="Candidate id whose latest design to check."
+    )
+    check_parser.add_argument(
+        "--json", action="store_true", help="Print findings as a JSON list on stdout."
+    )
+
     export_parser = sub.add_parser(
         "export",
         help="Export a blueprint + coding-agent prompt as one markdown file (build kit).",
@@ -960,6 +970,53 @@ def _cmd_show(args) -> int:
     return 0
 
 
+def _cmd_check(args) -> int:
+    import json
+    from dataclasses import asdict
+
+    from praxis.config import load_facts
+    from praxis.consistency import (
+        SEVERITY_ERROR,
+        SEVERITY_INFO,
+        SEVERITY_WARNING,
+        run_checks,
+    )
+    from praxis.db import latest_design
+    from praxis.design_io import load_passes
+
+    design = latest_design(args.candidate_id)
+    if design is None:
+        print(f"error: candidate {args.candidate_id} has no design", file=sys.stderr)
+        return 1
+
+    findings = run_checks(load_passes(design), load_facts())
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[finding.severity] = counts.get(finding.severity, 0) + 1
+
+    if args.json:
+        print(json.dumps([asdict(f) for f in findings], indent=2))
+        return 1 if counts.get(SEVERITY_ERROR) else 0
+
+    markers = {
+        SEVERITY_ERROR: "[ERROR]",
+        SEVERITY_WARNING: "[WARN ]",
+        SEVERITY_INFO: "[INFO ]",
+    }
+    for finding in findings:
+        print(
+            f"{markers[finding.severity]} {finding.rule_id} "
+            f"{finding.pass_id}: {finding.message}"
+        )
+    print(
+        f"{counts.get(SEVERITY_ERROR, 0)} error(s), "
+        f"{counts.get(SEVERITY_WARNING, 0)} warning(s), "
+        f"{counts.get(SEVERITY_INFO, 0)} info",
+        file=sys.stderr,
+    )
+    return 1 if counts.get(SEVERITY_ERROR) else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1005,6 +1062,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_specs(args)
     if args.command == "show":
         return _cmd_show(args)
+    if args.command == "check":
+        return _cmd_check(args)
     if args.command == "export":
         return _cmd_export(args)
     if args.command == "eval":

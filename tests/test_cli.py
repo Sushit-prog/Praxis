@@ -1,4 +1,4 @@
-"""CLI tests for `praxis run`, `praxis status`, `praxis show`, and `praxis eval`."""
+"""CLI tests for `praxis run`, `praxis status`, `praxis show`, `praxis check`, and `praxis eval`."""
 
 from __future__ import annotations
 
@@ -71,6 +71,52 @@ def seeded_db(tmp_path, monkeypatch):
         )
         session.commit()
     return db_path
+
+
+@pytest.fixture
+def design_db(tmp_path, monkeypatch):
+    """A temp SQLite DB with one candidate whose stored design passes are all clean."""
+    from sqlalchemy.orm import Session
+
+    from praxis.consistency import KNOWN_PASS_IDS
+    from praxis.db import Base, Candidate, Design, get_engine
+
+    db_path = tmp_path / "check.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.setattr("praxis.config.load_facts", lambda *a, **k: None)
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        candidate = Candidate(
+            source="arxiv", url="https://a", title="Alpha", raw_text="x", status="designed"
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            Design(
+                candidate_id=candidate.id,
+                status="complete",
+                passes_json=json.dumps(
+                    {pid: "All numbers are internally consistent." for pid in KNOWN_PASS_IDS}
+                ),
+            )
+        )
+        session.commit()
+    return db_path
+
+
+def _set_passes(**overrides):
+    """Merge overrides into the seeded design's passes_json."""
+    from sqlalchemy.orm import Session
+
+    from praxis.db import Design, get_engine
+
+    with Session(get_engine()) as session:
+        design = session.get(Design, 1)
+        passes = json.loads(design.passes_json)
+        passes.update(overrides)
+        design.passes_json = json.dumps(passes)
+        session.commit()
 
 
 def test_cli_status_counts(seeded_db, capsys):
@@ -449,3 +495,67 @@ def test_cli_run_all_providers_cooling_exits_nonzero(monkeypatch, tmp_path, caps
 
     assert rc == 1
     assert "cooling down" in capsys.readouterr().err
+
+
+def test_check_missing_design_exits_1(design_db, capsys):
+    rc = main(["check", "999"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "no design" in captured.err
+    assert captured.out == ""
+
+
+def test_check_clean_design_exits_0(design_db, capsys):
+    rc = main(["check", "1"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "[ERROR]" not in captured.out
+    assert "[WARN ]" not in captured.out
+    assert "[INFO ]" not in captured.out
+    assert "0 error(s), 0 warning(s), 0 info" in captured.err
+
+
+def test_check_bad_r1_exits_1(design_db, capsys):
+    _set_passes(plan="The fallback is 2k × 3 MB is 6 MB.")
+
+    rc = main(["check", "1"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[ERROR] r1-arithmetic plan:" in captured.out
+    assert "1 error(s), 0 warning(s), 0 info" in captured.err
+
+
+def test_check_warning_only_exits_0(design_db, capsys):
+    _set_passes(
+        test_plan=(
+            "Requires ≤ 5 GB free storage remaining on the working volume "
+            "(per facts sheet)."
+        )
+    )
+
+    rc = main(["check", "1"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "[WARN ] r2-direction test_plan:" in captured.out
+    assert "[ERROR]" not in captured.out
+    assert "0 error(s), 1 warning(s), 0 info" in captured.err
+
+
+def test_check_json_output(design_db, capsys):
+    _set_passes(plan="The fallback is 2k × 3 MB is 6 MB.")
+
+    rc = main(["check", "1", "--json"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert len(data) == 1
+    assert set(data[0]) == {"rule_id", "severity", "pass_id", "excerpt", "message"}
+    assert data[0]["rule_id"] == "r1-arithmetic"
+    assert data[0]["severity"] == "error"
+    assert data[0]["pass_id"] == "plan"
+    assert captured.err == ""
