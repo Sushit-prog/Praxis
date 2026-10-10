@@ -276,7 +276,8 @@ non-gpt-oss models are never sent the parameter); every call targets input + out
 ≤ ~5000 tokens.
 
 `PRAXIS_DESIGN_MODEL` accepts a **comma-separated chain** of provider/model ids
-(`groq/openai/gpt-oss-120b, cerebras/gpt-oss-120b, openrouter/openai/gpt-oss-120b`):
+(`nvidia_nim/nvidia/nemotron-3-super-120b-a12b, groq/openai/gpt-oss-120b,
+openrouter/nvidia/nemotron-3.5-lightning:free`):
 a provider that keeps failing the run fails over to the next entry instead of
 ending it, and `praxis doctor` verifies every chain entry exists at its
 provider. Each pass receives the facts sheet (from `hardware_profile.yaml`) as
@@ -427,13 +428,17 @@ completion to every `PRAXIS_DESIGN_MODEL` chain entry and reports real
 failures (payment required, auth, model unavailable) with a fix hint — plain
 `praxis doctor` is unchanged.
 
-Job A consumes three free providers — **Groq, OpenRouter, Cerebras** — directly
-via litellm. Job B routes every Coder call through the local **omniroute
-gateway**, which owns the backends and does provider-level failover internally:
+Job A consumes three free providers — **NVIDIA NIM, Groq, OpenRouter** — directly
+via litellm (OpenRouter's free models are capped at 50 requests/day, counted
+only on success, so the openrouter entry is failover insurance rather than a
+workhorse; Cerebras remains a configured-but-unused provider — its billing
+endpoint rejects with "payment required"). Job B routes every Coder call
+through the local **omniroute gateway**, which owns the backends and does
+provider-level failover internally:
 
 | Job | Who calls | Keys live where | How switching works |
 |---|---|---|---|
-| **A — Analyst + Architect** (`praxis/providers.py` → `praxis/llm.py`) | litellm | Praxis env (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, with `PRAXIS_<PROVIDER>_API_KEY` overrides) | health-aware pool skips a cooling-down provider instantly — zero wasted LLM calls re-trying a dead key |
+| **A — Analyst + Architect** (`praxis/providers.py` → `praxis/llm.py`) | litellm | Praxis env (`NVIDIA_NIM_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, with `PRAXIS_<PROVIDER>_API_KEY` overrides) | health-aware pool skips a cooling-down provider instantly — zero wasted LLM calls re-trying a dead key |
 | **B — Coder** (`praxis/agents/coder.py` → OpenCode CLI) | `opencode run` against the omniroute gateway (`~/.config/opencode/opencode.json`, baseURL `http://localhost:20128/v1`) | the gateway's own auth store; opencode holds no direct provider keys | Praxis rotates the `--model omniroute/<id>` flag across the ids in `PRAXIS_CODER_MODELS` and detects exhaustion from exit output |
 
 So you hand Praxis **3 keys** (Job A). Job B's keys live inside the omniroute
@@ -491,7 +496,7 @@ Everything else in the pipeline is implemented:
 - Cost/token observability (`praxis usage`, per-batch spend footer)
 - LLM response caching (sha256-keyed, disable with `PRAXIS_LLM_CACHE=0`)
 - Model fallback (`PRAXIS_FALLBACK_MODELS`)
-- Multi-provider instant failover (Groq / OpenRouter / Cerebras, per-job keys, persisted cooldowns; `praxis providers`)
+- Multi-provider instant failover (NVIDIA NIM / Groq / OpenRouter, per-job keys, persisted cooldowns; `praxis providers`)
 - Pipeline resumability (`praxis run --resume`)
 - Confidence-aware borderline routing (`PRAXIS_BORDERLINE_MARGIN`)
 
