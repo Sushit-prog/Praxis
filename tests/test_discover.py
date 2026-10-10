@@ -205,6 +205,9 @@ def cli_discover_env(tmp_path, monkeypatch):
 
     db_path = tmp_path / "cli.db"
     monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    # design/discover gate on _require_provider_key(); these tests mock the LLM,
+    # so satisfy the preflight with a dummy key (presence is checked, never validity).
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_preflight")
     engine = get_engine()
     Base.metadata.create_all(engine)
     with Session(engine) as session:

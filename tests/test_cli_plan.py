@@ -63,6 +63,9 @@ def plan_env(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # designs/ lands in tmp; repo .env stays hidden
     monkeypatch.setenv("PRAXIS_DESIGN_MODEL", "groq/openai/gpt-oss-120b")
     monkeypatch.setenv("PRAXIS_DETECT_HW", "0")
+    # design/plan gate on _require_provider_key(); these tests mock the LLM, so
+    # satisfy the preflight with a dummy key (presence is checked, never validity).
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_preflight")
 
     engine = get_engine()
     Base.metadata.create_all(engine)
