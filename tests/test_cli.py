@@ -559,3 +559,99 @@ def test_check_json_output(design_db, capsys):
     assert data[0]["severity"] == "error"
     assert data[0]["pass_id"] == "plan"
     assert captured.err == ""
+
+
+# ---------------------------------------------------------------------------
+# providers key annotation + keyless preflight
+# ---------------------------------------------------------------------------
+
+_KEY_ENV_VARS = (
+    "GROQ_API_KEY",
+    "NVIDIA_NIM_API_KEY",
+    "OPENROUTER_API_KEY",
+    "CEREBRAS_API_KEY",
+    "PRAXIS_GROQ_API_KEY",
+    "PRAXIS_NVIDIA_NIM_API_KEY",
+    "PRAXIS_OPENROUTER_API_KEY",
+    "PRAXIS_CEREBRAS_API_KEY",
+)
+
+
+def _scrub_provider_keys(monkeypatch):
+    for var in _KEY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_cli_providers_annotates_key_presence(tmp_path, monkeypatch, capsys):
+    from sqlalchemy.orm import Session
+
+    from praxis.db import Base, ProviderHealth, get_engine
+
+    _scrub_provider_keys(monkeypatch)
+    monkeypatch.setattr("praxis.cli._load_env", lambda: None)
+    db_path = tmp_path / "p.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(ProviderHealth(job="pipeline", provider="groq", state="healthy"))
+        session.add(ProviderHealth(job="coder", provider="omniroute", state="healthy"))
+        session.commit()
+
+    assert main(["providers"]) == 0
+    out = capsys.readouterr().out
+    assert "[pipeline] groq: healthy (key: missing — run praxis doctor)" in out
+    assert "[coder] omniroute: healthy\n" in out  # coder keys are gateway-owned
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_present")
+    assert main(["providers"]) == 0
+    out = capsys.readouterr().out
+    assert "[pipeline] groq: healthy (key: set)" in out
+
+
+def test_require_provider_key_unit(monkeypatch):
+    from praxis.cli import _require_provider_key
+
+    _scrub_provider_keys(monkeypatch)
+    assert _require_provider_key() == 1
+    monkeypatch.setenv("PRAXIS_OPENROUTER_API_KEY", "or-key")
+    assert _require_provider_key() is None
+    monkeypatch.setenv("PRAXIS_OPENROUTER_API_KEY", "")  # empty counts as missing
+    assert _require_provider_key() == 1
+
+
+def test_cli_design_keyless_preflight(design_db, monkeypatch, capsys):
+    _scrub_provider_keys(monkeypatch)
+    monkeypatch.setattr("praxis.cli._load_env", lambda: None)
+
+    rc = main(["design", "1"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "no provider key configured" in captured.err
+    assert "praxis doctor" in captured.err
+
+
+def test_cli_plan_keyless_preflight(design_db, monkeypatch, capsys):
+    _scrub_provider_keys(monkeypatch)
+    monkeypatch.setattr("praxis.cli._load_env", lambda: None)
+
+    rc = main(["plan", "1"])
+
+    assert rc == 1
+    assert "no provider key configured" in capsys.readouterr().err
+
+
+def test_cli_discover_keyless_preflight(tmp_path, monkeypatch, capsys):
+    from praxis.db import Base, get_engine
+
+    _scrub_provider_keys(monkeypatch)
+    monkeypatch.setattr("praxis.cli._load_env", lambda: None)
+    db_path = tmp_path / "d.db"
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{db_path}")
+    Base.metadata.create_all(get_engine())
+
+    rc = main(["discover", "--topic", "anything"])
+
+    assert rc == 1
+    assert "no provider key configured" in capsys.readouterr().err

@@ -506,6 +506,7 @@ def _cmd_providers(args) -> int:
     from datetime import UTC, datetime
 
     from praxis.db import provider_health_rows
+    from praxis.doctor import _provider_key
 
     # Schema is guaranteed by _ensure_schema(); no rows is the empty case.
     rows = provider_health_rows()
@@ -524,7 +525,13 @@ def _cmd_providers(args) -> int:
             state = f"cooling_down {max(0, leftover_s)}s left{signal}"
         else:
             state = "healthy"
-        print(f"  [{row.job}] {row.provider}: {state}")
+        # "healthy" only means "not cooling down"; a pool row with no key can
+        # never actually serve a call, so say so instead of looking ready.
+        key_note = ""
+        if row.job == "pipeline":
+            has_key = _provider_key(row.provider)
+            key_note = " (key: set)" if has_key else " (key: missing — run praxis doctor)"
+        print(f"  [{row.job}] {row.provider}: {state}{key_note}")
     return 0
 
 
@@ -782,6 +789,9 @@ def _cmd_discover(args) -> int:
     from praxis.design_io import record_pick
     from praxis.discover import discover, focus_note, format_table, prompt_pick
 
+    blocked = _require_provider_key()
+    if blocked is not None:
+        return blocked
     facts = load_facts()
     profile = HardwareProfile(
         cpu_only=facts.cpu_only,
@@ -850,6 +860,27 @@ def _print_design_passes(candidate_id: int) -> int:
     return 0
 
 
+def _require_provider_key() -> int | None:
+    """Fail fast, with a clear hint, when no Job-A provider key is configured.
+
+    Returns None when at least one key exists, else 1 after printing the
+    error. `praxis run` deliberately skips this: a fully-cached resume can
+    complete keyless, and the analyst calls already fail with their own
+    provider errors when a key is missing mid-run.
+    """
+    from praxis.doctor import _provider_key
+
+    if any(_provider_key(p) for p in ("groq", "nvidia_nim", "openrouter", "cerebras")):
+        return None
+    print(
+        "error: no provider key configured "
+        "(set GROQ_API_KEY / NVIDIA_NIM_API_KEY / OPENROUTER_API_KEY); "
+        "run 'praxis doctor' for the full pre-flight",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _cmd_design(args) -> int:
     from praxis.config import HardwareProfile, load_facts
     from praxis.design import PASS_IDS
@@ -858,6 +889,9 @@ def _cmd_design(args) -> int:
     if getattr(args, "show", False):
         return _print_design_passes(args.candidate_id)
 
+    blocked = _require_provider_key()
+    if blocked is not None:
+        return blocked
     candidate = get_candidate(args.candidate_id)
     if candidate is None:
         print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
@@ -899,6 +933,9 @@ def _cmd_plan(args) -> int:
     from praxis.discover import get_candidate
     from praxis.planning import generate_doc_pack
 
+    blocked = _require_provider_key()
+    if blocked is not None:
+        return blocked
     candidate = get_candidate(args.candidate_id)
     if candidate is None:
         print(f"error: no candidate with id {args.candidate_id}", file=sys.stderr)
