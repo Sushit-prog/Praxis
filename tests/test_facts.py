@@ -57,7 +57,13 @@ def test_load_facts_reads_full_profile():
     assert by_model["groq/openai/gpt-oss-20b"].tpm == 8000
     qwen = by_model["groq/qwen/qwen3.8-27b"]
     assert qwen.itpm == 7000 and qwen.otpm == 1000
-    assert all("Sep 2026" in e.note for e in facts.model_limits)
+    # Observation dates: the Sep 2026 sweep seeded the original entries; the
+    # chain re-probe added entries observed in Oct 2026. Accept both, in any
+    # date form the sweep writes ("Sep 2026", "Oct 2026", "Oct 10, 2026").
+    assert all(
+        ("Sep 2026" in e.note) or ("Oct 2026" in e.note) or ("Oct 10, 2026" in e.note)
+        for e in facts.model_limits
+    )
     notes = " | ".join(facts.stack_notes)
     assert "llama.cpp" in notes and "GGUF" in notes
     assert "Ollama" in notes
@@ -66,10 +72,11 @@ def test_load_facts_reads_full_profile():
     assert any("SQLite" in note for note in facts.stack_notes)
     assert any("CUDA-only" in note for note in facts.stack_notes)
     assert any("Docker" in note or "WSL2" in note for note in facts.stack_notes)
-    # Hosted option: optional, rate-limited, never a hard dependency.
+    # Hosted lead: rate-limited, in the design chain, degrades via failover.
     limits = " | ".join(facts.provider_limits)
     assert "nvidia_nim/nvidia/nemotron-3-super-120b-a12b" in limits
-    assert "rate-limited" in limits and "must not depend on it" in limits
+    assert "rate-limited" in limits and "design-chain LEAD" in limits
+    assert "degrade gracefully to the groq/openrouter entries" in limits
 
 
 def test_env_overrides_beat_yaml(tmp_path, monkeypatch):

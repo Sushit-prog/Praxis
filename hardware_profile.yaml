@@ -46,14 +46,18 @@ avoid:
   - CUDA-only libraries
   - VPS unless justified
 provider_limits:
-  - "openrouter: UNVERIFIED: check before relying"
-  - "cerebras: UNVERIFIED: check before relying"
-  - "nvidia_nim: OPTIONAL hosted 70B-class fallback (litellm id nvidia_nim/nvidia/nemotron-3-super-120b-a12b, needs NVIDIA_NIM_API_KEY) - rate-limited free endpoint; designs must not depend on it"
-# Chain health (observed Sep 29, 2026): openrouter/openai/gpt-oss-120b:free
-# is dead (404, free tier withdrawn - paid slug only) and cerebras rejects
-# with "Payment required"; the effective design/plan chain today is
-# nvidia_nim -> groq only. Re-probe (praxis doctor --deep) before relying
-# on the later chain entries.
+  - "openrouter: VERIFIED Oct 10, 2026 - nvidia/nemotron-3.5-lightning:free answers 1-token probes; free tier is 50 requests/day (counted only on success)"
+  - "cerebras: billing dead (payment required, Sep 29, 2026) - key kept but removed from the design chain; do not rely on it"
+  - "nvidia_nim: design-chain LEAD (litellm id nvidia_nim/nvidia/nemotron-3-super-120b-a12b, needs NVIDIA_NIM_API_KEY) - rate-limited free endpoint; designs must degrade gracefully to the groq/openrouter entries when it is unavailable"
+# Chain health (re-probed Oct 10, 2026): the effective design/plan chain is
+# nvidia_nim -> groq/openai/gpt-oss-120b -> openrouter/nvidia/nemotron-3.5-
+# lightning:free. Replaced entries: openrouter/openai/gpt-oss-120b:free (dead,
+# 404 "unavailable for free"), groq/qwen/qwen3.8-27b (otpm=1000 could not
+# serve the 2000-token design/plan budgets - see its entry below),
+# cerebras/qwen-3.8-27b (payment required). OpenRouter free candidates ruled
+# out: thinkingmachines/inkling{,-small}:free 403 "agentic harnesses only",
+# nvidia/nemotron-3-ultra-550b-a55b:free timed out twice at 30s. Re-probe
+# (praxis doctor --deep) before relying on any entry.
 # Per-model free-tier rate limits (tpm/itpm/otpm are PER-MINUTE pacing
 # budgets); each limit is optional and a model with no entry here (or a
 # missing limit) is NOT throttled by the design engine. Optional max_output
@@ -66,16 +70,29 @@ model_limits:
   - model: groq/openai/gpt-oss-20b
     tpm: 8000
     note: "observed on the free tier, Sep 2026, may change"
-  # KNOWN LIMITATION (flagged Sep 29, 2026, not fixed): otpm=1000 doubles as
-  # this model's per-request output ceiling, but design-pass budgets (2000
-  # tokens) are resolved against the chain LEAD (nvidia_nim, unclamped). A
-  # failover here truncates and fails fast: min(2x retry, ceiling=1000) can
-  # never exceed the failed 2000-token attempt. Fix later: re-clamp pass
-  # budgets per chain entry, or raise otpm/max_output.
+  # KNOWN LIMITATION (flagged Sep 29, 2026, mitigated Oct 10, 2026 by moving
+  # this model out of PRAXIS_DESIGN_MODEL): otpm=1000 doubles as this model's
+  # per-request output ceiling, while design/plan pass budgets (1200-2000
+  # tokens) are resolved against the chain LEAD. A failover here truncates
+  # and fails fast: min(2x retry, ceiling=1000) can never exceed the failed
+  # attempt, so the entry burns one call and skips ahead. Still applies to
+  # ANY otpm-limited model put in the chain. Fix if reintroduced: re-clamp
+  # pass budgets per chain entry, or raise otpm/max_output.
   - model: groq/qwen/qwen3.8-27b
     itpm: 7000
     otpm: 1000
-    note: "observed on the free tier, Sep 2026, may change"
+    note: "observed on the free tier, Sep 2026; NOT in PRAXIS_DESIGN_MODEL since Oct 10, 2026"
   - model: nvidia_nim/nvidia/nemotron-3-super-120b-a12b
     max_output: 4096
     note: "observed Sep 2026: pack pass env_example truncated twice at 1200 output tokens; 4096 covers current pass budgets - pacing (tpm/otpm) not yet observed"
+  # Third chain entry (verified Oct 10, 2026). max_output observed from the
+  # OpenRouter models endpoint (top_provider.max_completion_tokens=65536);
+  # a max_tokens=65537 request was ACCEPTED, so the router enforces the 1M
+  # context window rather than the 65536 figure - use it as a conservative
+  # per-request ceiling, not a hard wire limit. tpm/itpm/otpm deliberately
+  # unset: they are not observable from the API, and a model with no entry is
+  # not paced by the design engine. Free tier is 50 REQUESTS/day (only
+  # successes count), so this entry is failover insurance, not a workhorse.
+  - model: openrouter/nvidia/nemotron-3.5-lightning:free
+    max_output: 65536
+    note: "observed Oct 10, 2026; default reasoning is ON (222 of 239 completion tokens on a trivial ping), so effective content output per pass is lower than max_output"
