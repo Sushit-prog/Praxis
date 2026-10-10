@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,38 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from praxis.config import HardwareProfile  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _deep_isolation(tmp_path_factory):
+    """Keep the suite off the developer's real ./praxis.db.
+
+    Any test that does not set its own PRAXIS_DB_URL gets a throwaway
+    database instead of the default ledger, and the session fails loudly if
+    ./praxis.db (or its WAL sidecars) still changes — some code path opened
+    the default ledger and must be fixed to point at a temp DB.
+    """
+    default_db = Path.cwd() / "praxis.db"
+
+    def _snapshot():
+        paths = [default_db, Path(f"{default_db}-wal"), Path(f"{default_db}-shm")]
+        return {
+            p: (p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None
+            for p in paths
+        }
+
+    before = _snapshot()
+    suite_db = tmp_path_factory.mktemp("ledger") / "suite.db"
+    os.environ["PRAXIS_DB_URL"] = f"sqlite:///{suite_db.as_posix()}"
+    yield
+    if os.environ.get("PRAXIS_DB_URL") == f"sqlite:///{suite_db.as_posix()}":
+        del os.environ["PRAXIS_DB_URL"]
+    after = _snapshot()
+    if before != after:
+        pytest.fail(
+            "the default ./praxis.db was opened/modified during the suite; "
+            "tests must set PRAXIS_DB_URL (or PRAXIS_DB_PATH) to a temp database"
+        )
 
 
 def fake_completion(**kwargs):

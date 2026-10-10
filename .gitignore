@@ -23,6 +23,9 @@ praxis.db.bak-*
 .ruff_cache/
 .mypy_cache/
 
+# OpenCode plan/session files (plans, not project artifacts)
+.opencode/
+
 # Grounding fetch cache (arXiv/GitHub source text)
 .praxis-cache/
 

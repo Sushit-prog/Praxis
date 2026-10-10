@@ -258,6 +258,9 @@ def _deep_isolation(monkeypatch, tmp_path):
 
     from praxis.db import Base
 
+    # Without this, run_doctor_checks()' DB check resolves the default
+    # ./praxis.db and writes the developer's real ledger mid-suite.
+    monkeypatch.setenv("PRAXIS_DB_URL", f"sqlite:///{(tmp_path / 'deep.db').as_posix()}")
     engine = create_engine(f"sqlite:///{tmp_path / 'doctor.db'}")
     Base.metadata.create_all(engine)
 
