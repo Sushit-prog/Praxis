@@ -282,6 +282,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan_parser.set_defaults(run_critic=False)
 
+    handoff_parser = sub.add_parser(
+        "handoff",
+        help=(
+            "Export a finished design's docs pack into a fresh project "
+            "directory for a coding agent (checks, copy, git init, "
+            "HANDOFF_PROMPT.md)."
+        ),
+    )
+    handoff_parser.add_argument(
+        "candidate_id", type=int, help="Candidate id whose design to hand off."
+    )
+    handoff_parser.add_argument(
+        "target", help="Target directory for the new project (must be outside the repo)."
+    )
+    handoff_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Allow a non-empty target (overwrite-merge, extras kept) and "
+            "non-pack entries in docs/ (they are skipped, never copied)."
+        ),
+    )
+    handoff_parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="Export even if the stored design has consistency errors.",
+    )
+
     return parser
 
 
@@ -1017,6 +1045,17 @@ def _cmd_check(args) -> int:
     return 1 if counts.get(SEVERITY_ERROR) else 0
 
 
+def _cmd_handoff(args) -> int:
+    from praxis.handoff import run_handoff
+
+    return run_handoff(
+        args.candidate_id,
+        args.target,
+        force=args.force,
+        skip_check=args.skip_check,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1094,6 +1133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             logging.error("praxis plan failed: %s", exc)
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    if args.command == "handoff":
+        return _cmd_handoff(args)
 
     parser.print_help()
     return 0
