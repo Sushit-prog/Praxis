@@ -30,6 +30,8 @@ RULE_R1 = "r1-arithmetic"
 RULE_R2 = "r2-direction"
 RULE_R4_LEAVING = "r4-leaving"
 RULE_R4_CAP = "r4-cap"
+RULE_R3 = "r3-dependency"
+RULE_R5 = "r5-metric"
 RULE_REGISTRY_UNKNOWN = "registry-unknown"
 RULE_REGISTRY_MISSING = "registry-missing"
 
@@ -373,6 +375,171 @@ def check_r4(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list
 
 
 # ---------------------------------------------------------------------------
+# R3 (warning): two passes prescribe different packages for the same slot
+# ---------------------------------------------------------------------------
+
+# Curated software slots (v1): each maps a slot to the packages that can fill
+# it. Only backticked tokens count, so the English word "requests" ("queue
+# requests") can never match the HTTP-client slot.
+_DEPENDENCY_SLOTS: dict[str, frozenset[str]] = {
+    "http client": frozenset({"requests", "httpx", "urllib3", "aiohttp"}),
+    "llm orchestration": frozenset({"langgraph", "langchain"}),
+    "embeddings": frozenset({"sentence-transformers", "fastembed"}),
+}
+_BACKTICK = re.compile(r"`([^`\n]+)`")
+
+
+def _check_r3(passes: Mapping[str, str]) -> list[Finding]:
+    occurrences: dict[str, dict[str, set[str]]] = {
+        slot: {} for slot in _DEPENDENCY_SLOTS
+    }
+    excerpts: dict[tuple[str, str], str] = {}
+    for pass_id, raw in passes.items():
+        text = _strip_fences(_normalize(raw))
+        for m in _BACKTICK.finditer(text):
+            token = m.group(1).strip().lower().replace("_", "-")
+            for slot, packages in _DEPENDENCY_SLOTS.items():
+                if token in packages:
+                    occurrences[slot].setdefault(token, set()).add(pass_id)
+                    excerpts.setdefault((slot, token), _excerpt(text, m.start(), m.end()))
+    findings: list[Finding] = []
+    for slot, by_package in occurrences.items():
+        packages = sorted(by_package)
+        # A conflicting pair: two different packages that never appear in the
+        # same pass. Co-presence in one pass = acknowledged comparison.
+        pair: tuple[str, str] | None = None
+        for i, a in enumerate(packages):
+            for b in packages[i + 1 :]:
+                if by_package[a].isdisjoint(by_package[b]):
+                    pair = (a, b)
+                    break
+            if pair:
+                break
+        if pair is None:
+            continue
+        a, b = pair
+        anchor = min(by_package[a] | by_package[b])
+        findings.append(
+            Finding(
+                RULE_R3,
+                SEVERITY_WARNING,
+                anchor,
+                excerpts[(slot, a)],
+                f"dependency conflict: pass {sorted(by_package[a])[0]!r} requires "
+                f"{a!r} ({slot}), pass {sorted(by_package[b])[0]!r} requires "
+                f"{b!r}; the two passes never mention each other's package",
+            )
+        )
+    return findings
+
+
+def check_r3(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+    del facts  # text-internal rule
+    try:
+        return _check_r3(passes)
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# ---------------------------------------------------------------------------
+# R5 (warning): two passes prescribe different similarity metrics for
+# vector retrieval
+# ---------------------------------------------------------------------------
+
+_METRIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("cosine", re.compile(r"\bcosine\b", re.I)),
+    ("euclidean", re.compile(r"\beuclidean\b|\bL2\s+(?:distance|metric)\b", re.I)),
+    ("dot product", re.compile(r"\bdot[\s-]product\b", re.I)),
+    ("manhattan", re.compile(r"\bmanhattan\b", re.I)),
+)
+# Context that makes a metric claim about vector retrieval, as opposed to a
+# dedup threshold or a norm note ("L2 norm ~ 1.0"). Bare "similarity" is
+# deliberately absent.
+_RETRIEVAL_CTX = re.compile(
+    r"k[\s‐\-‑–—]?nn|nearest|retriev|vector\s+search|"
+    r"over\s+(?:all\s+)?(?:stored\s+)?embeddings",
+    re.I,
+)
+
+# A period inside a backticked identifier (`records.embedding`) is not a
+# clause boundary; mask those dots 1:1 so excerpts stay position-accurate.
+_DOT_MASK = "\x01"
+_BACKTICK_SPAN = re.compile(r"`[^`\n]+`")
+
+
+def _mask_backtick_dots(text: str) -> str:
+    return _BACKTICK_SPAN.sub(lambda m: m.group(0).replace(".", _DOT_MASK), text)
+
+
+def _primary_metric(text: str) -> tuple[str, int, int] | None:
+    """First retrieval-context metric claim in document order, if any."""
+    pos = 0
+    for clause in _BOUNDARY.split(text):
+        clause_start = pos
+        pos += len(clause) + 1  # +1 for the split delimiter
+        if not _RETRIEVAL_CTX.search(clause):
+            continue
+        best: tuple[int, str, int, int] | None = None
+        for metric, pattern in _METRIC_PATTERNS:
+            m = pattern.search(clause)
+            if m and (best is None or m.start() < best[0]):
+                best = (m.start(), metric, clause_start + m.start(), clause_start + m.end())
+        if best:
+            return best[1], best[2], best[3]
+    return None
+
+
+def _check_r5(passes: Mapping[str, str]) -> list[Finding]:
+    by_metric: dict[str, list[str]] = {}
+    excerpts: dict[str, str] = {}
+    primary_pass: dict[str, str] = {}
+    for pass_id, raw in passes.items():
+        # Unlike r1/r2/r4, r5 deliberately does NOT strip fenced blocks: the
+        # prescribed metric usually lives in the pseudocode fence, which is
+        # still a prescription, not a mere snippet.
+        text = _normalize(raw)
+        primary = _primary_metric(_mask_backtick_dots(text))
+        if primary is None:
+            continue
+        metric, start, end = primary
+        primary_pass[pass_id] = metric
+        by_metric.setdefault(metric, []).append(pass_id)
+        excerpts.setdefault(pass_id, _excerpt(text, start, end).replace(_DOT_MASK, "."))
+    if len(by_metric) < 2:
+        return []
+    anchor_pass = min(primary_pass)
+    anchor_metric = primary_pass[anchor_pass]
+    findings: list[Finding] = []
+    for metric in sorted(by_metric):
+        if metric == anchor_metric:
+            continue
+        pass_id = min(by_metric[metric])
+        anchor_others = [p for p in sorted(by_metric[anchor_metric]) if p != anchor_pass]
+        detail = f"but pass {anchor_pass!r} prescribes '{anchor_metric}'"
+        if anchor_others:
+            detail += f" (also: {', '.join(anchor_others)})"
+        findings.append(
+            Finding(
+                RULE_R5,
+                SEVERITY_WARNING,
+                pass_id,
+                excerpts[pass_id],
+                f"metric conflict: pass {pass_id!r} prescribes '{metric}' for "
+                f"vector retrieval, {detail}",
+            )
+        )
+    return findings
+
+
+def check_r5(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+    del facts  # text-internal rule
+    try:
+        return _check_r5(passes)
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Registry: unknown pass key (warning), missing pass key (info)
 # ---------------------------------------------------------------------------
 
@@ -408,7 +575,7 @@ def _registry(passes: Mapping[str, str]) -> list[Finding]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-RULES = (check_r1, check_r2, check_r4)
+RULES = (check_r1, check_r2, check_r4, check_r3, check_r5)
 
 
 def run_checks(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:

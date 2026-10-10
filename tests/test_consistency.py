@@ -12,8 +12,10 @@ from praxis.consistency import (
     KNOWN_PASS_IDS,
     RULE_R1,
     RULE_R2,
+    RULE_R3,
     RULE_R4_CAP,
     RULE_R4_LEAVING,
+    RULE_R5,
     RULE_REGISTRY_MISSING,
     RULE_REGISTRY_UNKNOWN,
     SEVERITY_ERROR,
@@ -22,7 +24,9 @@ from praxis.consistency import (
     Finding,
     check_r1,
     check_r2,
+    check_r3,
     check_r4,
+    check_r5,
     run_checks,
 )
 
@@ -244,6 +248,136 @@ def test_r4_short_gap_guard_no_false_positive():
         "free storage constraints (5 GB available, keeping <100MB per design)"
     )
     assert check_r4({"env_example": text}) == []
+
+
+# ---------------------------------------------------------------------------
+# R3 (warning): dependency conflict across passes
+# ---------------------------------------------------------------------------
+
+# Verbatim from the real design-5 contradiction (TASKS.md:8 vs SECURITY.md:15).
+_R3_BAD_PLAN = (
+    "Install Python 3.11, required packages (`requests`, `sqlite3`, "
+    "`sentence‑transformers`, `scikit‑learn`)."
+)
+_R3_BAD_SECURITY = (
+    "The dependency list is deliberately minimal: core packages include "
+    "`langgraph`, `sentence-transformers`, `sqlite3` (standard library), "
+    "`httpx` for API calls, and `pytest` for testing."
+)
+
+
+def test_r3_dependency_conflict_flagged():
+    findings = check_r3({"plan": _R3_BAD_PLAN, "security": _R3_BAD_SECURITY})
+    assert len(findings) == 1
+    f = findings[0]
+    assert (f.rule_id, f.severity) == (RULE_R3, SEVERITY_WARNING)
+    assert f.pass_id == "plan"  # alphabetically first of the conflicting pair
+    assert "requests" in f.message and "httpx" in f.message
+    assert "plan" in f.message and "security" in f.message
+
+
+def test_r3_dependency_clean_same_pass_acknowledged():
+    assert check_r3({"security": "Use `httpx` instead of `requests` for calls."}) == []
+
+
+def test_r3_dependency_clean_same_package_across_passes():
+    plan = "Install `httpx` and `sentence-transformers`."
+    security = "Core packages: `httpx`, `sentence-transformers`."
+    assert check_r3({"plan": plan, "security": security}) == []
+
+
+def test_r3_dependency_clean_english_word_requests():
+    text = "Queue requests if TPM > 7,000 and retry with backoff."
+    assert check_r3({"architecture": text}) == []
+
+
+def test_r3_dependency_clean_third_pass_acknowledges_both():
+    plan = "Install `requests`."
+    security = "Use `httpx`, not `requests`."
+    assert check_r3({"plan": plan, "security": security}) == []
+
+
+def test_r3_dependency_silent_on_malformed_input():
+    assert check_r3({"plan": None}) == []  # type: ignore[dict-item]
+    assert check_r3({"plan": object()}) == []  # type: ignore[dict-item]
+
+
+# ---------------------------------------------------------------------------
+# R5 (warning): similarity-metric conflict across passes
+# ---------------------------------------------------------------------------
+
+# Verbatim from the real design-5 contradiction (DESIGN.md:257 vs PRD.md:22).
+_R5_BAD_DATA_CONTRACTS = "1. Perform k‑NN over `records.embedding` (Euclidean distance)."
+_R5_BAD_PRD = (
+    "RetrievalEngine shall perform k-NN cosine similarity over stored embeddings, "
+    "re-rank results using `score = a*sim + b*R_m - c*nu_m` and return the "
+    "top-k records."
+)
+
+
+def test_r5_metric_conflict_flagged():
+    findings = check_r5({"data_contracts": _R5_BAD_DATA_CONTRACTS, "prd": _R5_BAD_PRD})
+    assert len(findings) == 1
+    f = findings[0]
+    assert (f.rule_id, f.severity) == (RULE_R5, SEVERITY_WARNING)
+    assert f.pass_id == "prd"  # first pass (alphabetically) using the minority metric
+    assert "cosine" in f.message and "euclidean" in f.message
+    assert "cosine similarity" in f.excerpt  # excerpt is from the minority pass
+
+
+def test_r5_metric_clean_all_cosine():
+    passes = {
+        "prd": "k-NN cosine similarity over stored embeddings.",
+        "test_plan": "returns the top-k nearest vectors sorted by cosine similarity",
+        "data_contracts": "Perform k‑NN over `records.embedding` (cosine distance).",
+    }
+    assert check_r5(passes) == []
+
+
+def test_r5_metric_clean_non_retrieval_comparison():
+    text = "Euclidean distance and cosine similarity rank unit vectors differently."
+    assert check_r5({"architecture": text}) == []
+
+
+def test_r5_metric_clean_dedup_threshold_not_retrieval():
+    text = "Detect pairs of active records with cosine similarity > threshold."
+    assert check_r5({"data_contracts": text}) == []
+
+
+def test_r5_metric_clean_l2_norm_note():
+    text = "yields a vector of length 384 with L2 norm ~ 1.0 (inference)."
+    assert check_r5({"prd": text}) == []
+
+
+def test_r5_metric_clean_fenced_non_retrieval_block():
+    """r5 scans fences, but the metric claim still needs retrieval context."""
+    text = (
+        "# Scratch notes\n\n"
+        "```\n"
+        "Euclidean distance and cosine similarity rank unit vectors differently.\n"
+        "```\n"
+    )
+    assert check_r5({"architecture": text}) == []
+
+
+def test_r5_metric_silent_on_malformed_input():
+    assert check_r5({"prd": None}) == []  # type: ignore[dict-item]
+    assert check_r5({"prd": object()}) == []  # type: ignore[dict-item]
+
+
+def test_new_rules_warnings_only_exit_semantics():
+    """The real contradiction text yields warnings (exit 0), never errors."""
+    passes = {
+        "plan": _R3_BAD_PLAN,
+        "security": _R3_BAD_SECURITY,
+        "data_contracts": _R5_BAD_DATA_CONTRACTS,
+        "prd": _R5_BAD_PRD,
+    }
+    findings = run_checks(passes)
+    r3 = _rule(findings, RULE_R3)
+    r5 = _rule(findings, RULE_R5)
+    assert len(r3) == 1 and len(r5) == 1
+    assert not [f for f in findings if f.severity == SEVERITY_ERROR]
 
 
 # ---------------------------------------------------------------------------
