@@ -1080,7 +1080,7 @@ def _cmd_check(args) -> int:
         SEVERITY_WARNING,
         run_checks,
     )
-    from praxis.db import get_design_meta, latest_design
+    from praxis.db import get_design_meta, latest_blueprint, latest_design
     from praxis.design import PROVENANCE_VERSION
     from praxis.design_io import load_passes
 
@@ -1090,10 +1090,13 @@ def _cmd_check(args) -> int:
         return 1
 
     meta = get_design_meta(design.id) if design.id is not None else {}
+    blueprint = latest_blueprint(args.candidate_id)
+    facts = load_facts()
     findings = run_checks(
         load_passes(design),
-        load_facts(),
+        facts,
         stamped=meta.get("pack_version") == PROVENANCE_VERSION,
+        blueprint=blueprint.blueprint_md if blueprint is not None else None,
     )
     counts: dict[str, int] = {}
     for finding in findings:
@@ -1119,6 +1122,13 @@ def _cmd_check(args) -> int:
         f"{counts.get(SEVERITY_INFO, 0)} info",
         file=sys.stderr,
     )
+    if facts is not None:
+        print(
+            "checked against: usable RAM "
+            f"{facts.usable_ram_gb} GB, cpu_only={facts.cpu_only}, "
+            f"local_only={facts.local_only}",
+            file=sys.stderr,
+        )
     return 1 if counts.get(SEVERITY_ERROR) else 0
 
 

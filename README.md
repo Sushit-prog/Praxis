@@ -39,15 +39,23 @@ praxis handoff <id> ../MyProject   # no key required
 
 ## Sample output
 
-`praxis check 5` (the MemGuard design pack) — two warnings, exit 0:
+`praxis check 5` (the MemGuard design pack) — seven warnings (five from the older single-pass Architect blueprint), two info, exit 0:
 
 ```
+[WARN ] r10-stack-fit blueprint: ram-claim: states an 8 GB bound; usable headroom is 4 GB
+[WARN ] r10-stack-fit blueprint: remote-host: unit prescribes a rented/remote host but the facts sheet is local-only (local_only=True)
+[WARN ] r10-stack-fit blueprint: cuda-only: unit mentions CUDA tooling but the facts sheet is CPU-only (cpu_only=True)
+[WARN ] r10-stack-fit blueprint: remote-host: unit prescribes a rented/remote host but the facts sheet is local-only (local_only=True)
+[WARN ] r10-stack-fit blueprint: cuda-only: unit mentions CUDA tooling but the facts sheet is CPU-only (cpu_only=True)
 [WARN ] r3-dependency plan: dependency conflict: pass 'security' requires 'httpx' (http client), pass 'plan' requires 'requests'; the two passes never mention each other's package
 [WARN ] r5-metric prd: metric conflict: pass 'prd' prescribes 'cosine' for vector retrieval, but pass 'data_contracts' prescribes 'euclidean'
-0 error(s), 2 warning(s), 0 info
+[INFO ] r8-prd-sections prd: prd sections: legacy pack: missing MVP (v0.2 packs require it)
+[INFO ] r13-rules-categories rules: rules categories: legacy pack: missing General, Before coding, Security, Testing, Git (v0.2 packs require it)
+0 error(s), 7 warning(s), 2 info
+checked against: usable RAM 4 GB, cpu_only=True, local_only=True
 ```
 
-`praxis check 5 --json` returns the same two findings as a JSON list with `rule_id`, `severity`, `pass_id`, `excerpt`, and `message` fields.
+The five `r10-stack-fit` warnings come from the **older single-pass Architect blueprint** for candidate 5 (a pre-v0.2 blueprint that prescribes a VPS and bitsandbytes on a CPU-only, local-only facts sheet); its eleven stored passes score zero. Facts come from `hardware_profile.yaml` (env vars and an optional host probe can override the snapshot), so every r10 verdict is explainable against the printed line. `praxis check 5 --json` returns the same findings as a JSON list with `rule_id`, `severity`, `pass_id`, `excerpt`, and `message` fields.
 
 ## Why the checker exists
 
@@ -63,6 +71,10 @@ An LLM-written decision record in the MemGuard design pack said "2k records × 3
 | `r4-cap` | error | Component size written as a percentage or fraction of a cap that does not match the stated cap |
 | `r3-dependency` | warning | Two passes prescribing different packages for one slot (e.g. `requests` in TASKS vs `httpx` in SECURITY) |
 | `r5-metric` | warning | Two passes prescribing different retrieval metrics (e.g. Euclidean vs cosine) |
+| `r8-prd-sections` | warning (info on legacy packs) | PRD missing required sections (Problem, Users, Goal, Features, MVP, Out of scope, Success criteria) |
+| `r9-task-structure` | warning (info on legacy packs) | `TASK-NNN` tasks in the plan without an Acceptance marker within 3 lines; stamped packs with no task ids at all |
+| `r10-stack-fit` | warning | Prescribed models, RAM/VRAM footprints, CUDA tooling, or rented hosts that do not fit the facts sheet (stored passes + blueprint) |
+| `r13-rules-categories` | warning (info on legacy packs) | RULES missing required categories (General, Before coding, Security, Testing, Git) |
 | `registry-unknown` | warning | A pass key not in the known-pass registry |
 | `registry-missing` | info | A known pass key absent from the stored design |
 

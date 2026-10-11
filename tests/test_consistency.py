@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from praxis.config import FactsSheet
 from praxis.consistency import (
     KNOWN_PASS_IDS,
     RULE_R1,
@@ -19,6 +20,7 @@ from praxis.consistency import (
     RULE_R5,
     RULE_R8,
     RULE_R9,
+    RULE_R10,
     RULE_R13,
     RULE_REGISTRY_MISSING,
     RULE_REGISTRY_UNKNOWN,
@@ -33,6 +35,7 @@ from praxis.consistency import (
     check_r5,
     check_r8,
     check_r9,
+    check_r10,
     check_r13,
     run_checks,
 )
@@ -700,6 +703,175 @@ def test_guide_tasks_silent_unstamped_warns_stamped():
     assert findings[0].rule_id == RULE_R9
     assert findings[0].severity == SEVERITY_WARNING
     assert "TASK-NNN" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# R10 (warning): stack fit vs the facts sheet (+ blueprint source)
+# ---------------------------------------------------------------------------
+
+_FACTS = FactsSheet()  # usable_ram_gb=4, ram_gb=8, cpu_only=True, local_only=True
+
+_R10_NEG_FIXTURES = [
+    "Avoid CUDA-only libraries entirely - the machine is CPU-only.",
+    "The machine is not CUDA-capable; avoid bitsandbytes.",
+    "Instead of a rented VPS, run everything locally.",
+    "Rejected: a rented VPS with 8 GB RAM was ruled out.",
+    "No GPU required for this workload; CPU inference only.",
+    "Use httpx instead of requests for all API calls.",
+    "The model does not fit in the available headroom.",
+    "Neo4j is avoided; use SQLite instead.",
+    "No docker containers are needed.",
+    "### Non-Goals (explicitly out of scope for v1)\n"
+    "- GPU acceleration or CUDA-dependent libraries.",
+    "### Non-Goals (explicitly out of scope for v1)\n"
+    "- Use of Neo4j or other graph databases.",
+    "The generator and verifier both call the same Groq gpt-oss-20b model via the API.",
+    "LLM_MODEL_NAME=gpt-oss-20b",
+    "Respecting the 8 GB RAM, CPU-only, and $15/month budget constraints.",
+    "Peak RSS must stay <= 4 GB to respect the headroom.",
+    "Disk-space usage must leave >= 5 GB free storage.",
+    "All tests run on a CPU-only machine with 8 GB usable RAM.",
+]
+
+_R10_POS_FIXTURES = [
+    (
+        "Loads a 2.7B Llama-2 model via bitsandbytes on a rented VPS.",
+        {"cuda-only", "remote-host"},
+    ),
+    (
+        "| 0. Setup | Environment provisioning | VPS with 8 GB RAM, Ubuntu 22.04, "
+        "bitsandbytes | Verify CPU inference performance |",
+        {"cuda-only", "remote-host"},
+    ),
+    ("The largest memory footprint comes from the quantized LLM (~4 GB).", {"ram-claim"}),
+    (
+        "Combined with embeddings and the database, total usage stays below 8 GB.",
+        {"ram-claim"},
+    ),
+    (
+        # negation scope is one unit: "false" silences its own sentence only
+        "The verifier marks corrupt records as false. "
+        "It then loads the model via bitsandbytes.",
+        {"cuda-only"},
+    ),
+]
+
+
+@pytest.mark.parametrize("text", _R10_NEG_FIXTURES)
+def test_r10_negation_fixtures_silent(text):
+    assert check_r10({"plan": text}, _FACTS) == []
+
+
+@pytest.mark.parametrize("text,want", _R10_POS_FIXTURES)
+def test_r10_positive_fixtures_fire(text, want):
+    findings = check_r10({"plan": text}, _FACTS)
+    assert findings, f"expected findings for {text!r}"
+    assert {f.rule_id for f in findings} == {RULE_R10}
+    assert {f.severity for f in findings} == {SEVERITY_WARNING}
+    kinds = {f.message.split(":", 1)[0] for f in findings}
+    assert want <= kinds
+
+
+# The five known firing rows of the stored candidate-5 blueprint (regression).
+_R10_BP5_FIXTURE = (
+    "## Proposed Architecture\n"
+    "> **Buildable on Target Hardware** - The largest memory footprint comes "
+    "from the quantized LLM (~4 GB). Combined with embeddings and the database, "
+    "total usage stays below 8 GB. All operations run on CPU; no GPU is "
+    "required. The monthly $15 budget covers a modest VPS (e.g., DigitalOcean "
+    "Droplet 8GB RAM) and storage costs.\n"
+    "| **LLM Inference Engine** | Generates task outputs and verifier "
+    "responses | 1.3 B or 2.7 B Llama-2 (or similar) quantized to 8-bit, "
+    "loaded locally via bitsandbytes. |\n"
+    "| **0. Setup** | Environment provisioning | VPS with 8 GB RAM, Ubuntu "
+    "22.04, Python 3.10, `transformers`, `bitsandbytes`, `hnswlib`, `LMDB` | "
+    "Verify CPU inference performance |\n"
+)
+
+
+def test_r10_blueprint5_regression_five_known_rows():
+    findings = check_r10({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    assert len(findings) == 5
+    assert {f.pass_id for f in findings} == {"blueprint"}
+    assert {f.severity for f in findings} == {SEVERITY_WARNING}
+    kinds = [f.message.split(":", 1)[0] for f in findings]
+    assert sorted(kinds) == ["cuda-only", "cuda-only", "ram-claim", "remote-host", "remote-host"]
+    # the ~4 GB restatement and both 8 GB RAM restatements stay silent: the
+    # single ram-claim is the upper-bound sentence, reworded as a bound
+    ram = [f for f in findings if f.message.startswith("ram-claim")]
+    assert len(ram) == 1
+    assert "states an 8 GB bound; usable headroom is 4 GB" in ram[0].message
+    assert "claims" not in ram[0].message
+
+
+def test_r10_vram_dedupe_no_double_ram_claim():
+    text = "Inference requires over 40GB of VRAM in fp16 and a 3B-parameter UNet."
+    kinds = {
+        f.message.split(":", 1)[0] for f in check_r10({"plan": text}, _FACTS)
+    }
+    assert "vram-claim" in kinds
+    assert "ram-claim" not in kinds
+
+
+def test_r10_gpu_host_silent_for_cuda_and_vram():
+    facts = FactsSheet(cpu_only=False, gpu=True)
+    text = "Runs bitsandbytes kernels with 40 GB VRAM on the host."
+    assert check_r10({"plan": text}, facts) == []
+
+
+def test_r10_non_local_host_silent_for_remote():
+    facts = FactsSheet(local_only=False)
+    assert check_r10({"plan": "Runs on a rented VPS."}, facts) == []
+
+
+def test_r10_facts_none_silent():
+    assert check_r10({"plan": _R10_POS_FIXTURES[0][0]}, None) == []
+
+
+def test_r10_design5_passes_zero_findings():
+    import json
+    import sqlite3
+
+    db_path = Path(__file__).parent.parent / "praxis.db"
+    if not db_path.is_file():
+        pytest.skip("local praxis.db not present")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT passes_json FROM designs WHERE candidate_id=5 "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        pytest.skip("candidate 5 has no stored design")
+    passes = {
+        k: v for k, v in json.loads(row[0]).items() if not k.startswith("_")
+    }
+    assert check_r10(passes, _FACTS) == []
+
+
+def test_r10_guide_fixtures_zero_findings():
+    guide_pass = {
+        "prd.md": "prd",
+        "rules.md": "rules",
+        "tasks.md": "plan",
+        "memory.md": "memory",
+    }
+    for name, pid in guide_pass.items():
+        text = _guide(name)
+        assert check_r10({pid: text}, _FACTS) == [], name
+
+
+def test_r10_deterministic():
+    passes = {"plan": _R10_POS_FIXTURES[0][0], "prd": _R10_POS_FIXTURES[2][0]}
+    assert check_r10(passes, _FACTS) == check_r10(passes, _FACTS)
+
+
+def test_run_checks_blueprints_scanned_under_blueprint_label():
+    findings = run_checks({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    r10 = [f for f in findings if f.rule_id == RULE_R10]
+    assert r10 and {f.pass_id for f in r10} == {"blueprint"}
 
 
 # ---------------------------------------------------------------------------

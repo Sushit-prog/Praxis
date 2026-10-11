@@ -19,7 +19,7 @@ from pathlib import Path
 
 from praxis.config import load_facts
 from praxis.consistency import SEVERITY_ERROR, run_checks
-from praxis.db import get_design_meta, latest_design
+from praxis.db import get_design_meta, latest_blueprint, latest_design
 from praxis.design import PROVENANCE_VERSION
 from praxis.design_io import design_dir, load_passes
 from praxis.planning import PACK_PASS_IDS
@@ -200,10 +200,12 @@ def run_handoff(
 
     if not skip_check:
         meta = get_design_meta(design.id) if design.id is not None else {}
+        blueprint = latest_blueprint(candidate_id)
         findings = run_checks(
             passes,
             load_facts(),
             stamped=meta.get("pack_version") == PROVENANCE_VERSION,
+            blueprint=blueprint.blueprint_md if blueprint is not None else None,
         )
         errors = [f for f in findings if f.severity == SEVERITY_ERROR]
         if errors:

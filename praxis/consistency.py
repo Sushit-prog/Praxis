@@ -34,6 +34,7 @@ RULE_R3 = "r3-dependency"
 RULE_R5 = "r5-metric"
 RULE_R8 = "r8-prd-sections"
 RULE_R9 = "r9-task-structure"
+RULE_R10 = "r10-stack-fit"
 RULE_R13 = "r13-rules-categories"
 RULE_REGISTRY_UNKNOWN = "registry-unknown"
 RULE_REGISTRY_MISSING = "registry-missing"
@@ -56,7 +57,8 @@ class Finding:
 
 # Narrow no-break space (U+202F), no-break space (U+00A0) and thin space
 # (U+2009) appear as digit separators in generated prose ("1 200 records").
-_WS_TABLE = {0x202F: " ", 0x00A0: " ", 0x2009: " "}
+# Soft/hard hyphens (U+2010/U+2011) and en-dash (U+2013) normalize to "-".
+_WS_TABLE = {0x202F: " ", 0x00A0: " ", 0x2009: " ", 0x2010: "-", 0x2011: "-", 0x2013: "-"}
 
 _UNIT = r"KB|MB|GB|TB"
 # Digit groups optionally separated by comma/space/tab (never newline):
@@ -773,6 +775,275 @@ def check_r13(
 
 
 # ---------------------------------------------------------------------------
+# R10 (warning): stack fit — prescribed hardware/models vs the facts sheet,
+# over every stored pass plus the stored blueprint (labeled "blueprint").
+# Kinds: ram-claim, model-ram, cuda-only, remote-host, vram-claim.
+# ---------------------------------------------------------------------------
+
+_R10_CUDA_CUES = ("bitsandbytes", "cuda", "flash-attn", "flash attention", "deepspeed", "nccl")
+_R10_VPS_CUES = ("vps", "rented", "ec2", "digitalocean", "heroku", "fly.io", "aws instance")
+_R10_NEG_RE = re.compile(
+    r"\bnot\b|\bavoid|instead of|\breject|\bno gpu|\bno cuda|\bno vps|\bwithout\b|"
+    r"rule[ds]? out|\bdo not\b|\bdon't\b|\bnever\b|\bunavailable\b|\bfree tier\b|"
+    r"\bfalse\b",
+    re.I,
+)
+_R10_SIL_SECTION = re.compile(
+    r"non-?goal|out of scope|out-of-scope|anti-goal|alternatives rejected|rejected:", re.I
+)
+_R10_SIL_HEADING = re.compile(
+    r"non-?goal|out of scope|out-of-scope|avoid|reject|anti", re.I
+)
+_R10_COMPLIANT_RE = re.compile(
+    r"\bwithin\b|≤|<=|\bmust stay\b|\bto stay\b|\bstay inside\b|"
+    r"\brespect(ing|s)?\b|\bkeep\b|\bkeeps\b",
+    re.I,
+)
+_R10_FOOTPRINT_RE = re.compile(
+    r"\busage\b|\bfootprint\b|\brss\b|\bresident\b|\bpeak\b|\btotal\b|\bactive records\b|\bapp\b",
+    re.I,
+)
+_R10_RESTATE_RE = re.compile(
+    r"\bcpu-only\b|\bcpu server\b|\bsingle .{0,12}server\b|\btarget hardware\b|\bhost\b|"
+    r"\bmachine\b|\bconstraints?\b|\bbudget\b|\busable\b|\bheadroom\b|\bspec\b|\bsetup\b",
+    re.I,
+)
+_R10_API_RE = re.compile(
+    r"\bapi\b|\bendpoint\b|\bgroq\b|\bopenrouter\b|\bfree-tier\b|\brate limit\b|"
+    r"\bprovider\b|\bhttpx\b|\brequests\b|\btoken count\b|\bclient\b",
+    re.I,
+)
+_R10_LOCAL_LOAD_RE = re.compile(
+    r"quantiz|\bloads?\b|\blocal\b|\bresident\b|gguf|\bfp16\b|\bfp32\b|"
+    r"\bbitsandbytes\b|\bon-device\b|\bon device\b",
+    re.I,
+)
+_R10_MODEL_NAME = (
+    r"\b(?:llama|mistral|qwen|gemma|phi|falcon|deepseek|gpt-oss|bert|resnet|unet|"
+    r"clip|distilbert|gpt-2|gpt2)\b"
+)
+_R10_MODEL_RE = re.compile(_R10_MODEL_NAME, re.I)
+_R10_PARAM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*[Bb]\b")
+_R10_GB_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB\b", re.I)
+# Word-anchored: "vram"/"parameter" must not satisfy the RAM context.
+_R10_GB_CTX_RE = re.compile(
+    r"\bram\b|\bmemory\b|\bfootprint\b|\busage\b|\brss\b|\bheadroom\b|\btotal\b",
+    re.I,
+)
+# Upper-bound phrasing: the claim is a ceiling, not a footprint estimate.
+_R10_BOUND_RE = re.compile(
+    r"\bbelow\b|\bunder\b|\bup to\b|\bat most\b|\bless than\b|\bno more than\b",
+    re.I,
+)
+_R10_DISK_RE = re.compile(r"disk|storage|\bdb\b|database size|log files?", re.I)
+_R10_VRAM_RE = re.compile(r"\bvram\b|gpu memory|gpu-ram", re.I)
+_R10_QUANT_BYTES = (("8-bit", 1.0), ("int8", 1.0), ("4-bit", 0.5), ("q4", 0.5), ("q8", 1.0))
+
+
+def _r10_units(text: str) -> list[tuple[str, str]]:
+    """(unit, heading) pairs: table rows whole, prose split on sentence ends."""
+    units: list[tuple[str, str]] = []
+    heading = ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            heading = s.lstrip("#").strip()
+            continue
+        if s.startswith("|"):
+            units.append((s, heading))
+            continue
+        for part in re.split(r"(?<=[.!?])\s+", s):
+            part = part.strip()
+            if part:
+                units.append((part, heading))
+    return units
+
+
+def _r10_excerpt(unit: str) -> str:
+    return " ".join(unit.split())[:140]
+
+
+def _r10_finding(source: str, kind: str, message: str, unit: str) -> Finding:
+    return Finding(
+        RULE_R10, SEVERITY_WARNING, source, _r10_excerpt(unit), f"{kind}: {message}"
+    )
+
+
+def _r10_scan(
+    text: str,
+    source: str,
+    *,
+    usable_ram_gb: float,
+    ram_gb: float,
+    cpu_only: bool,
+    local_only: bool,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    for unit, heading in _r10_units(_strip_fences(_normalize(text))):
+        low = unit.lower()
+        if _R10_SIL_HEADING.search(heading) or _R10_SIL_SECTION.search(unit):
+            continue  # H1: rejected/non-goal sections are not prescriptions
+        if _R10_NEG_RE.search(low):
+            continue
+        fired: set[str] = set()  # per-unit dedupe: one finding per kind per unit
+
+        if cpu_only and any(c in low for c in _R10_CUDA_CUES) and "cuda-only" not in fired:
+            fired.add("cuda-only")
+            findings.append(
+                _r10_finding(
+                    source,
+                    "cuda-only",
+                    f"unit mentions CUDA tooling but the facts sheet is CPU-only "
+                    f"(cpu_only={cpu_only})",
+                    unit,
+                )
+            )
+        if local_only and any(c in low for c in _R10_VPS_CUES) and "remote-host" not in fired:
+            fired.add("remote-host")
+            findings.append(
+                _r10_finding(
+                    source,
+                    "remote-host",
+                    f"unit prescribes a rented/remote host but the facts sheet is "
+                    f"local-only (local_only={local_only})",
+                    unit,
+                )
+            )
+
+        # VRAM claims: GPU memory on a CPU-only host (dedupe vs ram-claim below:
+        # vram mentions are masked out before the generic RAM scan).
+        vram_masked = unit
+        if cpu_only and _R10_VRAM_RE.search(low) and not _R10_COMPLIANT_RE.search(low):
+            g = _R10_GB_RE.search(unit)
+            if g and "vram-claim" not in fired:
+                fired.add("vram-claim")
+                findings.append(
+                    _r10_finding(
+                        source,
+                        "vram-claim",
+                        f"claims {float(g.group(1)):g} GB VRAM but the facts sheet "
+                        f"is CPU-only (cpu_only={cpu_only})",
+                        unit,
+                    )
+                )
+                vram_masked = _R10_VRAM_RE.sub(lambda m: " " * len(m.group()), unit)
+
+        # Named model loaded locally: estimated weights vs usable RAM (H4/H5).
+        m = _R10_PARAM_RE.search(unit)
+        if (
+            m
+            and _R10_MODEL_RE.search(unit)
+            and not _R10_API_RE.search(low)
+            and _R10_LOCAL_LOAD_RE.search(low)
+            and "model-ram" not in fired
+        ):
+            params = float(m.group(1))
+            factor = 2.0
+            for label, b in _R10_QUANT_BYTES:
+                if label in low:
+                    factor = b
+                    break
+            est = params * factor
+            if est >= usable_ram_gb:
+                fired.add("model-ram")
+                findings.append(
+                    _r10_finding(
+                        source,
+                        "model-ram",
+                        f"does not fit: {params:g}B x {factor:g} B/param = "
+                        f"{est:g} GB vs {usable_ram_gb:g} GB usable",
+                        unit,
+                    )
+                )
+            elif est >= 0.7 * usable_ram_gb:
+                fired.add("model-ram")
+                findings.append(
+                    _r10_finding(
+                        source,
+                        "model-ram",
+                        f"tight: {params:g}B x {factor:g} B/param = {est:g} GB vs "
+                        f"{usable_ram_gb:g} GB usable",
+                        unit,
+                    )
+                )
+
+        if _R10_DISK_RE.search(low):
+            continue  # H6: storage claims are a different category; never free storage
+
+        # Generic RAM/GB claims (H2 compliant, H3 restatement, VRAM-masked).
+        if (
+            _R10_GB_CTX_RE.search(vram_masked.lower())
+            and not _R10_COMPLIANT_RE.search(low)
+            and "ram-claim" not in fired
+        ):
+            g = _R10_GB_RE.search(vram_masked)
+            if g:
+                claim = float(g.group(1))
+                is_restate = claim > 0 and (
+                    (claim in (ram_gb, usable_ram_gb) and not _R10_FOOTPRINT_RE.search(low))
+                    or _R10_RESTATE_RE.search(low)
+                )
+                if not is_restate and claim >= 0.7 * usable_ram_gb:
+                    fired.add("ram-claim")
+                    if claim >= usable_ram_gb and _R10_BOUND_RE.search(low):
+                        message = (
+                            f"states an {claim:g} GB bound; usable headroom is "
+                            f"{usable_ram_gb:g} GB"
+                        )
+                    elif claim >= usable_ram_gb:
+                        message = (
+                            f"does not fit: claims {claim:g} GB vs "
+                            f"{usable_ram_gb:g} GB usable"
+                        )
+                    else:
+                        message = (
+                            f"tight: claims {claim:g} GB vs "
+                            f"{usable_ram_gb:g} GB usable"
+                        )
+                    findings.append(_r10_finding(source, "ram-claim", message, unit))
+    return findings
+
+
+def check_r10(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    blueprint: str | None = None,
+    **_ignored: object,
+) -> list[Finding]:
+    if facts is None:
+        return []
+    try:
+        usable = float(facts.usable_ram_gb)
+        if usable <= 0:
+            return []
+        sources = sorted(
+            (pid, text)
+            for pid, text in passes.items()
+            if isinstance(text, str) and text.strip()
+        )
+        if isinstance(blueprint, str) and blueprint.strip():
+            sources.append(("blueprint", blueprint))
+        findings: list[Finding] = []
+        for source, text in sources:
+            findings.extend(
+                _r10_scan(
+                    text,
+                    source,
+                    usable_ram_gb=usable,
+                    ram_gb=float(facts.ram_gb),
+                    cpu_only=bool(facts.cpu_only),
+                    local_only=bool(facts.local_only),
+                )
+            )
+        return findings
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Registry: unknown pass key (warning), missing pass key (info)
 # ---------------------------------------------------------------------------
 
@@ -816,6 +1087,7 @@ RULES = (
     check_r5,
     check_r8,
     check_r9,
+    check_r10,
     check_r13,
 )
 
@@ -825,16 +1097,19 @@ def run_checks(
     facts: FactsSheet | None = None,
     *,
     stamped: bool = False,
+    blueprint: str | None = None,
 ) -> list[Finding]:
     """Run every rule plus the registry over stored pass text.
 
     Pure and deterministic: the same inputs always yield the same findings in
     the same order (sorted by pass id, rule id, excerpt). ``stamped`` marks a
     v0.2 pack (both design and pack layers stamped); content rules r8/r9/r13
-    warn on stamped packs and emit legacy-pack info otherwise.
+    warn on stamped packs and emit legacy-pack info otherwise. ``blueprint``
+    is the stored Architect blueprint markdown, scanned by r10 under the
+    source label "blueprint" (never a registry key).
     """
     findings: list[Finding] = list(_registry(passes))
     for rule in RULES:
-        findings.extend(rule(passes, facts, stamped=stamped))
+        findings.extend(rule(passes, facts, stamped=stamped, blueprint=blueprint))
     findings.sort(key=lambda f: (f.pass_id, f.rule_id, f.excerpt))
     return findings
