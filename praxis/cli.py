@@ -191,6 +191,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--focus", help="Focus note steering the design (skips the interactive focus prompt)."
     )
 
+    idea_parser = sub.add_parser(
+        "idea",
+        help=(
+            "Validate a plain-text brief (MVP + Out-of-scope bullets) and "
+            "store it as a candidate for `praxis design`. Idempotent on "
+            "content: the same brief reuses the same candidate."
+        ),
+    )
+    idea_parser.add_argument("brief", help="Path to the brief markdown file.")
+
     design_parser = sub.add_parser(
         "design", help="Generate a multi-pass design document for a candidate."
     )
@@ -828,6 +838,22 @@ def _cmd_discover(args) -> int:
     return _design_and_write(row.candidate, profile, focus=focus, facts=facts)
 
 
+def _cmd_idea(args) -> int:
+    from praxis.idea import BriefError, intake_brief, read_brief
+
+    try:
+        text = read_brief(args.brief)
+        candidate, created = intake_brief(text)
+    except BriefError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "created" if created else "reused existing candidate for"
+    print(f"{verb} idea candidate {candidate.id}: {candidate.title}")
+    print(f"  key: {candidate.url}")
+    print(f"next: praxis design {candidate.id}")
+    return 0
+
+
 def _print_design_passes(candidate_id: int) -> int:
     """Print the completed passes of a candidate's newest design (--show)."""
     from praxis.db import latest_design
@@ -1156,6 +1182,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             logging.error("praxis discover failed: %s", exc)
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    if args.command == "idea":
+        return _cmd_idea(args)
     if args.command == "design":
         try:
             return _cmd_design(args)
