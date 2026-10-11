@@ -406,7 +406,8 @@ def test_generate_design_failure_mid_pass_is_resumable(design_db, no_grounding, 
     assert stored is not None
     assert stored.status == "in_progress"
     done = json.loads(stored.passes_json)
-    assert set(done) == {"technique", "architecture"}
+    assert set(done) == {"technique", "architecture", "_meta"}
+    assert done["_meta"]["design_version"] == "0.2"
 
     monkeypatch.setattr(design_module, "call_llm", _completion_returning_passes(GOOD_PASSES))
     second = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
@@ -881,7 +882,11 @@ def test_resume_after_third_pass_fails(design_db, no_grounding, monkeypatch):
     assert first.completed_passes == ["technique", "architecture"]
     stored = latest_design(design_db)
     assert stored is not None and stored.status == "in_progress"
-    assert set(json.loads(stored.passes_json)) == {"technique", "architecture"}
+    assert set(json.loads(stored.passes_json)) == {
+        "technique",
+        "architecture",
+        "_meta",
+    }
 
     # Resume: pass 3 now succeeds; only passes 3-5 and the critic are called.
     called = []
@@ -1437,3 +1442,149 @@ def test_show_export_design_show_with_2011_in_text(
     assert out_path is not None
     kit = out_path.read_text(encoding="utf-8")
     assert tricky_title in kit
+
+
+# ---------------------------------------------------------------------------
+# Provenance stamps (v0.2): design layer + prompt content
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_design_run_stamps_design_version(design_db, no_grounding, monkeypatch):
+    """A run that starts with zero stored passes stamps design_version once."""
+    import praxis.design as design_module
+    from praxis.db import get_design_meta
+
+    monkeypatch.setattr(
+        design_module, "call_llm", _completion_returning_passes(GOOD_PASSES)
+    )
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+
+    assert result.status == "complete"
+    meta = get_design_meta(result.design_id)
+    assert meta["design_version"] == "0.2"
+    # The pack layer has not run: pack_version and generated_at stay absent.
+    assert "pack_version" not in meta
+    assert "generated_at" not in meta
+
+
+def test_design_crash_resume_keeps_design_stamp(design_db, no_grounding, monkeypatch):
+    """A design that crashed mid-run keeps its stamp across --resume."""
+    import praxis.design as design_module
+    from praxis.db import get_design_meta
+
+    def fail_on_third_pass(prompt, system=None, model=None, **kwargs):
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                if title == "Data Model & Contracts":
+                    raise RuntimeError("rate limited on pass 3")
+                return content
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fail_on_third_pass)
+    first = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert first.status == "failed"
+    stamped = get_design_meta(first.design_id)
+    assert stamped["design_version"] == "0.2"
+
+    monkeypatch.setattr(
+        design_module, "call_llm", _completion_returning_passes(GOOD_PASSES)
+    )
+    second = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+    assert second.status == "complete"
+    assert get_design_meta(second.design_id) == stamped
+
+
+def test_legacy_design_resume_stays_unstamped(design_db, no_grounding, monkeypatch):
+    """A complete legacy design (no _meta) resumed is never stamped."""
+    import praxis.design as design_module
+    from praxis.db import get_design_meta, get_session, save_design_pass
+
+    design = design_module._get_or_create_design(design_db, "standard", None, None)
+    design_id = design.id
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        row.status = "in_progress"
+        session.commit()
+    finally:
+        session.close()
+    for pass_id in PASS_IDS:
+        save_design_pass(design_id, pass_id, GOOD_PASSES[pass_id])
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("no LLM call expected: every core pass is stored")
+
+    monkeypatch.setattr(design_module, "call_llm", unexpected_call)
+    result = generate_design(_Candidate(design_db), HardwareProfile(), pace_seconds=0.0)
+
+    assert result.status == "complete"
+    assert get_design_meta(design_id) == {}
+
+
+def test_passes_loaders_filter_meta_key(design_db):
+    """Both loaders drop the ``_``-prefixed _meta block; it is never a pass."""
+    import praxis.design as design_module
+    from praxis.db import get_session, save_design_pass, set_design_meta
+    from praxis.design_io import load_passes
+
+    design = design_module._get_or_create_design(design_db, "standard", None, None)
+    save_design_pass(design.id, "technique", GOOD_PASSES["technique"])
+    set_design_meta(design.id, {"design_version": "0.2"})
+
+    session = get_session()
+    try:
+        row = session.get(Design, design.id)
+    finally:
+        session.close()
+
+    for loaded in (design_module._load_passes(row), load_passes(row)):
+        assert set(loaded) == {"technique"}
+        assert "_meta" not in loaded
+
+
+def test_pass_instruction_requires_mvp_and_out_of_scope():
+    from praxis.design import _PASS_SPECS
+
+    instruction = _PASS_SPECS["prd"]["instruction"]
+    assert "`## MVP` section" in instruction
+    assert "`## Out of scope` section" in instruction
+    assert "Non-goals" not in instruction
+
+
+def test_pass_instruction_requires_rules_five_headings():
+    from praxis.design import _PASS_SPECS
+
+    instruction = _PASS_SPECS["rules"]["instruction"]
+    assert "General, Before coding, Security, " in instruction
+    assert "Testing, Git" in instruction
+
+
+def test_pass_instruction_requires_architecture_stack_and_folder():
+    from praxis.design import _PASS_SPECS
+
+    instruction = _PASS_SPECS["architecture"]["instruction"]
+    assert "`### Stack` list" in instruction
+    assert "`### Folder structure`" in instruction
+
+
+def test_pass_instruction_requires_plan_doc_update_discipline():
+    from praxis.design import _PASS_SPECS
+
+    instruction = _PASS_SPECS["plan"]["instruction"]
+    assert "After EACH task" in instruction
+    assert "tick its checkbox" in instruction
+    assert "Status / Current task / Next step" in instruction
+    assert "before proposing a commit" in instruction
+    # Per task, not only at the end.
+    assert "final task" not in instruction
+
+
+def test_pass_instruction_requires_readme_verbatim_layout():
+    from praxis.design import _PASS_SPECS
+
+    instruction = _PASS_SPECS["readme"]["instruction"]
+    assert "copy it verbatim from the architecture pass's" in instruction
+    assert "`### Folder structure` block" in instruction

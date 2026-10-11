@@ -37,16 +37,19 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
 from praxis.config import FactsSheet, HardwareProfile, load_facts
 from praxis.db import (
     LLMUsage,
     clear_design_pass,
+    get_design_meta,
     get_session,
     latest_blueprint,
     latest_design,
     save_design_pass,
+    set_design_meta,
 )
 from praxis.design import (
     _PASS_SPECS,
@@ -54,6 +57,7 @@ from praxis.design import (
     GROUNDING_CHAR_BUDGETS,
     PASS_IDS,
     PASS_PACING_S,
+    PROVENANCE_VERSION,
     SYSTEM_PROMPT,
     _constraints_block,
     _context_summary,
@@ -350,6 +354,23 @@ def generate_doc_pack(
             )
         done.pop(pass_id, None)
         clear_design_pass(design.id, pass_id)
+
+    if design.id is not None and not any((done.get(p) or "").strip() for p in PACK_PASS_IDS):
+        # Fresh pack run (zero stored pack passes): stamp the pack layer
+        # once, but only when the design layer is already stamped — legacy
+        # designs stay unstamped, and an existing stamp (crash-resumed v0.2
+        # packs) is never rewritten, so generated_at stays byte-stable.
+        meta = get_design_meta(design.id)
+        if meta.get("design_version") and "pack_version" not in meta:
+            set_design_meta(
+                design.id,
+                {
+                    "pack_version": PROVENANCE_VERSION,
+                    "generated_at": datetime.now(UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                },
+            )
 
     grounding = ground_candidate(candidate)
     grounding_text = grounding.prompt_block()

@@ -255,3 +255,72 @@ def test_write_docs_pack_requires_pack_passes(docs_db, tmp_path):
     partial = {k: v for k, v in PASSES.items() if k != "prd"}
     with pytest.raises(ValueError, match="praxis plan 1"):
         _write(tmp_path, passes=partial)
+
+
+# ---------------------------------------------------------------------------
+# Provenance renders (v0.2): no render-time clocks, MEMORY status fields
+# ---------------------------------------------------------------------------
+
+
+def test_memory_md_has_status_task_and_next_step(docs_db, tmp_path):
+    _seed_design()
+    out = _write(tmp_path)
+
+    text = (out / "MEMORY.md").read_text(encoding="utf-8")
+    assert "## Status\n- Status: planning complete" in text
+    assert "## Current task\n- (none yet — pick TASK-001)" in text
+    assert "## Next step\n- Run the handoff loop" in text
+    # Target repos do not have Praxis: the seed never tells the coding
+    # agent to run a praxis command.
+    assert "run the task's test" in text
+    assert "praxis check" not in text
+
+
+def test_decisions_md_header_date_from_generated_at():
+    passes = {
+        "architecture": "## Architecture\n\n### Decision records\n"
+        "- DR-1 x — options: a, b; chose: a; why: small; revisit when: big.\n",
+        "hardware_fit": "## Hardware & Budget Fit\n\n### Rejected\n- none.\n",
+    }
+    text = render_decisions_md(passes, generated_at=FROZEN)
+
+    assert text.startswith("# Decision Records\n")
+    assert "- Date: 2026-09-29" in text
+    assert "- Status: active" in text
+    assert "- Source: architecture pass (decision records)" in text
+    assert "- DR-1 x" in text
+
+
+def test_decisions_md_unstamped_without_generated_at():
+    passes = {
+        "architecture": "## Architecture\n\n### Decision records\n- DR-1 x.\n",
+        "hardware_fit": "## Hardware & Budget Fit\n\n### Rejected\n- none.\n",
+    }
+    text = render_decisions_md(passes)
+
+    assert "- Date: unstamped legacy pack" in text
+
+
+def test_write_docs_pack_byte_stable_without_generated_at(docs_db, tmp_path):
+    """Legacy packs (no _meta): two renders differ in no byte."""
+    _seed_design()
+    out = _write(tmp_path, generated_at=None)
+    first = {name: (out / name).read_bytes() for name in ALL_FILES}
+
+    out = _write(tmp_path, generated_at=None)
+    second = {name: (out / name).read_bytes() for name in ALL_FILES}
+
+    assert first == second
+    # And the legacy stamp literal replaces the old render-time clock.
+    assert b"unstamped" in (out / "DESIGN.md").read_bytes()
+
+
+def test_parse_generated_at_roundtrip():
+    from praxis.design_io import parse_generated_at
+
+    parsed = parse_generated_at("2026-10-12T08:30:00Z")
+    assert parsed == datetime(2026, 10, 12, 8, 30, 0, tzinfo=UTC)
+    assert parse_generated_at(None) is None
+    assert parse_generated_at("") is None
+    assert parse_generated_at("not-a-timestamp") is None
+    assert parse_generated_at(123) is None

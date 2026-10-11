@@ -696,7 +696,7 @@ def _discard_partial_pack(design) -> None:
     nothing to restart, and a complete pack re-renders the docs files with
     zero LLM calls.
     """
-    from praxis.db import clear_design_pass
+    from praxis.db import clear_design_meta, clear_design_pass
     from praxis.design_io import load_passes as _load_passes
 
     passes = _load_passes(design)
@@ -705,6 +705,7 @@ def _discard_partial_pack(design) -> None:
         return
     for pass_id in PACK_PASS_IDS:
         clear_design_pass(design.id, pass_id)
+    clear_design_meta(design.id)
 
 
 def _design_and_write(
@@ -952,10 +953,10 @@ def _cmd_design(args) -> int:
 
 def _cmd_plan(args) -> int:
     from praxis.config import HardwareProfile, load_facts
-    from praxis.db import latest_design
+    from praxis.db import get_design_meta, latest_design
     from praxis.design import PASS_IDS
     from praxis.design_io import load_passes as _load_passes
-    from praxis.design_io import write_docs_pack
+    from praxis.design_io import parse_generated_at, write_docs_pack
     from praxis.discover import get_candidate
     from praxis.planning import generate_doc_pack
 
@@ -1021,7 +1022,14 @@ def _cmd_plan(args) -> int:
 
     design = latest_design(args.candidate_id)
     passes = _load_passes(design)
-    docs_dir = write_docs_pack(candidate, profile, passes=passes, facts=facts)
+    meta = get_design_meta(design.id) if design.id is not None else {}
+    docs_dir = write_docs_pack(
+        candidate,
+        profile,
+        passes=passes,
+        facts=facts,
+        generated_at=parse_generated_at(meta.get("generated_at")),
+    )
     print(f"plan complete: candidate {result.candidate_id}")
     print(f"  {docs_dir}")
     print(

@@ -32,7 +32,7 @@ PACK_CONTENT = {
         "- FR-001 Fetch 10 chunks from a sample corpus (acceptance: "
         "test_retriever_returns_chunks passes) [source 1].\n"
         "- FR-002 Report peak RSS before and after a run (inference).\n"
-        "- Non-goals: GPU training, web UI.\n"
+        "- Out of scope: GPU training, web UI.\n"
     ),
     "rules": (
         "## Engineering Rules\n\n"
@@ -536,3 +536,127 @@ def test_generate_doc_pack_reports_plan_stage_usage(
     assert result.calls == 1
     assert result.total_tokens == 250
     assert result.cost_usd == pytest.approx(0.02)
+
+
+# ---------------------------------------------------------------------------
+# Provenance stamps (v0.2): pack layer
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_pack_stamps_when_design_stamped(planning_db, no_grounding, monkeypatch):
+    """Zero stored pack passes + stamped design layer -> pack stamp written."""
+    from praxis.db import get_design_meta, set_design_meta
+
+    design_id = _seed_design(planning_db, GOOD_PASSES)
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    result, _ = _generate(planning_db, monkeypatch)
+
+    assert result.status == "complete"
+    meta = get_design_meta(design_id)
+    assert meta["design_version"] == "0.2"
+    assert meta["pack_version"] == "0.2"
+    assert meta["generated_at"] is not None
+
+
+def test_fresh_pack_unstamped_for_legacy_design(
+    planning_db, no_grounding, monkeypatch
+):
+    """A fresh plan on an unstamped (legacy) design never stamps pack_version."""
+    from praxis.db import get_design_meta
+
+    design_id = _seed_design(planning_db, GOOD_PASSES)
+
+    result, _ = _generate(planning_db, monkeypatch)
+
+    assert result.status == "complete"
+    assert get_design_meta(design_id) == {}
+
+
+def test_legacy_complete_pack_rerun_stays_unstamped(
+    planning_db, no_grounding, monkeypatch
+):
+    """plan --resume on a complete legacy pack: zero calls, still unstamped."""
+    from praxis.db import get_design_meta
+
+    design_id = _seed_design(planning_db, {**GOOD_PASSES, **PACK_CONTENT})
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("no LLM call expected: every pack pass is stored")
+
+    result, _ = _generate(planning_db, monkeypatch, fake=unexpected_call)
+
+    assert result.status == "complete"
+    assert result.calls == 0
+    assert get_design_meta(design_id) == {}
+
+
+def test_crash_resumed_v02_pack_stays_stamped(planning_db, no_grounding, monkeypatch):
+    """A stamped v0.2 pack that crashed mid-run keeps its meta across resume."""
+    import praxis.design as design_module
+    from praxis.db import get_design_meta, set_design_meta
+
+    design_id = _seed_design(planning_db, GOOD_PASSES)
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    base = _pack_completion()
+
+    def flaky(prompt, system=None, model=None, **kwargs):
+        if kwargs.get("stage") == "plan" and "Engineering Rules" in prompt:
+            raise RuntimeError("provider exploded")
+        return base(prompt, system=system, model=model, **kwargs)
+
+    first, _ = _generate(planning_db, monkeypatch, fake=flaky)
+    assert first.status == "failed"
+    stamped = get_design_meta(design_id)
+    assert stamped["pack_version"] == "0.2"
+    assert stamped["generated_at"] is not None
+
+    monkeypatch.setattr(design_module, "call_llm", base)
+    second, _ = _generate(planning_db, monkeypatch)
+    assert second.status == "complete"
+    assert get_design_meta(design_id) == stamped  # byte-stable generated_at
+
+
+def test_pack_rerun_single_pass_keeps_meta(planning_db, no_grounding, monkeypatch):
+    """--pass N on a stamped pack keeps the original stamp untouched."""
+    from praxis.db import get_design_meta, set_design_meta
+
+    design_id = _seed_design(planning_db, GOOD_PASSES)
+    set_design_meta(design_id, {"design_version": "0.2"})
+    first, _ = _generate(planning_db, monkeypatch)
+    assert first.status == "complete"
+    stamped = get_design_meta(design_id)
+
+    second, fake = _generate(planning_db, monkeypatch, rerun_passes=["rules"])
+    assert second.status == "complete"
+    assert len(fake.calls) == 1
+    assert get_design_meta(design_id) == stamped
+
+
+def test_discard_partial_pack_clears_meta(planning_db, no_grounding, monkeypatch):
+    """A fresh start clears the pack stamp but keeps the design stamp."""
+    from praxis.cli import _discard_partial_pack
+    from praxis.db import get_design_meta, latest_design, set_design_meta
+
+    design_id = _seed_design(
+        planning_db, {**GOOD_PASSES, "prd": PACK_CONTENT["prd"]}
+    )
+    set_design_meta(
+        design_id,
+        {"design_version": "0.2", "pack_version": "0.2", "generated_at": "x"},
+    )
+
+    design = latest_design(planning_db)
+    _discard_partial_pack(design)
+
+    assert get_design_meta(design_id) == {"design_version": "0.2"}
+    assert "prd" not in json.loads(latest_design(planning_db).passes_json)
+
+    # A fresh plan after the discard re-stamps the pack layer cleanly.
+    result, _ = _generate(planning_db, monkeypatch)
+    assert result.status == "complete"
+    meta = get_design_meta(design_id)
+    assert meta["design_version"] == "0.2"
+    assert meta["pack_version"] == "0.2"
+    assert meta["generated_at"] is not None

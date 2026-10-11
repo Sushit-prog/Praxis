@@ -384,3 +384,54 @@ def test_cli_idea_missing_file_exits_1(idea_db, capsys):
 
     assert rc == 1
     assert "no such brief file" in capsys.readouterr().err
+
+
+# --- status isolation ------------------------------------------------------
+
+
+def test_design_does_not_overwrite_idea_status(idea_db, monkeypatch):
+    """A full (mocked-LLM) design run leaves status='idea' untouched.
+
+    The design path writes design rows and files but must never promote or
+    otherwise rewrite the candidate's status; only analyst/architect/coder/
+    pipeline/review stages own status transitions.
+    """
+    import json
+
+    import praxis.design as design_module
+    import praxis.grounding as grounding_module
+    from praxis.config import HardwareProfile
+    from praxis.db import Candidate, get_session
+    from praxis.design import generate_design
+    from tests.test_design import GOOD_PASSES
+
+    candidate, _ = intake_brief(VALID_BRIEF)
+    assert candidate.status == "idea"
+
+    def fake_ground(_candidate):
+        return grounding_module.Grounding(chunks=[], provenance=[], source_kind="none")
+
+    monkeypatch.setattr(grounding_module, "ground_candidate", fake_ground)
+    monkeypatch.setattr(design_module, "ground_candidate", fake_ground)
+
+    def fake_call_llm(prompt, system=None, model=None, **kwargs):
+        if "Review it against the defect classes" in prompt:
+            return json.dumps({"defects": []})
+        for content in GOOD_PASSES.values():
+            title = content.split("\n", 1)[0].lstrip("# ").strip()
+            if f"start with its '## {title}'" in prompt:
+                return content
+        raise AssertionError(f"unexpected prompt: {prompt[:120]!r}")
+
+    monkeypatch.setattr(design_module, "call_llm", fake_call_llm)
+
+    result = generate_design(candidate, HardwareProfile(), pace_seconds=0.0)
+    assert result.status == "complete"
+
+    session = get_session()
+    try:
+        row = session.get(Candidate, candidate.id)
+        assert row is not None
+        assert row.status == "idea"
+    finally:
+        session.close()
