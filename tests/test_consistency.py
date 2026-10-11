@@ -5,6 +5,7 @@ string, and rules are exercised individually plus via ``run_checks``.
 """
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -665,6 +666,40 @@ def test_r13_missing_pass_silent_but_prose_reports_all(passes):
     else:
         findings = check_r13(passes)
         assert len(findings) == 1  # parseable prose: every category missing
+
+
+# ---------------------------------------------------------------------------
+# Guide fixtures (human-written, read-only): tests/fixtures/guide/
+# ---------------------------------------------------------------------------
+
+_GUIDE_DIR = Path(__file__).parent / "fixtures" / "guide"
+
+
+def _guide(name: str) -> str:
+    """A guide fixture's text with LF endings (identical for LF/CRLF checkouts)."""
+    return (_GUIDE_DIR / name).read_bytes().decode("utf-8").replace("\r\n", "\n")
+
+
+def test_guide_prd_clean_stamped_and_unstamped():
+    text = _guide("prd.md")
+    assert check_r8({"prd": text}) == []
+    assert check_r8({"prd": text}, stamped=True) == []
+
+
+def test_guide_rules_clean_stamped_and_unstamped():
+    text = _guide("rules.md")
+    assert check_r13({"rules": text}) == []
+    assert check_r13({"rules": text}, stamped=True) == []
+
+
+def test_guide_tasks_silent_unstamped_warns_stamped():
+    text = _guide("tasks.md")
+    assert check_r9({"plan": text}) == []
+    findings = check_r9({"plan": text}, stamped=True)
+    assert len(findings) == 1
+    assert findings[0].rule_id == RULE_R9
+    assert findings[0].severity == SEVERITY_WARNING
+    assert "TASK-NNN" in findings[0].message
 
 
 # ---------------------------------------------------------------------------
