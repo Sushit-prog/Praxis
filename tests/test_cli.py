@@ -73,6 +73,19 @@ def seeded_db(tmp_path, monkeypatch):
     return db_path
 
 
+# Minimal content-rule-clean texts for the seeded design: r8 needs seven PRD
+# sections, r13 five RULES categories; plan/tasks stay prose (legacy r9 is
+# silent without TASK-NNN ids).
+_CLEAN_PRD = (
+    "# Problem\nx\n## Users\nx\n### Goal\nx\n## Features\nx\n"
+    "### MVP\nx\n## Out of scope\nx\n### Success criteria\nx\n"
+)
+_CLEAN_RULES = (
+    "## General\nx\n### Before coding\nx\n## Security\nx\n"
+    "### Testing\nx\n## Git\nx\n"
+)
+
+
 @pytest.fixture
 def design_db(tmp_path, monkeypatch):
     """A temp SQLite DB with one candidate whose stored design passes are all clean."""
@@ -97,7 +110,14 @@ def design_db(tmp_path, monkeypatch):
                 candidate_id=candidate.id,
                 status="complete",
                 passes_json=json.dumps(
-                    {pid: "All numbers are internally consistent." for pid in KNOWN_PASS_IDS}
+                    {
+                        **{
+                            pid: "All numbers are internally consistent."
+                            for pid in KNOWN_PASS_IDS
+                        },
+                        "prd": _CLEAN_PRD,
+                        "rules": _CLEAN_RULES,
+                    }
                 ),
             )
         )
@@ -559,6 +579,41 @@ def test_check_json_output(design_db, capsys):
     assert data[0]["severity"] == "error"
     assert data[0]["pass_id"] == "plan"
     assert captured.err == ""
+
+
+def test_check_content_rule_legacy_info_exits_0(design_db, capsys):
+    """An unstamped pack's r8 finding is info and mentions the legacy pack."""
+    _set_passes(prd="## Users\nx\n")
+
+    rc = main(["check", "1"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "[INFO ] r8-prd-sections prd:" in captured.out
+    assert "legacy pack" in captured.out
+    assert "[ERROR]" not in captured.out
+    assert "[WARN ]" not in captured.out
+
+
+def test_check_content_rule_stamped_warning(design_db, capsys):
+    """A stamped (both layers) pack's r8 finding is a warning, not info."""
+    _set_passes(
+        prd="## Users\nx\n",
+        _meta={
+            "design_version": "0.2",
+            "pack_version": "0.2",
+            "generated_at": "2026-10-12T00:00:00Z",
+        },
+    )
+
+    rc = main(["check", "1"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "[WARN ] r8-prd-sections prd:" in captured.out
+    assert "legacy pack" not in captured.out
+    assert "[INFO ] r8" not in captured.out
+    assert "[ERROR]" not in captured.out
 
 
 # ---------------------------------------------------------------------------

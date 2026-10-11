@@ -16,6 +16,9 @@ from praxis.consistency import (
     RULE_R4_CAP,
     RULE_R4_LEAVING,
     RULE_R5,
+    RULE_R8,
+    RULE_R9,
+    RULE_R13,
     RULE_REGISTRY_MISSING,
     RULE_REGISTRY_UNKNOWN,
     SEVERITY_ERROR,
@@ -27,6 +30,9 @@ from praxis.consistency import (
     check_r3,
     check_r4,
     check_r5,
+    check_r8,
+    check_r9,
+    check_r13,
     run_checks,
 )
 
@@ -378,6 +384,303 @@ def test_new_rules_warnings_only_exit_semantics():
     r5 = _rule(findings, RULE_R5)
     assert len(r3) == 1 and len(r5) == 1
     assert not [f for f in findings if f.severity == SEVERITY_ERROR]
+
+
+# ---------------------------------------------------------------------------
+# R8 (warning/info): PRD section presence — one finding per rule
+# ---------------------------------------------------------------------------
+
+_R8_BAD_PRD = "## Users\nOnly students use it.\n"
+
+_R8_LEGACY_SYNONYMS_PRD = """# The Problem
+x
+## Target Users
+x
+### Goals
+x
+## Core Features
+x
+### MVP
+x
+## Non-Goals (explicitly out of scope for v1)
+x
+### Success Metrics (v1)
+x
+"""
+
+
+def test_r8_missing_sections_one_finding_listing_all():
+    findings = check_r8({"prd": _R8_BAD_PRD}, stamped=True)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == RULE_R8 and f.pass_id == "prd"
+    assert f.severity == SEVERITY_WARNING
+    assert "missing" in f.message
+    assert "Problem" in f.message
+    assert "MVP" in f.message
+    assert "Success criteria" in f.message
+    assert "Users" not in f.message.split("missing", 1)[1].split("(required")[0]
+
+
+def test_r8_all_sections_present_clean():
+    assert check_r8({"prd": _R8_LEGACY_SYNONYMS_PRD}, stamped=True) == []
+
+
+def test_r8_plural_headings_accepted():
+    prd = (
+        "# Problems\nx\n## Users\nx\n### Goals\nx\n## Features\nx\n"
+        "### MVPs\nx\n## Out of scopes\nx\n### Success criteria\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_any_heading_level_accepted():
+    prd = (
+        "###### Problem\nx\n#### Users\nx\n##### Goal\nx\n#### Features\nx\n"
+        "###### MVP\nx\n#### Out of scope\nx\n##### Success criteria\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_case_insensitive():
+    prd = (
+        "# problem\nx\n## USERS\nx\n### Goal\nx\n## features\nx\n"
+        "### Mvp\nx\n## OUT OF SCOPE\nx\n### success CRITERIA\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_design5_style_headings_only_mvp_missing():
+    prd = """## Product Requirements
+### Problem & Goal
+x
+### Users and Use Cases
+x
+### Functional Requirements
+x
+### Success Metrics (v1)
+x
+### Non-Goals (explicitly out of scope for v1)
+x
+### Open Questions
+x
+"""
+    findings = check_r8({"prd": prd})
+    assert len(findings) == 1
+    assert findings[0].severity == SEVERITY_INFO
+    assert "missing MVP" in findings[0].message
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"prd": None},  # type: ignore[dict-item]
+        {"prd": object()},  # type: ignore[dict-item]
+        {"prd": "   \n  "},
+    ],
+)
+def test_r8_silent_on_missing_or_unparseable(passes):
+    assert check_r8(passes) == []
+
+
+def test_r8_severity_matrix_stamped_vs_legacy():
+    passes = {"prd": _R8_BAD_PRD}
+    legacy = check_r8(passes)
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r8(passes, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert "legacy pack" not in stamped[0].message
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+# ---------------------------------------------------------------------------
+# R9 (warning/info): TASK-NNN acceptance window in the plan pass
+# ---------------------------------------------------------------------------
+
+
+def test_r9_acceptance_next_line_clean():
+    plan = (
+        "- [ ] **TASK-001** Install the dependencies.\n"
+        "  *Acceptance:* `pip list` shows every package.\n"
+    )
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["*Acceptance:* done", "**Acceptance**", "Acceptance: done", "Accepts: done"],
+)
+def test_r9_acceptance_marker_variants(marker):
+    plan = f"- [ ] TASK-001 Do the thing.\n  {marker}\n"
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+def test_r9_acceptance_at_window_edge_ok():
+    plan = (
+        "- [ ] TASK-001 Do the thing.\n"
+        "line2\n"
+        "line3\n"
+        "  Acceptance: yes\n"
+    )
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+def test_r9_acceptance_outside_window_flagged():
+    plan = (
+        "- [ ] TASK-001 Do the thing.\n"
+        "line2\n"
+        "line3\n"
+        "line4\n"
+        "  Acceptance: yes\n"
+    )
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert "TASK-001" in findings[0].message
+
+
+def test_r9_task_without_acceptance_one_finding_lists_all():
+    plan = (
+        "- [ ] TASK-001 First.\n  Acceptance: ok\n"
+        "- [ ] TASK-002 Second, no acceptance here.\n"
+        "- [ ] TASK-003 Third, also missing.\n"
+    )
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert "TASK-002" in findings[0].message
+    assert "TASK-003" in findings[0].message
+    assert "TASK-001" not in findings[0].message
+
+
+def test_r9_plain_checkbox_list_silent_on_legacy():
+    plan = "- [ ] Install dependencies\n- [ ] Write the client\n"
+    assert check_r9({"plan": plan}) == []
+
+
+def test_r9_plain_checkbox_list_warns_on_stamped():
+    plan = "- [ ] Install dependencies\n- [ ] Write the client\n"
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert findings[0].severity == SEVERITY_WARNING
+    assert "TASK-NNN" in findings[0].message
+
+
+def test_r9_severity_matrix_stamped_vs_legacy():
+    plan = "- [ ] TASK-001 No acceptance.\n"
+    legacy = check_r9({"plan": plan})
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r9({"plan": plan}, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"plan": None},  # type: ignore[dict-item]
+        {"plan": object()},  # type: ignore[dict-item]
+        {"plan": "   "},
+    ],
+)
+def test_r9_silent_on_missing_or_unparseable(passes):
+    assert check_r9(passes) == []
+
+
+def test_r9_silent_when_tasks_are_fenced():
+    plan = "```python\n# see TASK-001 in the docs\n```\n- [ ] free-form work\n"
+    assert check_r9({"plan": plan}) == []
+
+
+# ---------------------------------------------------------------------------
+# R13 (warning/info): RULES category headings — extras never flagged
+# ---------------------------------------------------------------------------
+
+_R13_BAD_RULES = "## General\nBe careful.\n## Security\nScan secrets.\n"
+
+_R13_GUIDE_STYLE_RULES = """# Engineering Rules
+## General
+x
+## Before Coding
+x
+## UI
+x
+## Security
+x
+## Testing
+x
+## Git
+x
+"""
+
+
+def test_r13_missing_categories_one_finding_listing_all():
+    findings = check_r13({"rules": _R13_BAD_RULES}, stamped=True)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == RULE_R13 and f.pass_id == "rules"
+    assert f.severity == SEVERITY_WARNING
+    assert "Before coding" in f.message
+    assert "Testing" in f.message
+    assert "Git" in f.message
+    assert "General" not in f.message.split("missing", 1)[1].split("(required")[0]
+
+
+def test_r13_guide_style_with_ui_extra_clean():
+    assert check_r13({"rules": _R13_GUIDE_STYLE_RULES}, stamped=True) == []
+
+
+def test_r13_before_you_code_synonym():
+    rules = (
+        "## General\nx\n## Before you code\nx\n## Security\nx\n"
+        "## Testing\nx\n## Git\nx\n"
+    )
+    assert check_r13({"rules": rules}, stamped=True) == []
+
+
+def test_r13_severity_matrix_stamped_vs_legacy():
+    passes = {"rules": _R13_BAD_RULES}
+    legacy = check_r13(passes)
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r13(passes, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"rules": None},  # type: ignore[dict-item]
+        {"rules": object()},  # type: ignore[dict-item]
+        {"rules": "prose without any headings"},
+    ],
+)
+def test_r13_missing_pass_silent_but_prose_reports_all(passes):
+    if "rules" not in passes or not isinstance(passes["rules"], str):
+        assert check_r13(passes) == []
+    else:
+        findings = check_r13(passes)
+        assert len(findings) == 1  # parseable prose: every category missing
+
+
+# ---------------------------------------------------------------------------
+# run_checks stamped wiring for the content rules
+# ---------------------------------------------------------------------------
+
+
+def test_run_checks_stamped_kwarg_flows_to_content_rules():
+    passes = {"prd": _R8_BAD_PRD, "rules": _R13_BAD_RULES, "plan": "no ids here"}
+    legacy = run_checks(passes)
+    content = [f for f in legacy if f.rule_id in (RULE_R8, RULE_R9, RULE_R13)]
+    assert {f.severity for f in content} == {SEVERITY_INFO}
+    stamped = run_checks(passes, stamped=True)
+    content = [f for f in stamped if f.rule_id in (RULE_R8, RULE_R9, RULE_R13)]
+    assert {f.severity for f in content} == {SEVERITY_WARNING}
+    assert not [f for f in stamped if f.severity == SEVERITY_ERROR]
 
 
 # ---------------------------------------------------------------------------

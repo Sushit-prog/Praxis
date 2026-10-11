@@ -32,6 +32,9 @@ RULE_R4_LEAVING = "r4-leaving"
 RULE_R4_CAP = "r4-cap"
 RULE_R3 = "r3-dependency"
 RULE_R5 = "r5-metric"
+RULE_R8 = "r8-prd-sections"
+RULE_R9 = "r9-task-structure"
+RULE_R13 = "r13-rules-categories"
 RULE_REGISTRY_UNKNOWN = "registry-unknown"
 RULE_REGISTRY_MISSING = "registry-missing"
 
@@ -145,7 +148,9 @@ def _conn_is_approx(conn: str) -> bool:
     return conn.lower() in _CONN_APPROX
 
 
-def check_r1(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def check_r1(
+    passes: Mapping[str, str], facts: FactsSheet | None = None, **_ignored: object
+) -> list[Finding]:
     del facts  # text-internal rule
     findings: list[Finding] = []
     for pass_id, raw in passes.items():
@@ -237,7 +242,9 @@ _GE_VALUE = re.compile(rf"(?:≥|>=)\s*{_NUM}\s*(?:{_UNIT})")
 _BOUNDARY = re.compile(r"(?<!\d)\.|\.(?!\d)|[;|\n]")
 
 
-def check_r2(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def check_r2(
+    passes: Mapping[str, str], facts: FactsSheet | None = None, **_ignored: object
+) -> list[Finding]:
     del facts  # text-internal rule
     findings: list[Finding] = []
     for pass_id, raw in passes.items():
@@ -308,7 +315,9 @@ _BARE_OPS = {"<", "<=", "≤"}
 _CAP_NOUN_R4 = re.compile(r"\b(?:headroom|ceiling|cap|limit|budget|constraint)\b", re.I)
 
 
-def check_r4(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def check_r4(
+    passes: Mapping[str, str], facts: FactsSheet | None = None, **_ignored: object
+) -> list[Finding]:
     del facts  # text-internal rule
     findings: list[Finding] = []
     for pass_id, raw in passes.items():
@@ -433,7 +442,9 @@ def _check_r3(passes: Mapping[str, str]) -> list[Finding]:
     return findings
 
 
-def check_r3(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def check_r3(
+    passes: Mapping[str, str], facts: FactsSheet | None = None, **_ignored: object
+) -> list[Finding]:
     del facts  # text-internal rule
     try:
         return _check_r3(passes)
@@ -531,10 +542,232 @@ def _check_r5(passes: Mapping[str, str]) -> list[Finding]:
     return findings
 
 
-def check_r5(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def check_r5(
+    passes: Mapping[str, str], facts: FactsSheet | None = None, **_ignored: object
+) -> list[Finding]:
     del facts  # text-internal rule
     try:
         return _check_r5(passes)
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# ---------------------------------------------------------------------------
+# R8/R9/R13 (warning on stamped v0.2 packs, info on legacy packs): content
+# shape of the PRD, the plan's tasks, and the RULES categories. One finding
+# per rule, listing every missing item; never an error in v0.2.0.
+# ---------------------------------------------------------------------------
+
+
+def _pass_text(passes: Mapping[str, str], pass_id: str) -> str | None:
+    """The pass's text, or None when the pass is absent/unparseable/blank."""
+    raw = passes.get(pass_id)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw
+
+
+def _norm_label(text: str) -> str:
+    """Casefold a heading/label; hyphens, underscores and & become spaces."""
+    text = text.translate(str.maketrans({"-": " ", "_": " ", "&": " ", "–": " ", "—": " "}))
+    return " ".join(text.casefold().split())
+
+
+def _syn_re(synonym: str) -> re.Pattern[str]:
+    """Whole-word match for a synonym, accepting simple plurals per word."""
+    words = r"\s+".join(re.escape(w) + r"s?" for w in synonym.split())
+    return re.compile(rf"\b{words}\b", re.I)
+
+
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*$")
+
+
+def _headings(text: str) -> list[str]:
+    """Normalized heading labels of a fence-stripped document, in order."""
+    labels: list[str] = []
+    for line in _strip_fences(_normalize(text)).splitlines():
+        m = _HEADING.match(line)
+        if m and m.group(1).strip():
+            labels.append(_norm_label(m.group(1)))
+    return labels
+
+
+def _has_heading(headings: list[str], synonym: str) -> bool:
+    pattern = _syn_re(synonym)
+    return any(pattern.search(h) for h in headings)
+
+
+def _content_finding(
+    rule_id: str,
+    pass_id: str,
+    excerpt: str,
+    missing: list[str],
+    *,
+    stamped: bool,
+    item: str,
+) -> Finding:
+    joined = ", ".join(missing)
+    if stamped:
+        severity = SEVERITY_WARNING
+        message = f"missing {joined} (required in v0.2 packs)"
+    else:
+        severity = SEVERITY_INFO
+        message = f"legacy pack: missing {joined} (v0.2 packs require it)"
+    return Finding(rule_id, severity, pass_id, excerpt, f"{item}: {message}")
+
+
+# Each section maps its display label to the synonym list; a heading matches
+# when any synonym appears as whole words (simple plurals accepted).
+_R8_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Problem", ("problem",)),
+    ("Users", ("users", "target users")),
+    ("Goal", ("goal",)),
+    ("Features", ("features", "core features", "functional requirements")),
+    ("MVP", ("mvp",)),
+    ("Out of scope", ("out of scope", "non goals")),
+    ("Success criteria", ("success criteria", "success metrics")),
+)
+
+
+def check_r8(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    stamped: bool = False,
+    **_ignored: object,
+) -> list[Finding]:
+    del facts  # text-internal rule
+    text = _pass_text(passes, "prd")
+    if text is None:
+        return []
+    try:
+        headings = _headings(text)
+        missing = [
+            label
+            for label, syns in _R8_SECTIONS
+            if not any(_has_heading(headings, s) for s in syns)
+        ]
+        if not missing:
+            return []
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "prd")
+        return [
+            _content_finding(
+                RULE_R8, "prd", first[:120], missing, stamped=stamped, item="prd sections"
+            )
+        ]
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# The plan pass is where TASK-NNN tasks live (TASKS.md is a render of it).
+_TASK_ID = re.compile(r"TASK-(?P<id>\d+)", re.I)
+_ACCEPTANCE_WINDOW = 3
+_ACCEPTANCE = re.compile(
+    r"\s*(?:[-+•]\s*)?accept(?:s|ance)?(?:\s*:|\s*$)", re.I
+)
+
+
+def _is_acceptance_line(line: str) -> bool:
+    stripped = line.replace("*", "").replace("_", "").replace("`", "")
+    return bool(_ACCEPTANCE.match(stripped))
+
+
+def check_r9(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    stamped: bool = False,
+    **_ignored: object,
+) -> list[Finding]:
+    del facts  # text-internal rule
+    text = _pass_text(passes, "plan")
+    if text is None:
+        return []
+    try:
+        lines = _strip_fences(_normalize(text)).splitlines()
+        tasks: list[tuple[str, int]] = []
+        for i, line in enumerate(lines):
+            m = _TASK_ID.search(line)
+            if m:
+                tasks.append((f"TASK-{m.group('id')}", i))
+        if not tasks:
+            if not stamped:
+                return []
+            return [
+                Finding(
+                    RULE_R9,
+                    SEVERITY_WARNING,
+                    "plan",
+                    "plan",
+                    "task structure: no TASK-NNN ids in plan "
+                    "(required in v0.2 packs)",
+                )
+            ]
+        uncovered = [
+            tid
+            for tid, i in tasks
+            if not any(
+                _is_acceptance_line(ln)
+                for ln in lines[i + 1 : i + 1 + _ACCEPTANCE_WINDOW]
+            )
+        ]
+        if not uncovered:
+            return []
+        excerpt = next(
+            (ln.strip()[:120] for ln in lines if _TASK_ID.search(ln)), "plan"
+        )
+        return [
+            _content_finding(
+                RULE_R9,
+                "plan",
+                excerpt,
+                uncovered,
+                stamped=stamped,
+                item=(
+                    f"tasks without an Acceptance marker within "
+                    f"{_ACCEPTANCE_WINDOW} lines"
+                ),
+            )
+        ]
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+_R13_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("General", ("general",)),
+    ("Before coding", ("before coding", "before you code")),
+    ("Security", ("security",)),
+    ("Testing", ("testing",)),
+    ("Git", ("git",)),
+)
+
+
+def check_r13(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    stamped: bool = False,
+    **_ignored: object,
+) -> list[Finding]:
+    del facts  # text-internal rule
+    text = _pass_text(passes, "rules")
+    if text is None:
+        return []
+    try:
+        headings = _headings(text)
+        missing = [
+            label
+            for label, syns in _R13_CATEGORIES
+            if not any(_has_heading(headings, s) for s in syns)
+        ]
+        if not missing:
+            return []
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "rules")
+        return [
+            _content_finding(
+                RULE_R13, "rules", first[:120], missing, stamped=stamped, item="rules categories"
+            )
+        ]
     except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
         return []
 
@@ -575,17 +808,33 @@ def _registry(passes: Mapping[str, str]) -> list[Finding]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-RULES = (check_r1, check_r2, check_r4, check_r3, check_r5)
+RULES = (
+    check_r1,
+    check_r2,
+    check_r4,
+    check_r3,
+    check_r5,
+    check_r8,
+    check_r9,
+    check_r13,
+)
 
 
-def run_checks(passes: Mapping[str, str], facts: FactsSheet | None = None) -> list[Finding]:
+def run_checks(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    stamped: bool = False,
+) -> list[Finding]:
     """Run every rule plus the registry over stored pass text.
 
     Pure and deterministic: the same inputs always yield the same findings in
-    the same order (sorted by pass id, rule id, excerpt).
+    the same order (sorted by pass id, rule id, excerpt). ``stamped`` marks a
+    v0.2 pack (both design and pack layers stamped); content rules r8/r9/r13
+    warn on stamped packs and emit legacy-pack info otherwise.
     """
     findings: list[Finding] = list(_registry(passes))
     for rule in RULES:
-        findings.extend(rule(passes, facts))
+        findings.extend(rule(passes, facts, stamped=stamped))
     findings.sort(key=lambda f: (f.pass_id, f.rule_id, f.excerpt))
     return findings

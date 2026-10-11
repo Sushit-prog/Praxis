@@ -1080,7 +1080,8 @@ def _cmd_check(args) -> int:
         SEVERITY_WARNING,
         run_checks,
     )
-    from praxis.db import latest_design
+    from praxis.db import get_design_meta, latest_design
+    from praxis.design import PROVENANCE_VERSION
     from praxis.design_io import load_passes
 
     design = latest_design(args.candidate_id)
@@ -1088,7 +1089,12 @@ def _cmd_check(args) -> int:
         print(f"error: candidate {args.candidate_id} has no design", file=sys.stderr)
         return 1
 
-    findings = run_checks(load_passes(design), load_facts())
+    meta = get_design_meta(design.id) if design.id is not None else {}
+    findings = run_checks(
+        load_passes(design),
+        load_facts(),
+        stamped=meta.get("pack_version") == PROVENANCE_VERSION,
+    )
     counts: dict[str, int] = {}
     for finding in findings:
         counts[finding.severity] = counts.get(finding.severity, 0) + 1
