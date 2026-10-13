@@ -14,7 +14,7 @@ Scout
      data_contracts, plan, hardware_fit)
   -> praxis plan (docs pack: 6 LLM + 5 deterministic + optional Recommendations)
   -> praxis check (deterministic zero-LLM consistency rules)
-  -> praxis handoff (allowlisted copy + secret scan + git init)
+  -> praxis handoff (allowlisted copy + agent files + secret scan + git init)
   -> coding agent builds from the exported pack
 ```
 
@@ -91,9 +91,14 @@ Errors fail the command (exit 1). Warnings and info are reported but exit 0. Err
 - A non-empty target (unless `--force`, which overwrite-merges and never deletes extras).
 - A target inside the Praxis repo, or a repo ancestor of the target (symlink- and case-insensitive-resolved).
 - Stray files in `docs/` that are not on the allowlist (unless `--force`, which skips them rather than copying).
-- Key-like strings in the copied content (e.g. `gsk_…`, `sk-…`, `Bearer …`); documented placeholders like `…_placeholder` will be ignored. On a hit it aborts and cleans up; the matched value is never printed.
+- Key-like strings among the files handoff wrote or merged (e.g. `gsk_…`, `sk-…`, `Bearer …`); documented placeholders like `…_placeholder` will be ignored, and pre-existing user files in a `--force` target are never scanned. On a hit it aborts and cleans up; the matched value is never printed.
 
-After a clean copy it runs `git init` and writes `HANDOFF_PROMPT.md`, a plan-mode prompt that tells the agent to read the pack, obey RULES.md, propose a milestone-1 plan listing every ambiguity with `file:line`, and wait for approval before writing code.
+After a clean copy it writes the generated files and runs `git init`:
+
+- **`HANDOFF_PROMPT.md`** — a plan-mode prompt that tells the agent to read the pack, obey RULES.md, propose a milestone-1 plan listing every ambiguity with `file:line`, and wait for approval; after approval it runs the task-by-task implement loop (test the task, tick TASKS.md, update MEMORY.md, propose a commit, stop).
+- **`AGENTS.md`** — a Praxis header, a short Workflow section (derived from the files actually copied), and RULES.md verbatim; a pre-existing user file without the header is kept, never overwritten.
+- **`.gitignore`** — universal safety lines plus blocks for the stack the pack describes (ARCHITECTURE.md `### Stack` markers, union for mixed stacks; SQLite mentions add `*.db`/`*.sqlite3`; nothing detected means universal lines only). Existing files are merge-appended, never replaced.
+- **`.cursor/rules/praxis.mdc`** — only with `--cursor`; same body as AGENTS.md behind Cursor frontmatter.
 
 ## Worked example: MemGuard
 
@@ -210,6 +215,7 @@ praxis check 42 --json
 praxis handoff 42 ../MyProject
 praxis handoff 42 ../MyProject --force
 praxis handoff 42 ../MyProject --skip-check
+praxis handoff 42 ../MyProject --cursor
 ```
 
 ## Design engine (multi-pass DESIGN.md)

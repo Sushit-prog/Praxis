@@ -14,10 +14,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
 from praxis.config import FactsSheet
 from praxis.design import PASS_IDS
 from praxis.planning import OPTIONAL_PASS_IDS, PACK_PASS_IDS
+from praxis.untrusted import UNTRUSTED_END, UNTRUSTED_START
 
 # Union of the core design passes and the docs-pack passes; a stored design is
 # expected to carry exactly these keys.

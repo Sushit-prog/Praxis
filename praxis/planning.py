@@ -42,7 +42,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
 from praxis.config import FactsSheet, HardwareProfile, load_facts
 from praxis.db import (
     LLMUsage,
@@ -80,6 +79,7 @@ from praxis.design import (
 )
 from praxis.export import _section
 from praxis.grounding import ground_candidate
+from praxis.untrusted import UNTRUSTED_END, UNTRUSTED_START
 
 logger = logging.getLogger(__name__)
 

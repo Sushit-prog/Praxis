@@ -305,8 +305,8 @@ def build_parser() -> argparse.ArgumentParser:
         "handoff",
         help=(
             "Export a finished design's docs pack into a fresh project "
-            "directory for a coding agent (checks, copy, git init, "
-            "HANDOFF_PROMPT.md)."
+            "directory for a coding agent (checks, copy, agent files, "
+            "git init, HANDOFF_PROMPT.md)."
         ),
     )
     handoff_parser.add_argument(
@@ -327,6 +327,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-check",
         action="store_true",
         help="Export even if the stored design has consistency errors.",
+    )
+    handoff_parser.add_argument(
+        "--cursor",
+        action="store_true",
+        help=(
+            "Also write .cursor/rules/praxis.mdc (same body as AGENTS.md) "
+            "for Cursor users."
+        ),
     )
 
     return parser
@@ -1150,6 +1158,7 @@ def _cmd_handoff(args) -> int:
         args.target,
         force=args.force,
         skip_check=args.skip_check,
+        cursor=args.cursor,
     )
 
 
