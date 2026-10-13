@@ -39,8 +39,9 @@ def _isolate(monkeypatch, tmp_path, *, env_file: str | None):
     Two leaks are guarded against: ``find_dotenv`` walks up the real
     filesystem (so the project's own .env would be found), and litellm loads
     the project .env at import time (so the machine's real keys would enter
-    ``os.environ`` mid-test). litellm is preloaded in conftest, so no import
-    here can fire that side effect again; clean the env and control
+    ``os.environ`` mid-test). Both are disabled for the whole session by
+    conftest (LITELLM_MODE=PRODUCTION and the find_dotenv guard), so no
+    import here can fire either side effect; clean the env and control
     ``_load_env`` directly.
     """
     import praxis.llm  # noqa: F401 - ensure the wrapper is imported first
