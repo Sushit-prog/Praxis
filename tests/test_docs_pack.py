@@ -29,6 +29,9 @@ ALL_FILES = [
     "TASKS.md",
     "TEST_PLAN.md",
 ]
+# The core eleven plus the optional Recommendations document.
+ALL_FILES_FULL = sorted([*ALL_FILES, "RECOMMENDATIONS.md"])
+CORE_PASSES = {k: v for k, v in PASSES.items() if k != "recommendations"}
 
 
 @pytest.fixture
@@ -103,16 +106,31 @@ def _write(tmp_path, **kwargs):
     )
 
 
-def test_write_docs_pack_writes_eleven_files(docs_db, tmp_path):
+def test_write_docs_pack_writes_eleven_core_files(docs_db, tmp_path):
+    """Without a stored Recommendations pass, exactly the core eleven land."""
     _seed_design()
-    out = _write(tmp_path)
+    out = _write(tmp_path, passes=CORE_PASSES)
 
     assert out == tmp_path / "designs" / "001-cpu-fine-tune" / "docs"
     assert sorted(p.name for p in out.iterdir()) == ALL_FILES
+    assert not (out / "RECOMMENDATIONS.md").exists()
     # The memory seed falls back to a placeholder when no history exists.
     assert "(no build-memory entries for this candidate)" in (
         out / "MEMORY.md"
     ).read_text(encoding="utf-8")
+
+
+def test_write_docs_pack_writes_recommendations_when_stored(docs_db, tmp_path):
+    """A stored Recommendations pass adds the twelfth file, verbatim."""
+    _seed_design()
+    out = _write(tmp_path)
+
+    assert sorted(p.name for p in out.iterdir()) == ALL_FILES_FULL
+    text = (out / "RECOMMENDATIONS.md").read_text(encoding="utf-8")
+    assert text == PACK_CONTENT["recommendations"]
+    assert text.startswith("# Recommendations\n")
+    assert "## Fit summary\n" in text
+    assert "no hardware conflicts detected (scan covers RAM" in text
 
 
 def test_design_md_is_verbatim_with_stamp(docs_db, tmp_path):
@@ -231,7 +249,7 @@ def test_stamp_only_on_design_and_tasks(docs_db, tmp_path):
     _seed_design()
     out = _write(tmp_path)
 
-    for name in ALL_FILES:
+    for name in ALL_FILES_FULL:
         if name in ("DESIGN.md", "TASKS.md"):
             continue
         assert "generated-from" not in (out / name).read_text(encoding="utf-8")
@@ -305,14 +323,34 @@ def test_write_docs_pack_byte_stable_without_generated_at(docs_db, tmp_path):
     """Legacy packs (no _meta): two renders differ in no byte."""
     _seed_design()
     out = _write(tmp_path, generated_at=None)
-    first = {name: (out / name).read_bytes() for name in ALL_FILES}
+    first = {name: (out / name).read_bytes() for name in ALL_FILES_FULL}
 
     out = _write(tmp_path, generated_at=None)
-    second = {name: (out / name).read_bytes() for name in ALL_FILES}
+    second = {name: (out / name).read_bytes() for name in ALL_FILES_FULL}
 
     assert first == second
     # And the legacy stamp literal replaces the old render-time clock.
     assert b"unstamped" in (out / "DESIGN.md").read_bytes()
+
+
+def test_recommendations_md_byte_stable_empty_state(docs_db, tmp_path):
+    """The pinned empty-state Recommendations render is byte-stable."""
+    _seed_design()
+    out = _write(tmp_path)
+    first = (out / "RECOMMENDATIONS.md").read_bytes()
+
+    out = _write(tmp_path)
+    second = (out / "RECOMMENDATIONS.md").read_bytes()
+
+    assert first == second
+    text = first.decode("utf-8").replace("\r\n", "\n")
+    assert (
+        "no hardware conflicts detected (scan covers RAM, GPU/CUDA and "
+        "remote-host claims); 42 hardware-related statements checked"
+    ) in text
+    assert "## Risks\nnone" in text
+    assert "no substitution found" in text
+    assert "scan found no hardware-driven cuts" in text
 
 
 def test_parse_generated_at_roundtrip():

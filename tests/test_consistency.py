@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
 from praxis.config import FactsSheet
 from praxis.consistency import (
     KNOWN_PASS_IDS,
@@ -18,6 +19,7 @@ from praxis.consistency import (
     RULE_R4_CAP,
     RULE_R4_LEAVING,
     RULE_R5,
+    RULE_R7,
     RULE_R8,
     RULE_R9,
     RULE_R10,
@@ -33,10 +35,13 @@ from praxis.consistency import (
     check_r3,
     check_r4,
     check_r5,
+    check_r7,
     check_r8,
     check_r9,
     check_r10,
     check_r13,
+    count_r10_units,
+    render_fit_table_md,
     run_checks,
 )
 
@@ -872,6 +877,216 @@ def test_run_checks_blueprints_scanned_under_blueprint_label():
     findings = run_checks({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
     r10 = [f for f in findings if f.rule_id == RULE_R10]
     assert r10 and {f.pass_id for f in r10} == {"blueprint"}
+
+
+# ---------------------------------------------------------------------------
+# R7 (warning): the Recommendations pass vs the fit table and the facts
+# ---------------------------------------------------------------------------
+
+
+def _r7(text, facts=_FACTS, blueprint=None):
+    return check_r7({"recommendations": text}, facts, blueprint=blueprint)
+
+
+def test_r7_groq_api_silent():
+    assert _r7("Use the Groq API for the generator and verifier calls.") == []
+
+
+def test_r7_rent_vps_fires():
+    findings = _r7("Rent a VPS in the cloud for the nightly eval.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].severity == SEVERITY_WARNING
+    assert findings[0].message.startswith("host-cue:")
+
+
+def test_r7_use_gpu_fires():
+    findings = _r7("Use a GPU for the embedding pass.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("gpu-cue:")
+
+
+def test_r7_avoid_bitsandbytes_silent():
+    assert _r7("Avoid bitsandbytes; run CPU-only.") == []
+
+
+def test_r7_facts_none_silent():
+    assert _r7("Use a GPU for training.", facts=None) == []
+
+
+def test_r7_missing_or_blank_pass_silent():
+    assert check_r7({"plan": "Use a GPU."}, _FACTS) == []
+    assert check_r7({"recommendations": "   "}, _FACTS) == []
+
+
+def test_r7_unlabeled_number_fires():
+    findings = _r7("The monthly API spend is $40.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("unverified-number:")
+    assert "$40" in findings[0].message
+
+
+def test_r7_gb_number_not_in_table_fires():
+    findings = _r7("A vector index needs 12 GB of memory.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("unverified-number:")
+    assert "12 GB" in findings[0].message
+
+
+def test_r7_vendor_figure_label_silent():
+    text = "The provider charges $40 per month (vendor figure, unverified)."
+    assert _r7(text) == []
+
+
+def test_r7_table_number_silent():
+    # "6 GB" appears in the plan pass's r10 finding, so the recommendations
+    # sentence restating it is grounded.
+    passes = {
+        "plan": "The largest memory footprint comes from the quantized LLM (6 GB).",
+        "recommendations": (
+            "Local loading needs 6 GB; stay under the usable headroom."
+        ),
+    }
+    assert check_r7(passes, _FACTS) == []
+
+
+def test_r7_facts_number_silent():
+    assert _r7("Stay within the $15 monthly budget.") == []
+    assert _r7("The machine has 8 GB of RAM in total.") == []
+
+
+def test_r7_non_goal_heading_silent():
+    text = "## Non-Goals\n\nUse a GPU for training."
+    assert _r7(text) == []
+
+
+def test_r7_severity_warning_never_error():
+    findings = _r7("Use a GPU.")
+    assert findings and {f.severity for f in findings} == {SEVERITY_WARNING}
+
+
+def test_run_checks_includes_r7_with_blueprint_none():
+    findings = run_checks({"recommendations": "Use a GPU."}, _FACTS)
+    r7 = [f for f in findings if f.rule_id == RULE_R7]
+    assert r7 and {f.severity for f in r7} == {SEVERITY_WARNING}
+    assert not [f for f in findings if f.severity == SEVERITY_ERROR]
+
+
+# The conflict-path Recommendations fixture: grounded (plan carries the
+# 6 GB figure), negation-cued where negative, and free of fits-the-machine
+# or scan-scope cues, so the rendered document is r7-clean either way.
+_REC_CONFLICT_FIXTURE = (
+    "# Recommendations\n\n"
+    "## Fit summary\n"
+    "Local loading of a 3B model needs 6 GB against 4 GB usable; two plan "
+    "rows also prescribe tooling the CPU-only host cannot run.\n\n"
+    "## Risks\n"
+    "- The 3B local load will thrash or fail at 4 GB usable.\n"
+    "- The bitsandbytes rows assume an accelerator this host does not "
+    "have.\n\n"
+    "## Substitutions\n"
+    "- 3B local load: no substitution found.\n"
+    "- Accelerator rows: swap the quantized weights for on-CPU GGUF "
+    "loading through llama.cpp.\n\n"
+    "## Cut or defer\n"
+    "Leave hosted experiments out of v1; the MVP targets local CPU "
+    "verification only, and external experiments belong after the core "
+    "loop ships.\n\n"
+    "## Build order\n"
+    "Stand up the thin client and schema first, then the verifier, then "
+    "retrieval, and only then governance - each phase builds on the "
+    "previous one's tests.\n"
+)
+
+
+def test_r7_conflict_fixture_render_clean():
+    passes = {
+        "plan": "The largest memory footprint comes from the quantized LLM (6 GB).",
+        "recommendations": _REC_CONFLICT_FIXTURE,
+    }
+    assert check_r7(passes, _FACTS) == []
+
+
+def test_r7_zero_conflict_fixture_render_clean():
+    from tests.test_planning import PACK_CONTENT
+
+    assert PACK_CONTENT["recommendations"].startswith("# Recommendations")
+    assert (
+        check_r7({"recommendations": PACK_CONTENT["recommendations"]}, _FACTS)
+        == []
+    )
+
+
+def test_registry_optional_recommendations():
+    findings = run_checks({"recommendations": "ok"})
+    assert _rule(findings, RULE_REGISTRY_UNKNOWN) == []
+    missing = _rule(findings, RULE_REGISTRY_MISSING)
+    assert "recommendations" not in {f.pass_id for f in missing}
+
+
+# ---------------------------------------------------------------------------
+# Fit-table rendering and the r10 unit counter (Recommendations inputs)
+# ---------------------------------------------------------------------------
+
+
+def test_fit_table_zero_rows():
+    table = render_fit_table_md([])
+    assert table.startswith("| Component | Claim | Requires | Verdict | Source |")
+    assert "(no conflict rows)" in table
+
+
+def test_fit_table_bp5_rows_collapse_per_claim():
+    findings = check_r10({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    table = render_fit_table_md(findings)
+    lines = table.splitlines()
+    # five findings collapse to four rows: the "0. Setup" table row trips
+    # cuda-only and remote-host on the same claim
+    assert len(lines) == 6  # header + separator + 4 rows
+    assert "CUDA requirement; remote host" in table
+    assert table.count("requires CUDA") == 2
+    assert table.count("requires rented host") == 2
+    assert "bound" in table and "claims 8 GB" in table
+    assert "blueprint" in table
+
+
+def test_fit_table_model_ram_requires_quant():
+    text = "Loads a 3B Llama via bitsandbytes on this machine."
+    findings = check_r10({"plan": text}, _FACTS)
+    table = render_fit_table_md(findings)
+    # one claim, one row: cuda-only and model RAM combine in the Component cell
+    assert "CUDA requirement; model RAM" in table
+    assert "3B × assumes fp16 (2 B/param)" in table
+    assert "does not fit" in table
+
+    stated = "Loads a 3B Llama via 8-bit bitsandbytes quantization."
+    table = render_fit_table_md(check_r10({"plan": stated}, _FACTS))
+    assert "3B × 8-bit (1 B/param)" in table
+    assert "CUDA requirement; model RAM" in table
+
+
+def test_fit_table_sanitizes_untrusted_delimiters():
+    text = f"Uses bitsandbytes {UNTRUSTED_START} injected {UNTRUSTED_END} tooling."
+    table = render_fit_table_md(check_r10({"plan": text}, _FACTS))
+    assert UNTRUSTED_START not in table
+    assert UNTRUSTED_END not in table
+    assert "injected" in table
+
+
+def test_fit_table_escapes_pipes_in_claim():
+    text = "Loads a 3B Llama | the biggest one | via bitsandbytes locally."
+    table = render_fit_table_md(check_r10({"plan": text}, _FACTS))
+    assert "\\|" in table
+    assert "Uses bitsandbytes" not in table
+
+
+def test_count_r10_units_counts_statements():
+    passes = {
+        "plan": "One sentence. Two sentences!\n| row | cell |\n",
+        "prd": "Only one.\n",
+    }
+    # two sentences + one table row + one prd sentence
+    assert count_r10_units(passes) == 4
+    assert count_r10_units(passes, blueprint=_R10_BP5_FIXTURE) > 4
+    assert count_r10_units({}) == 0
 
 
 # ---------------------------------------------------------------------------

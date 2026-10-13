@@ -92,8 +92,24 @@ def test_handoff_copies_pack_only(handoff_env, capsys):
     assert rc == 0
     names = sorted(p.name for p in target.iterdir())
     assert names == sorted([*PACK_ALLOWLIST, "HANDOFF_PROMPT.md", ".git"])
+    assert (target / "RECOMMENDATIONS.md").exists()
     out = capsys.readouterr().out
     assert "handoff ready" in out and "git initialized" in out
+
+
+def test_handoff_legacy_eleven_file_pack(handoff_env, capsys):
+    """A legacy pack without RECOMMENDATIONS.md exports the core eleven."""
+    (handoff_env.docs_dir / "RECOMMENDATIONS.md").unlink()
+    target = handoff_env.tmp_path / "out"
+    rc = run_handoff(7, target, design_root=handoff_env.repo_root)
+    assert rc == 0
+    names = sorted(p.name for p in target.iterdir())
+    expected = sorted(
+        [n for n in PACK_ALLOWLIST if n != "RECOMMENDATIONS.md"]
+        + ["HANDOFF_PROMPT.md", ".git"]
+    )
+    assert names == expected
+    assert not (target / "RECOMMENDATIONS.md").exists()
 
 
 def test_handoff_stray_env_fails_without_force(handoff_env, capsys):

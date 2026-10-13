@@ -12,7 +12,7 @@ Scout
   -> Architect (blueprint)
   -> design engine (5 paced LLM passes: technique, architecture,
      data_contracts, plan, hardware_fit)
-  -> praxis plan (11-file docs pack: 6 LLM + 5 deterministic)
+  -> praxis plan (docs pack: 6 LLM + 5 deterministic + optional Recommendations)
   -> praxis check (deterministic zero-LLM consistency rules)
   -> praxis handoff (allowlisted copy + secret scan + git init)
   -> coding agent builds from the exported pack
@@ -71,6 +71,7 @@ An LLM-written decision record in the MemGuard design pack said "2k records × 3
 | `r4-cap` | error | Component size written as a percentage or fraction of a cap that does not match the stated cap |
 | `r3-dependency` | warning | Two passes prescribing different packages for one slot (e.g. `requests` in TASKS vs `httpx` in SECURITY) |
 | `r5-metric` | warning | Two passes prescribing different retrieval metrics (e.g. Euclidean vs cosine) |
+| `r7-recommendation-claims` | warning | The optional Recommendations pass prescribing GPU/VRAM or rented hosts, or citing GB/$ numbers absent from the fit table and facts |
 | `r8-prd-sections` | warning (info on legacy packs) | PRD missing required sections (Problem, Users, Goal, Features, MVP, Out of scope, Success criteria) |
 | `r9-task-structure` | warning (info on legacy packs) | `TASK-NNN` tasks in the plan without an Acceptance marker within 3 lines; stamped packs with no task ids at all |
 | `r10-stack-fit` | warning | Prescribed models, RAM/VRAM footprints, CUDA tooling, or rented hosts that do not fit the facts sheet (stored passes + blueprint) |
@@ -84,7 +85,7 @@ Errors fail the command (exit 1). Warnings and info are reported but exit 0. Err
 
 `praxis handoff <id> <target>` exports a finished design's docs pack into a fresh project directory and bootstraps it for a coding agent. It makes **zero LLM calls**.
 
-**Copies (allowlist of 11 files):** `.env.example`, `ARCHITECTURE.md`, `DECISIONS.md`, `DESIGN.md`, `MEMORY.md`, `PRD.md`, `README.md`, `RULES.md`, `SECURITY.md`, `TASKS.md`, `TEST_PLAN.md`.
+**Copies (allowlist of 12 names; RECOMMENDATIONS.md only when present):** `.env.example`, `ARCHITECTURE.md`, `DECISIONS.md`, `DESIGN.md`, `MEMORY.md`, `PRD.md`, `README.md`, `RECOMMENDATIONS.md`, `RULES.md`, `SECURITY.md`, `TASKS.md`, `TEST_PLAN.md`.
 
 **Refuses:**
 - A non-empty target (unless `--force`, which overwrite-merges and never deletes extras).
@@ -237,7 +238,7 @@ Output is saved to the DB and written to `designs/<NNN>-<slug>/`: `DESIGN.md`, `
 
 ### Planning docs pack (praxis plan)
 
-`praxis plan <id>` turns a finished design into the hand-off bundle a coding agent implements from: eleven files under `designs/<NNN>-<slug>/docs/` — `PRD.md`, `ARCHITECTURE.md`, `DESIGN.md`, `RULES.md`, `TASKS.md`, `TEST_PLAN.md`, `SECURITY.md`, `DECISIONS.md`, `MEMORY.md`, `README.md`, and `.env.example`. Six of them are paced LLM passes in their own `plan` stage (PRD, rules, test plan, security, README, env example); the other five are rendered deterministically from the stored design passes.
+`praxis plan <id>` turns a finished design into the hand-off bundle a coding agent implements from: eleven files under `designs/<NNN>-<slug>/docs/` — `PRD.md`, `ARCHITECTURE.md`, `DESIGN.md`, `RULES.md`, `TASKS.md`, `TEST_PLAN.md`, `SECURITY.md`, `DECISIONS.md`, `MEMORY.md`, `README.md`, and `.env.example` — plus an optional twelfth, `RECOMMENDATIONS.md`. Six of the eleven are paced LLM passes in their own `plan` stage (PRD, rules, test plan, security, README, env example); the other five are rendered deterministically from the stored design passes. The Recommendations pass is generated automatically for stamped v0.2 packs (or on demand with `--recommend` on legacy packs): a hardware-fit summary driven by a deterministic fit table over the stored passes and blueprint, policed by the `r7-recommendation-claims` rule.
 
 The pack critic is off by default (`--critic` opts in). `MEMORY.md` is seed-only: Praxis writes it once and the coding agent maintains it from then on.
 

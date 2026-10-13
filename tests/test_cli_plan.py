@@ -10,7 +10,7 @@ from praxis.cli import build_parser, main
 from praxis.db import LLMUsage, get_session
 from praxis.planning import PACK_PASS_IDS
 from tests.test_design import GOOD_PASSES
-from tests.test_docs_pack import ALL_FILES
+from tests.test_docs_pack import ALL_FILES, ALL_FILES_FULL
 from tests.test_planning import PACK_CONTENT, _pack_completion, _seed_design
 
 # ---------------------------------------------------------------------------
@@ -26,6 +26,7 @@ def test_plan_parser_defaults():
     assert args.rerun_pass is None
     assert args.resume is False
     assert args.run_critic is False
+    assert args.recommend is False
 
 
 def test_plan_parser_critic_and_resume_flags():
@@ -34,6 +35,7 @@ def test_plan_parser_critic_and_resume_flags():
     assert build_parser().parse_args([*base, "--critic"]).run_critic is True
     assert build_parser().parse_args([*base, "--no-critic"]).run_critic is False
     assert build_parser().parse_args([*base, "--resume"]).resume is True
+    assert build_parser().parse_args([*base, "--recommend"]).recommend is True
 
 
 def test_plan_parser_pass_choices():
@@ -413,3 +415,46 @@ def test_cli_plan_stamped_docs_carry_generated_at(plan_env, monkeypatch, tmp_pat
     text = tasks.read_text(encoding="utf-8")
     assert text.startswith("<!-- generated-from: plan pass · ")
     assert stamp_date in text.split("-->", 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# Optional Recommendations pass via the CLI (v0.2)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_plan_recommend_on_legacy_pack(plan_env, monkeypatch, capsys, tmp_path):
+    """plan --recommend on a complete legacy pack: one call, 12 docs, no stamp."""
+    from praxis.db import get_design_meta
+
+    _add_pack_passes(plan_env["full"], *PACK_PASS_IDS)
+    design_id = _design_id(plan_env["full"])
+
+    rc, fake = _run(plan_env["full"], monkeypatch, "--recommend")
+    capsys.readouterr()
+
+    assert rc == 0
+    assert len(fake.calls) == 1
+    assert "'# Recommendations'" in fake.calls[0][1]
+    assert get_design_meta(design_id) == {}
+    docs = tmp_path / "designs" / "001-cpu-fine-tune" / "docs"
+    assert sorted(p.name for p in docs.iterdir()) == sorted(ALL_FILES_FULL)
+    assert "## Fit summary" in (docs / "RECOMMENDATIONS.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_cli_plan_stamped_fresh_includes_recommendations(
+    plan_env, monkeypatch, tmp_path
+):
+    """Stamped design + fresh plan: 7 calls and RECOMMENDATIONS.md in docs."""
+    from praxis.db import set_design_meta
+
+    design_id = _design_id(plan_env["full"])
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    rc, fake = _run(plan_env["full"], monkeypatch)
+    assert rc == 0
+    assert len(fake.calls) == 7
+    docs = tmp_path / "designs" / "001-cpu-fine-tune" / "docs"
+    assert (docs / "RECOMMENDATIONS.md").is_file()
+    assert sorted(p.name for p in docs.iterdir()) == sorted(ALL_FILES_FULL)

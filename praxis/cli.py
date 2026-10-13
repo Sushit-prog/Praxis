@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from praxis.design import PASS_IDS
-from praxis.planning import PACK_PASS_IDS
+from praxis.planning import PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -291,6 +291,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the pack critic (default).",
     )
     plan_parser.set_defaults(run_critic=False)
+    plan_parser.add_argument(
+        "--recommend",
+        action="store_true",
+        help=(
+            "Generate the optional Recommendations pass (hardware-fit "
+            "summary) when it is not already stored; stamped v0.2 packs "
+            "generate it automatically, legacy packs need this flag."
+        ),
+    )
 
     handoff_parser = sub.add_parser(
         "handoff",
@@ -703,7 +712,7 @@ def _discard_partial_pack(design) -> None:
     stored = [p for p in PACK_PASS_IDS if (passes.get(p) or "").strip()]
     if not stored or len(stored) == len(PACK_PASS_IDS):
         return
-    for pass_id in PACK_PASS_IDS:
+    for pass_id in (*PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID):
         clear_design_pass(design.id, pass_id)
     clear_design_meta(design.id)
 
@@ -1008,6 +1017,7 @@ def _cmd_plan(args) -> int:
         facts=facts,
         run_critic=args.run_critic,
         rerun_passes=rerun_passes,
+        recommend=args.recommend,
     )
     if result.status != "complete":
         completed = ", ".join(result.completed_passes) or "none"

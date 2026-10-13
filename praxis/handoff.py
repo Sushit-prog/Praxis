@@ -2,7 +2,8 @@
 
 `praxis handoff <id> <target>` is the bridge between a stored design and an
 external coding agent: it validates the design (same consistency checks as
-``praxis check``), copies the eleven allowlisted pack documents out of
+``praxis check``), copies the allowlisted pack documents (the eleven core
+files plus RECOMMENDATIONS.md when present) out of
 ``designs/<NNN>-<slug>/docs/``, runs ``git init``, and writes a plan-mode
 HANDOFF_PROMPT.md. Nothing outside the allowlist ever leaves the Praxis tree,
 and a post-copy secret scan refuses to leave key-like content behind.
@@ -24,7 +25,8 @@ from praxis.design import PROVENANCE_VERSION
 from praxis.design_io import design_dir, load_passes
 from praxis.planning import PACK_PASS_IDS
 
-# The exact eleven files `praxis plan` writes into docs/. Anything else in
+# The files `praxis plan` writes into docs/ (eleven core documents plus the
+# optional RECOMMENDATIONS.md, copied only when present). Anything else in
 # docs/ (stray .env, .pem, editor droppings) fails the handoff unless --force,
 # and even then only allowlisted names are ever copied.
 PACK_ALLOWLIST: tuple[str, ...] = (
@@ -35,6 +37,7 @@ PACK_ALLOWLIST: tuple[str, ...] = (
     "MEMORY.md",
     "PRD.md",
     "README.md",
+    "RECOMMENDATIONS.md",
     "RULES.md",
     "SECURITY.md",
     "TASKS.md",

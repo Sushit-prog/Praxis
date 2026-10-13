@@ -14,9 +14,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
 from praxis.config import FactsSheet
 from praxis.design import PASS_IDS
-from praxis.planning import PACK_PASS_IDS
+from praxis.planning import OPTIONAL_PASS_IDS, PACK_PASS_IDS
 
 # Union of the core design passes and the docs-pack passes; a stored design is
 # expected to carry exactly these keys.
@@ -32,6 +33,7 @@ RULE_R4_LEAVING = "r4-leaving"
 RULE_R4_CAP = "r4-cap"
 RULE_R3 = "r3-dependency"
 RULE_R5 = "r5-metric"
+RULE_R7 = "r7-recommendation-claims"
 RULE_R8 = "r8-prd-sections"
 RULE_R9 = "r9-task-structure"
 RULE_R10 = "r10-stack-fit"
@@ -1044,6 +1046,249 @@ def check_r10(
 
 
 # ---------------------------------------------------------------------------
+# Fit-table rendering (planning embeds this table in the Recommendations
+# prompt; r7 polices that document against the same table and the facts).
+# ---------------------------------------------------------------------------
+
+_KIND_LABELS = {
+    "cuda-only": "CUDA requirement",
+    "remote-host": "remote host",
+    "vram-claim": "VRAM claim",
+    "model-ram": "model RAM",
+    "ram-claim": "RAM claim",
+}
+_R7_MODEL_REQ_RE = re.compile(r"(\d+(?:\.\d+)?)B x (\d+(?:\.\d+)?) B/param")
+_R7_GB_IN_MSG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB")
+
+
+def _fit_requires(kind: str, rest: str, excerpt: str) -> tuple[str, str]:
+    """(verdict, requires) columns for one r10 finding."""
+    if kind == "cuda-only":
+        return "does not fit", "requires CUDA"
+    if kind == "remote-host":
+        return "does not fit", "requires rented host"
+    if kind == "vram-claim":
+        m = _R7_GB_IN_MSG_RE.search(rest)
+        claim = f"{float(m.group(1)):g}" if m else "?"
+        return "does not fit", f"claims {claim} GB VRAM"
+    if kind == "ram-claim":
+        m = _R7_GB_IN_MSG_RE.search(rest)
+        claim = f"{float(m.group(1)):g}" if m else "?"
+        if rest.startswith("states an"):
+            return "bound", f"claims {claim} GB"
+        verdict = "tight" if rest.startswith("tight") else "does not fit"
+        return verdict, f"claims {claim} GB"
+    if kind == "model-ram":
+        m = _R7_MODEL_REQ_RE.search(rest) or _R7_MODEL_REQ_RE.search(excerpt)
+        verdict = "tight" if rest.startswith("tight") else "does not fit"
+        if not m:
+            return verdict, "see claim"
+        params, factor = float(m.group(1)), float(m.group(2))
+        low = excerpt.lower()
+        quant = None
+        for label, _b in _R10_QUANT_BYTES:
+            if label in low:
+                quant = f"{label} ({factor:g} B/param)"
+                break
+        if quant is None and factor == 2.0:
+            quant = f"assumes fp16 ({factor:g} B/param)"
+        elif quant is None:
+            quant = f"{factor:g} B/param"
+        return verdict, f"{params:g}B × {quant}"
+    return "does not fit", "see claim"
+
+
+def _fit_cell(text: str) -> str:
+    clean = text.replace(UNTRUSTED_START, "").replace(UNTRUSTED_END, "")
+    return " ".join(clean.split()).replace("|", "\\|")[:140]
+
+
+def render_fit_table_md(findings: list[Finding]) -> str:
+    """Markdown fit table (Component/Claim/Requires/Verdict/Source).
+
+    Rows collapse to one per (claim, source): a unit that trips several
+    kinds contributes a single row with the kinds combined in the Component
+    cell (e.g. "CUDA requirement; remote host; model RAM"), so the prompt's
+    "one sentence per row" applies per claim.
+    """
+    header = (
+        "| Component | Claim | Requires | Verdict | Source |\n"
+        "| --- | --- | --- | --- | --- |"
+    )
+    order: list[tuple[str, str]] = []
+    grouped: dict[tuple[str, str], tuple[list[str], list[str], list[str]]] = {}
+    for f in findings:
+        if f.rule_id != RULE_R10:
+            continue
+        kind, _, rest = f.message.partition(": ")
+        verdict, requires = _fit_requires(kind, rest, f.excerpt)
+        claim = _fit_cell(f.excerpt)
+        key = (claim, f.pass_id)
+        if key not in grouped:
+            grouped[key] = ([], [], [])
+            order.append(key)
+        components, reqs, verdicts = grouped[key]
+        component = _KIND_LABELS.get(kind, kind)
+        if component not in components:
+            components.append(component)
+        if requires not in reqs:
+            reqs.append(requires)
+        if verdict not in verdicts:
+            verdicts.append(verdict)
+    if not order:
+        return header + "\n(no conflict rows)"
+    rows = [
+        f"| {'; '.join(components)} | {claim} | {'; '.join(reqs)} | "
+        f"{'; '.join(verdicts)} | {source} |"
+        for (claim, source), (components, reqs, verdicts) in (
+            (key, grouped[key]) for key in order
+        )
+    ]
+    return header + "\n" + "\n".join(rows)
+
+
+def count_r10_units(passes: Mapping[str, str], blueprint: str | None = None) -> int:
+    """Statement count the r10 scan would check (for the empty-state line)."""
+    try:
+        total = 0
+        sources = sorted(
+            (pid, text)
+            for pid, text in passes.items()
+            if isinstance(text, str) and text.strip()
+        )
+        if isinstance(blueprint, str) and blueprint.strip():
+            sources.append(("blueprint", blueprint))
+        for _, text in sources:
+            total += len(_r10_units(_strip_fences(_normalize(text))))
+        return total
+    except Exception:  # noqa: BLE001 - a broken helper must stay silent
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# R7 (warning): the Recommendations pass must stay inside table + facts
+# ---------------------------------------------------------------------------
+
+# Bare GPU/CUDA prescriptions (the r10 cue list catches tooling names; this
+# also catches the generic word on its own).
+_R7_GPU_RE = re.compile(r"\bgpu\b|\bcuda\b", re.I)
+_R7_USD_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
+_R7_VENDOR_UNVERIFIED_RE = re.compile(r"vendor figure, unverified", re.I)
+# The pinned empty-state line names the scan scope (RAM, GPU/CUDA,
+# remote-host) to be transparent, not to prescribe anything.
+_R7_SCAN_SCOPE_RE = re.compile(r"\bscan covers\b", re.I)
+# Facts-sheet values allowed in the recommendations text (free storage is
+# deliberately excluded: storage claims are r10's H6 category, not this rule).
+_R7_ALLOWED_FACTS = ("usable_ram_gb", "ram_gb", "monthly_budget_usd")
+
+
+def _r7_allowed_numbers(
+    passes: Mapping[str, str], facts: FactsSheet, blueprint: str | None
+) -> set[float]:
+    allowed: set[float] = set()
+    for attr in _R7_ALLOWED_FACTS:
+        value = getattr(facts, attr, None)
+        if value is not None:
+            try:
+                allowed.add(float(value))
+            except (TypeError, ValueError):
+                pass
+    # The fit table is built from the pack BEFORE the recommendations pass
+    # exists; exclude it here so the rule never grounds its own numbers.
+    core = {k: v for k, v in passes.items() if k != "recommendations"}
+    for finding in check_r10(core, facts, blueprint=blueprint):
+        blob = f"{finding.excerpt} {finding.message}"
+        for match in re.finditer(r"\d+(?:\.\d+)?", blob):
+            allowed.add(float(match.group()))
+    return allowed
+
+
+def check_r7(
+    passes: Mapping[str, str],
+    facts: FactsSheet | None = None,
+    *,
+    stamped: bool = False,
+    blueprint: str | None = None,
+    **_ignored: object,
+) -> list[Finding]:
+    """Recommendations prose must stay inside the fit table and the facts.
+
+    Warning-only: GPU/VRAM and rented-host prescriptions the facts sheet
+    contradicts, plus GB/$ numbers absent from the table and the facts,
+    unless the sentence carries the "vendor figure, unverified" label.
+    Missing or blank pass and a missing facts sheet are silent.
+    """
+    if facts is None:
+        return []
+    text = _pass_text(passes, "recommendations")
+    if not text:
+        return []
+    try:
+        allowed = _r7_allowed_numbers(passes, facts, blueprint)
+        findings: list[Finding] = []
+        for unit, heading in _r10_units(_strip_fences(_normalize(text))):
+            low = unit.lower()
+            if _R10_SIL_HEADING.search(heading) or _R10_SIL_SECTION.search(unit):
+                continue  # non-goal / rejected sections are not prescriptions
+            if _R7_SCAN_SCOPE_RE.search(unit):
+                continue  # the pinned scan-scope disclaimer, not a claim
+            if _R10_NEG_RE.search(low):
+                continue
+            excerpt = _r10_excerpt(unit)
+            if _R7_GPU_RE.search(low) or _R10_VRAM_RE.search(low):
+                findings.append(
+                    Finding(
+                        RULE_R7,
+                        SEVERITY_WARNING,
+                        "recommendations",
+                        excerpt,
+                        "gpu-cue: unit prescribes GPU/VRAM; alternatives must "
+                        "fit the facts sheet",
+                    )
+                )
+                continue
+            if any(cue in low for cue in _R10_VPS_CUES):
+                findings.append(
+                    Finding(
+                        RULE_R7,
+                        SEVERITY_WARNING,
+                        "recommendations",
+                        excerpt,
+                        "host-cue: unit prescribes a rented/remote host; the "
+                        "facts sheet is local-only",
+                    )
+                )
+                continue
+            if _R7_VENDOR_UNVERIFIED_RE.search(unit):
+                continue
+            bad: list[str] = []
+            for match in _R10_GB_RE.finditer(unit):
+                value = float(match.group(1))
+                if value not in allowed:
+                    bad.append(f"{value:g} GB")
+            for match in _R7_USD_RE.finditer(unit):
+                value = float(match.group(1))
+                if value not in allowed:
+                    bad.append(f"${value:g}")
+            if bad:
+                findings.append(
+                    Finding(
+                        RULE_R7,
+                        SEVERITY_WARNING,
+                        "recommendations",
+                        excerpt,
+                        "unverified-number: "
+                        + ", ".join(bad)
+                        + " not in the fit table or facts; label it "
+                        "'vendor figure, unverified' if intentional",
+                    )
+                )
+        return findings
+    except Exception:  # noqa: BLE001 - a broken rule must stay silent, not crash check
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Registry: unknown pass key (warning), missing pass key (info)
 # ---------------------------------------------------------------------------
 
@@ -1051,7 +1296,7 @@ def check_r10(
 def _registry(passes: Mapping[str, str]) -> list[Finding]:
     findings: list[Finding] = []
     for key in passes:
-        if key not in KNOWN_PASS_IDS:
+        if key not in KNOWN_PASS_IDS and key not in OPTIONAL_PASS_IDS:
             findings.append(
                 Finding(
                     RULE_REGISTRY_UNKNOWN,
@@ -1085,6 +1330,7 @@ RULES = (
     check_r4,
     check_r3,
     check_r5,
+    check_r7,
     check_r8,
     check_r9,
     check_r10,

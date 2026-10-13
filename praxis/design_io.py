@@ -17,7 +17,7 @@ from praxis.design import (
     render_tasks_md,
     target_machine_summary,
 )
-from praxis.planning import PACK_PASS_IDS
+from praxis.planning import PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID
 
 DESIGNS_DIR = Path("designs")
 
@@ -170,7 +170,8 @@ def load_passes(design: Design) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-# The six LLM pack documents and their filenames inside docs/.
+# The six LLM pack documents and their filenames inside docs/, plus the
+# optional Recommendations document (written only when its pass is stored).
 _PACK_FILENAMES = {
     "prd": "PRD.md",
     "rules": "RULES.md",
@@ -178,6 +179,7 @@ _PACK_FILENAMES = {
     "security": "SECURITY.md",
     "readme": "README.md",
     "env_example": ".env.example",
+    RECOMMENDATIONS_PASS_ID: "RECOMMENDATIONS.md",
 }
 
 # Core passes the deterministic docs derive from (beyond the pack itself).
@@ -426,6 +428,12 @@ def write_docs_pack(
 
     for pass_id, filename in _PACK_FILENAMES.items():
         if pass_id == "readme":
+            continue
+        if pass_id == RECOMMENDATIONS_PASS_ID:
+            # Optional: written only when the pass is stored; the core pack
+            # (missing_pack check above) never gates on it.
+            if (passes.get(pass_id) or "").strip():
+                (out_dir / filename).write_text(passes[pass_id], encoding="utf-8")
             continue
         (out_dir / filename).write_text(passes[pass_id], encoding="utf-8")
 
