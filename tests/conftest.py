@@ -10,6 +10,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# litellm's import fires a .env side effect (documented in
+# _hermetic_model_env). llm.py now imports it lazily, so preload it here to
+# keep that side effect at session start instead of mid-test.
+import litellm  # noqa: E402, F401
+
 from praxis.config import HardwareProfile  # noqa: E402
 
 

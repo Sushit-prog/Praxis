@@ -15,9 +15,6 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from litellm import completion as _default_completion
-from litellm import completion_cost as _completion_cost
-
 from praxis.db import LLMCache, LLMUsage, get_session
 from praxis.providers import (
     AUTH_SIGNAL,
@@ -32,6 +29,33 @@ from praxis.providers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# litellm is imported on first use (see _resolve_*), so non-LLM commands
+# (praxis --help, praxis check) start without paying for the litellm/openai
+# import chain. The names stay module-level so existing patches keep
+# working: a patched non-None value short-circuits the import entirely.
+_default_completion: Callable[..., Any] | None = None
+_completion_cost: Callable[..., Any] | None = None
+
+
+def _resolve_completion() -> Callable[..., Any]:
+    """Return litellm.completion, importing it only when first needed."""
+    global _default_completion
+    if _default_completion is None:
+        from litellm import completion as _litellm_completion
+
+        _default_completion = _litellm_completion
+    return _default_completion
+
+
+def _resolve_completion_cost() -> Callable[..., Any]:
+    """Return litellm.completion_cost, importing it only when first needed."""
+    global _completion_cost
+    if _completion_cost is None:
+        from litellm import completion_cost as _litellm_completion_cost
+
+        _completion_cost = _litellm_completion_cost
+    return _completion_cost
 
 DEFAULT_MODEL = "groq/openai/gpt-oss-20b"
 
@@ -128,7 +152,7 @@ class LLMClient:
         completion: Callable[..., Any] | None = None,
         model: str | None = None,
     ) -> None:
-        self._completion = completion or _default_completion
+        self._completion = completion or _resolve_completion()
         self._model = _resolve_model(model)
 
     def call(
@@ -558,7 +582,7 @@ def _response_cost(response: Any) -> float | None:
         except (TypeError, ValueError):
             pass
     try:
-        cost = _completion_cost(completion_response=response)
+        cost = _resolve_completion_cost()(completion_response=response)
         return float(cost) if cost is not None else None
     except Exception:  # noqa: BLE001 - unknown model or non-litellm response
         return None
