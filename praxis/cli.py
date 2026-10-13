@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from praxis.design import PASS_IDS
-from praxis.planning import PACK_PASS_IDS
+from praxis.planning import PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -191,6 +191,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--focus", help="Focus note steering the design (skips the interactive focus prompt)."
     )
 
+    idea_parser = sub.add_parser(
+        "idea",
+        help=(
+            "Validate a plain-text brief (MVP + Out-of-scope bullets) and "
+            "store it as a candidate for `praxis design`. Idempotent on "
+            "content: the same brief reuses the same candidate."
+        ),
+    )
+    idea_parser.add_argument("brief", help="Path to the brief markdown file.")
+
     design_parser = sub.add_parser(
         "design", help="Generate a multi-pass design document for a candidate."
     )
@@ -281,13 +291,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the pack critic (default).",
     )
     plan_parser.set_defaults(run_critic=False)
+    plan_parser.add_argument(
+        "--recommend",
+        action="store_true",
+        help=(
+            "Generate the optional Recommendations pass (hardware-fit "
+            "summary) when it is not already stored; stamped v0.2 packs "
+            "generate it automatically, legacy packs need this flag."
+        ),
+    )
 
     handoff_parser = sub.add_parser(
         "handoff",
         help=(
             "Export a finished design's docs pack into a fresh project "
-            "directory for a coding agent (checks, copy, git init, "
-            "HANDOFF_PROMPT.md)."
+            "directory for a coding agent (checks, copy, agent files, "
+            "git init, HANDOFF_PROMPT.md)."
         ),
     )
     handoff_parser.add_argument(
@@ -308,6 +327,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-check",
         action="store_true",
         help="Export even if the stored design has consistency errors.",
+    )
+    handoff_parser.add_argument(
+        "--cursor",
+        action="store_true",
+        help=(
+            "Also write .cursor/rules/praxis.mdc (same body as AGENTS.md) "
+            "for Cursor users."
+        ),
     )
 
     return parser
@@ -686,15 +713,16 @@ def _discard_partial_pack(design) -> None:
     nothing to restart, and a complete pack re-renders the docs files with
     zero LLM calls.
     """
-    from praxis.db import clear_design_pass
+    from praxis.db import clear_design_meta, clear_design_pass
     from praxis.design_io import load_passes as _load_passes
 
     passes = _load_passes(design)
     stored = [p for p in PACK_PASS_IDS if (passes.get(p) or "").strip()]
     if not stored or len(stored) == len(PACK_PASS_IDS):
         return
-    for pass_id in PACK_PASS_IDS:
+    for pass_id in (*PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID):
         clear_design_pass(design.id, pass_id)
+    clear_design_meta(design.id)
 
 
 def _design_and_write(
@@ -828,6 +856,22 @@ def _cmd_discover(args) -> int:
     return _design_and_write(row.candidate, profile, focus=focus, facts=facts)
 
 
+def _cmd_idea(args) -> int:
+    from praxis.idea import BriefError, intake_brief, read_brief
+
+    try:
+        text = read_brief(args.brief)
+        candidate, created = intake_brief(text)
+    except BriefError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "created" if created else "reused existing candidate for"
+    print(f"{verb} idea candidate {candidate.id}: {candidate.title}")
+    print(f"  key: {candidate.url}")
+    print(f"next: praxis design {candidate.id}")
+    return 0
+
+
 def _print_design_passes(candidate_id: int) -> int:
     """Print the completed passes of a candidate's newest design (--show)."""
     from praxis.db import latest_design
@@ -926,10 +970,10 @@ def _cmd_design(args) -> int:
 
 def _cmd_plan(args) -> int:
     from praxis.config import HardwareProfile, load_facts
-    from praxis.db import latest_design
+    from praxis.db import get_design_meta, latest_design
     from praxis.design import PASS_IDS
     from praxis.design_io import load_passes as _load_passes
-    from praxis.design_io import write_docs_pack
+    from praxis.design_io import parse_generated_at, write_docs_pack
     from praxis.discover import get_candidate
     from praxis.planning import generate_doc_pack
 
@@ -981,6 +1025,7 @@ def _cmd_plan(args) -> int:
         facts=facts,
         run_critic=args.run_critic,
         rerun_passes=rerun_passes,
+        recommend=args.recommend,
     )
     if result.status != "complete":
         completed = ", ".join(result.completed_passes) or "none"
@@ -995,7 +1040,14 @@ def _cmd_plan(args) -> int:
 
     design = latest_design(args.candidate_id)
     passes = _load_passes(design)
-    docs_dir = write_docs_pack(candidate, profile, passes=passes, facts=facts)
+    meta = get_design_meta(design.id) if design.id is not None else {}
+    docs_dir = write_docs_pack(
+        candidate,
+        profile,
+        passes=passes,
+        facts=facts,
+        generated_at=parse_generated_at(meta.get("generated_at")),
+    )
     print(f"plan complete: candidate {result.candidate_id}")
     print(f"  {docs_dir}")
     print(
@@ -1046,7 +1098,8 @@ def _cmd_check(args) -> int:
         SEVERITY_WARNING,
         run_checks,
     )
-    from praxis.db import latest_design
+    from praxis.db import get_design_meta, latest_blueprint, latest_design
+    from praxis.design import PROVENANCE_VERSION
     from praxis.design_io import load_passes
 
     design = latest_design(args.candidate_id)
@@ -1054,7 +1107,15 @@ def _cmd_check(args) -> int:
         print(f"error: candidate {args.candidate_id} has no design", file=sys.stderr)
         return 1
 
-    findings = run_checks(load_passes(design), load_facts())
+    meta = get_design_meta(design.id) if design.id is not None else {}
+    blueprint = latest_blueprint(args.candidate_id)
+    facts = load_facts()
+    findings = run_checks(
+        load_passes(design),
+        facts,
+        stamped=meta.get("pack_version") == PROVENANCE_VERSION,
+        blueprint=blueprint.blueprint_md if blueprint is not None else None,
+    )
     counts: dict[str, int] = {}
     for finding in findings:
         counts[finding.severity] = counts.get(finding.severity, 0) + 1
@@ -1079,6 +1140,13 @@ def _cmd_check(args) -> int:
         f"{counts.get(SEVERITY_INFO, 0)} info",
         file=sys.stderr,
     )
+    if facts is not None:
+        print(
+            "checked against: usable RAM "
+            f"{facts.usable_ram_gb} GB, cpu_only={facts.cpu_only}, "
+            f"local_only={facts.local_only}",
+            file=sys.stderr,
+        )
     return 1 if counts.get(SEVERITY_ERROR) else 0
 
 
@@ -1090,6 +1158,7 @@ def _cmd_handoff(args) -> int:
         args.target,
         force=args.force,
         skip_check=args.skip_check,
+        cursor=args.cursor,
     )
 
 
@@ -1156,6 +1225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             logging.error("praxis discover failed: %s", exc)
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    if args.command == "idea":
+        return _cmd_idea(args)
     if args.command == "design":
         try:
             return _cmd_design(args)

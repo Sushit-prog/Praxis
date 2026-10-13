@@ -214,6 +214,20 @@ def test_load_env_without_file_is_noop(tmp_path, monkeypatch):
     assert _load_env() is None
 
 
+def test_load_env_hides_project_dotenv_in_tests(monkeypatch):
+    """From the repo root, the project .env must not load (key-independence).
+
+    The session's find_dotenv guard hides it; asserts only "no load", never
+    any value from the file.
+    """
+    from pathlib import Path
+
+    from praxis.cli import _load_env
+
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    assert _load_env() is None
+
+
 def test_cli_reads_config_after_dotenv(tmp_path, monkeypatch, capsys):
     """PRAXIS_DB_URL set only in .env is honored by the CLI (env loads before config)."""
     import os

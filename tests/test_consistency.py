@@ -5,9 +5,12 @@ string, and rules are exercised individually plus via ``run_checks``.
 """
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
+from praxis.agents.analyst import UNTRUSTED_END, UNTRUSTED_START
+from praxis.config import FactsSheet
 from praxis.consistency import (
     KNOWN_PASS_IDS,
     RULE_R1,
@@ -16,6 +19,11 @@ from praxis.consistency import (
     RULE_R4_CAP,
     RULE_R4_LEAVING,
     RULE_R5,
+    RULE_R7,
+    RULE_R8,
+    RULE_R9,
+    RULE_R10,
+    RULE_R13,
     RULE_REGISTRY_MISSING,
     RULE_REGISTRY_UNKNOWN,
     SEVERITY_ERROR,
@@ -27,6 +35,13 @@ from praxis.consistency import (
     check_r3,
     check_r4,
     check_r5,
+    check_r7,
+    check_r8,
+    check_r9,
+    check_r10,
+    check_r13,
+    count_r10_units,
+    render_fit_table_md,
     run_checks,
 )
 
@@ -378,6 +393,716 @@ def test_new_rules_warnings_only_exit_semantics():
     r5 = _rule(findings, RULE_R5)
     assert len(r3) == 1 and len(r5) == 1
     assert not [f for f in findings if f.severity == SEVERITY_ERROR]
+
+
+# ---------------------------------------------------------------------------
+# R8 (warning/info): PRD section presence — one finding per rule
+# ---------------------------------------------------------------------------
+
+_R8_BAD_PRD = "## Users\nOnly students use it.\n"
+
+_R8_LEGACY_SYNONYMS_PRD = """# The Problem
+x
+## Target Users
+x
+### Goals
+x
+## Core Features
+x
+### MVP
+x
+## Non-Goals (explicitly out of scope for v1)
+x
+### Success Metrics (v1)
+x
+"""
+
+
+def test_r8_missing_sections_one_finding_listing_all():
+    findings = check_r8({"prd": _R8_BAD_PRD}, stamped=True)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == RULE_R8 and f.pass_id == "prd"
+    assert f.severity == SEVERITY_WARNING
+    assert "missing" in f.message
+    assert "Problem" in f.message
+    assert "MVP" in f.message
+    assert "Success criteria" in f.message
+    assert "Users" not in f.message.split("missing", 1)[1].split("(required")[0]
+
+
+def test_r8_all_sections_present_clean():
+    assert check_r8({"prd": _R8_LEGACY_SYNONYMS_PRD}, stamped=True) == []
+
+
+def test_r8_plural_headings_accepted():
+    prd = (
+        "# Problems\nx\n## Users\nx\n### Goals\nx\n## Features\nx\n"
+        "### MVPs\nx\n## Out of scopes\nx\n### Success criteria\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_any_heading_level_accepted():
+    prd = (
+        "###### Problem\nx\n#### Users\nx\n##### Goal\nx\n#### Features\nx\n"
+        "###### MVP\nx\n#### Out of scope\nx\n##### Success criteria\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_case_insensitive():
+    prd = (
+        "# problem\nx\n## USERS\nx\n### Goal\nx\n## features\nx\n"
+        "### Mvp\nx\n## OUT OF SCOPE\nx\n### success CRITERIA\nx\n"
+    )
+    assert check_r8({"prd": prd}, stamped=True) == []
+
+
+def test_r8_design5_style_headings_only_mvp_missing():
+    prd = """## Product Requirements
+### Problem & Goal
+x
+### Users and Use Cases
+x
+### Functional Requirements
+x
+### Success Metrics (v1)
+x
+### Non-Goals (explicitly out of scope for v1)
+x
+### Open Questions
+x
+"""
+    findings = check_r8({"prd": prd})
+    assert len(findings) == 1
+    assert findings[0].severity == SEVERITY_INFO
+    assert "missing MVP" in findings[0].message
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"prd": None},  # type: ignore[dict-item]
+        {"prd": object()},  # type: ignore[dict-item]
+        {"prd": "   \n  "},
+    ],
+)
+def test_r8_silent_on_missing_or_unparseable(passes):
+    assert check_r8(passes) == []
+
+
+def test_r8_severity_matrix_stamped_vs_legacy():
+    passes = {"prd": _R8_BAD_PRD}
+    legacy = check_r8(passes)
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r8(passes, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert "legacy pack" not in stamped[0].message
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+# ---------------------------------------------------------------------------
+# R9 (warning/info): TASK-NNN acceptance window in the plan pass
+# ---------------------------------------------------------------------------
+
+
+def test_r9_acceptance_next_line_clean():
+    plan = (
+        "- [ ] **TASK-001** Install the dependencies.\n"
+        "  *Acceptance:* `pip list` shows every package.\n"
+    )
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["*Acceptance:* done", "**Acceptance**", "Acceptance: done", "Accepts: done"],
+)
+def test_r9_acceptance_marker_variants(marker):
+    plan = f"- [ ] TASK-001 Do the thing.\n  {marker}\n"
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+def test_r9_acceptance_at_window_edge_ok():
+    plan = (
+        "- [ ] TASK-001 Do the thing.\n"
+        "line2\n"
+        "line3\n"
+        "  Acceptance: yes\n"
+    )
+    assert check_r9({"plan": plan}, stamped=True) == []
+
+
+def test_r9_acceptance_outside_window_flagged():
+    plan = (
+        "- [ ] TASK-001 Do the thing.\n"
+        "line2\n"
+        "line3\n"
+        "line4\n"
+        "  Acceptance: yes\n"
+    )
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert "TASK-001" in findings[0].message
+
+
+def test_r9_task_without_acceptance_one_finding_lists_all():
+    plan = (
+        "- [ ] TASK-001 First.\n  Acceptance: ok\n"
+        "- [ ] TASK-002 Second, no acceptance here.\n"
+        "- [ ] TASK-003 Third, also missing.\n"
+    )
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert "TASK-002" in findings[0].message
+    assert "TASK-003" in findings[0].message
+    assert "TASK-001" not in findings[0].message
+
+
+def test_r9_plain_checkbox_list_silent_on_legacy():
+    plan = "- [ ] Install dependencies\n- [ ] Write the client\n"
+    assert check_r9({"plan": plan}) == []
+
+
+def test_r9_plain_checkbox_list_warns_on_stamped():
+    plan = "- [ ] Install dependencies\n- [ ] Write the client\n"
+    findings = check_r9({"plan": plan}, stamped=True)
+    assert len(findings) == 1
+    assert findings[0].severity == SEVERITY_WARNING
+    assert "TASK-NNN" in findings[0].message
+
+
+def test_r9_severity_matrix_stamped_vs_legacy():
+    plan = "- [ ] TASK-001 No acceptance.\n"
+    legacy = check_r9({"plan": plan})
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r9({"plan": plan}, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"plan": None},  # type: ignore[dict-item]
+        {"plan": object()},  # type: ignore[dict-item]
+        {"plan": "   "},
+    ],
+)
+def test_r9_silent_on_missing_or_unparseable(passes):
+    assert check_r9(passes) == []
+
+
+def test_r9_silent_when_tasks_are_fenced():
+    plan = "```python\n# see TASK-001 in the docs\n```\n- [ ] free-form work\n"
+    assert check_r9({"plan": plan}) == []
+
+
+# ---------------------------------------------------------------------------
+# R13 (warning/info): RULES category headings — extras never flagged
+# ---------------------------------------------------------------------------
+
+_R13_BAD_RULES = "## General\nBe careful.\n## Security\nScan secrets.\n"
+
+_R13_GUIDE_STYLE_RULES = """# Engineering Rules
+## General
+x
+## Before Coding
+x
+## UI
+x
+## Security
+x
+## Testing
+x
+## Git
+x
+"""
+
+
+def test_r13_missing_categories_one_finding_listing_all():
+    findings = check_r13({"rules": _R13_BAD_RULES}, stamped=True)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == RULE_R13 and f.pass_id == "rules"
+    assert f.severity == SEVERITY_WARNING
+    assert "Before coding" in f.message
+    assert "Testing" in f.message
+    assert "Git" in f.message
+    assert "General" not in f.message.split("missing", 1)[1].split("(required")[0]
+
+
+def test_r13_guide_style_with_ui_extra_clean():
+    assert check_r13({"rules": _R13_GUIDE_STYLE_RULES}, stamped=True) == []
+
+
+def test_r13_before_you_code_synonym():
+    rules = (
+        "## General\nx\n## Before you code\nx\n## Security\nx\n"
+        "## Testing\nx\n## Git\nx\n"
+    )
+    assert check_r13({"rules": rules}, stamped=True) == []
+
+
+def test_r13_severity_matrix_stamped_vs_legacy():
+    passes = {"rules": _R13_BAD_RULES}
+    legacy = check_r13(passes)
+    assert len(legacy) == 1 and legacy[0].severity == SEVERITY_INFO
+    assert "legacy pack" in legacy[0].message
+    stamped = check_r13(passes, stamped=True)
+    assert len(stamped) == 1 and stamped[0].severity == SEVERITY_WARNING
+    assert all(f.severity != SEVERITY_ERROR for f in legacy + stamped)
+
+
+@pytest.mark.parametrize(
+    "passes",
+    [
+        {},
+        {"rules": None},  # type: ignore[dict-item]
+        {"rules": object()},  # type: ignore[dict-item]
+        {"rules": "prose without any headings"},
+    ],
+)
+def test_r13_missing_pass_silent_but_prose_reports_all(passes):
+    if "rules" not in passes or not isinstance(passes["rules"], str):
+        assert check_r13(passes) == []
+    else:
+        findings = check_r13(passes)
+        assert len(findings) == 1  # parseable prose: every category missing
+
+
+# ---------------------------------------------------------------------------
+# Guide fixtures (human-written, read-only): tests/fixtures/guide/
+# ---------------------------------------------------------------------------
+
+_GUIDE_DIR = Path(__file__).parent / "fixtures" / "guide"
+
+
+def _guide(name: str) -> str:
+    """A guide fixture's text with LF endings (identical for LF/CRLF checkouts)."""
+    return (_GUIDE_DIR / name).read_bytes().decode("utf-8").replace("\r\n", "\n")
+
+
+def test_guide_prd_clean_stamped_and_unstamped():
+    text = _guide("prd.md")
+    assert check_r8({"prd": text}) == []
+    assert check_r8({"prd": text}, stamped=True) == []
+
+
+def test_guide_rules_clean_stamped_and_unstamped():
+    text = _guide("rules.md")
+    assert check_r13({"rules": text}) == []
+    assert check_r13({"rules": text}, stamped=True) == []
+
+
+def test_guide_tasks_silent_unstamped_warns_stamped():
+    text = _guide("tasks.md")
+    assert check_r9({"plan": text}) == []
+    findings = check_r9({"plan": text}, stamped=True)
+    assert len(findings) == 1
+    assert findings[0].rule_id == RULE_R9
+    assert findings[0].severity == SEVERITY_WARNING
+    assert "TASK-NNN" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# R10 (warning): stack fit vs the facts sheet (+ blueprint source)
+# ---------------------------------------------------------------------------
+
+_FACTS = FactsSheet()  # usable_ram_gb=4, ram_gb=8, cpu_only=True, local_only=True
+
+_R10_NEG_FIXTURES = [
+    "Avoid CUDA-only libraries entirely - the machine is CPU-only.",
+    "The machine is not CUDA-capable; avoid bitsandbytes.",
+    "Instead of a rented VPS, run everything locally.",
+    "Rejected: a rented VPS with 8 GB RAM was ruled out.",
+    "No GPU required for this workload; CPU inference only.",
+    "Use httpx instead of requests for all API calls.",
+    "The model does not fit in the available headroom.",
+    "Neo4j is avoided; use SQLite instead.",
+    "No docker containers are needed.",
+    "### Non-Goals (explicitly out of scope for v1)\n"
+    "- GPU acceleration or CUDA-dependent libraries.",
+    "### Non-Goals (explicitly out of scope for v1)\n"
+    "- Use of Neo4j or other graph databases.",
+    "The generator and verifier both call the same Groq gpt-oss-20b model via the API.",
+    "LLM_MODEL_NAME=gpt-oss-20b",
+    "Respecting the 8 GB RAM, CPU-only, and $15/month budget constraints.",
+    "Peak RSS must stay <= 4 GB to respect the headroom.",
+    "Disk-space usage must leave >= 5 GB free storage.",
+    "All tests run on a CPU-only machine with 8 GB usable RAM.",
+]
+
+_R10_POS_FIXTURES = [
+    (
+        "Loads a 2.7B Llama-2 model via bitsandbytes on a rented VPS.",
+        {"cuda-only", "remote-host"},
+    ),
+    (
+        "| 0. Setup | Environment provisioning | VPS with 8 GB RAM, Ubuntu 22.04, "
+        "bitsandbytes | Verify CPU inference performance |",
+        {"cuda-only", "remote-host"},
+    ),
+    ("The largest memory footprint comes from the quantized LLM (~4 GB).", {"ram-claim"}),
+    (
+        "Combined with embeddings and the database, total usage stays below 8 GB.",
+        {"ram-claim"},
+    ),
+    (
+        # negation scope is one unit: "false" silences its own sentence only
+        "The verifier marks corrupt records as false. "
+        "It then loads the model via bitsandbytes.",
+        {"cuda-only"},
+    ),
+]
+
+
+@pytest.mark.parametrize("text", _R10_NEG_FIXTURES)
+def test_r10_negation_fixtures_silent(text):
+    assert check_r10({"plan": text}, _FACTS) == []
+
+
+@pytest.mark.parametrize("text,want", _R10_POS_FIXTURES)
+def test_r10_positive_fixtures_fire(text, want):
+    findings = check_r10({"plan": text}, _FACTS)
+    assert findings, f"expected findings for {text!r}"
+    assert {f.rule_id for f in findings} == {RULE_R10}
+    assert {f.severity for f in findings} == {SEVERITY_WARNING}
+    kinds = {f.message.split(":", 1)[0] for f in findings}
+    assert want <= kinds
+
+
+# The five known firing rows of the stored candidate-5 blueprint (regression).
+_R10_BP5_FIXTURE = (
+    "## Proposed Architecture\n"
+    "> **Buildable on Target Hardware** - The largest memory footprint comes "
+    "from the quantized LLM (~4 GB). Combined with embeddings and the database, "
+    "total usage stays below 8 GB. All operations run on CPU; no GPU is "
+    "required. The monthly $15 budget covers a modest VPS (e.g., DigitalOcean "
+    "Droplet 8GB RAM) and storage costs.\n"
+    "| **LLM Inference Engine** | Generates task outputs and verifier "
+    "responses | 1.3 B or 2.7 B Llama-2 (or similar) quantized to 8-bit, "
+    "loaded locally via bitsandbytes. |\n"
+    "| **0. Setup** | Environment provisioning | VPS with 8 GB RAM, Ubuntu "
+    "22.04, Python 3.10, `transformers`, `bitsandbytes`, `hnswlib`, `LMDB` | "
+    "Verify CPU inference performance |\n"
+)
+
+
+def test_r10_blueprint5_regression_five_known_rows():
+    findings = check_r10({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    assert len(findings) == 5
+    assert {f.pass_id for f in findings} == {"blueprint"}
+    assert {f.severity for f in findings} == {SEVERITY_WARNING}
+    kinds = [f.message.split(":", 1)[0] for f in findings]
+    assert sorted(kinds) == ["cuda-only", "cuda-only", "ram-claim", "remote-host", "remote-host"]
+    # the ~4 GB restatement and both 8 GB RAM restatements stay silent: the
+    # single ram-claim is the upper-bound sentence, reworded as a bound
+    ram = [f for f in findings if f.message.startswith("ram-claim")]
+    assert len(ram) == 1
+    assert "states an 8 GB bound; usable headroom is 4 GB" in ram[0].message
+    assert "claims" not in ram[0].message
+
+
+def test_r10_vram_dedupe_no_double_ram_claim():
+    text = "Inference requires over 40GB of VRAM in fp16 and a 3B-parameter UNet."
+    kinds = {
+        f.message.split(":", 1)[0] for f in check_r10({"plan": text}, _FACTS)
+    }
+    assert "vram-claim" in kinds
+    assert "ram-claim" not in kinds
+
+
+def test_r10_gpu_host_silent_for_cuda_and_vram():
+    facts = FactsSheet(cpu_only=False, gpu=True)
+    text = "Runs bitsandbytes kernels with 40 GB VRAM on the host."
+    assert check_r10({"plan": text}, facts) == []
+
+
+def test_r10_non_local_host_silent_for_remote():
+    facts = FactsSheet(local_only=False)
+    assert check_r10({"plan": "Runs on a rented VPS."}, facts) == []
+
+
+def test_r10_facts_none_silent():
+    assert check_r10({"plan": _R10_POS_FIXTURES[0][0]}, None) == []
+
+
+def test_r10_design5_passes_zero_findings():
+    import json
+    import sqlite3
+
+    db_path = Path(__file__).parent.parent / "praxis.db"
+    if not db_path.is_file():
+        pytest.skip("local praxis.db not present")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT passes_json FROM designs WHERE candidate_id=5 "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        pytest.skip("candidate 5 has no stored design")
+    passes = {
+        k: v for k, v in json.loads(row[0]).items() if not k.startswith("_")
+    }
+    assert check_r10(passes, _FACTS) == []
+
+
+def test_r10_guide_fixtures_zero_findings():
+    guide_pass = {
+        "prd.md": "prd",
+        "rules.md": "rules",
+        "tasks.md": "plan",
+        "memory.md": "memory",
+    }
+    for name, pid in guide_pass.items():
+        text = _guide(name)
+        assert check_r10({pid: text}, _FACTS) == [], name
+
+
+def test_r10_deterministic():
+    passes = {"plan": _R10_POS_FIXTURES[0][0], "prd": _R10_POS_FIXTURES[2][0]}
+    assert check_r10(passes, _FACTS) == check_r10(passes, _FACTS)
+
+
+def test_run_checks_blueprints_scanned_under_blueprint_label():
+    findings = run_checks({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    r10 = [f for f in findings if f.rule_id == RULE_R10]
+    assert r10 and {f.pass_id for f in r10} == {"blueprint"}
+
+
+# ---------------------------------------------------------------------------
+# R7 (warning): the Recommendations pass vs the fit table and the facts
+# ---------------------------------------------------------------------------
+
+
+def _r7(text, facts=_FACTS, blueprint=None):
+    return check_r7({"recommendations": text}, facts, blueprint=blueprint)
+
+
+def test_r7_groq_api_silent():
+    assert _r7("Use the Groq API for the generator and verifier calls.") == []
+
+
+def test_r7_rent_vps_fires():
+    findings = _r7("Rent a VPS in the cloud for the nightly eval.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].severity == SEVERITY_WARNING
+    assert findings[0].message.startswith("host-cue:")
+
+
+def test_r7_use_gpu_fires():
+    findings = _r7("Use a GPU for the embedding pass.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("gpu-cue:")
+
+
+def test_r7_avoid_bitsandbytes_silent():
+    assert _r7("Avoid bitsandbytes; run CPU-only.") == []
+
+
+def test_r7_facts_none_silent():
+    assert _r7("Use a GPU for training.", facts=None) == []
+
+
+def test_r7_missing_or_blank_pass_silent():
+    assert check_r7({"plan": "Use a GPU."}, _FACTS) == []
+    assert check_r7({"recommendations": "   "}, _FACTS) == []
+
+
+def test_r7_unlabeled_number_fires():
+    findings = _r7("The monthly API spend is $40.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("unverified-number:")
+    assert "$40" in findings[0].message
+
+
+def test_r7_gb_number_not_in_table_fires():
+    findings = _r7("A vector index needs 12 GB of memory.")
+    assert [f.rule_id for f in findings] == [RULE_R7]
+    assert findings[0].message.startswith("unverified-number:")
+    assert "12 GB" in findings[0].message
+
+
+def test_r7_vendor_figure_label_silent():
+    text = "The provider charges $40 per month (vendor figure, unverified)."
+    assert _r7(text) == []
+
+
+def test_r7_table_number_silent():
+    # "6 GB" appears in the plan pass's r10 finding, so the recommendations
+    # sentence restating it is grounded.
+    passes = {
+        "plan": "The largest memory footprint comes from the quantized LLM (6 GB).",
+        "recommendations": (
+            "Local loading needs 6 GB; stay under the usable headroom."
+        ),
+    }
+    assert check_r7(passes, _FACTS) == []
+
+
+def test_r7_facts_number_silent():
+    assert _r7("Stay within the $15 monthly budget.") == []
+    assert _r7("The machine has 8 GB of RAM in total.") == []
+
+
+def test_r7_non_goal_heading_silent():
+    text = "## Non-Goals\n\nUse a GPU for training."
+    assert _r7(text) == []
+
+
+def test_r7_severity_warning_never_error():
+    findings = _r7("Use a GPU.")
+    assert findings and {f.severity for f in findings} == {SEVERITY_WARNING}
+
+
+def test_run_checks_includes_r7_with_blueprint_none():
+    findings = run_checks({"recommendations": "Use a GPU."}, _FACTS)
+    r7 = [f for f in findings if f.rule_id == RULE_R7]
+    assert r7 and {f.severity for f in r7} == {SEVERITY_WARNING}
+    assert not [f for f in findings if f.severity == SEVERITY_ERROR]
+
+
+# The conflict-path Recommendations fixture: grounded (plan carries the
+# 6 GB figure), negation-cued where negative, and free of fits-the-machine
+# or scan-scope cues, so the rendered document is r7-clean either way.
+_REC_CONFLICT_FIXTURE = (
+    "# Recommendations\n\n"
+    "## Fit summary\n"
+    "Local loading of a 3B model needs 6 GB against 4 GB usable; two plan "
+    "rows also prescribe tooling the CPU-only host cannot run.\n\n"
+    "## Risks\n"
+    "- The 3B local load will thrash or fail at 4 GB usable.\n"
+    "- The bitsandbytes rows assume an accelerator this host does not "
+    "have.\n\n"
+    "## Substitutions\n"
+    "- 3B local load: no substitution found.\n"
+    "- Accelerator rows: swap the quantized weights for on-CPU GGUF "
+    "loading through llama.cpp.\n\n"
+    "## Cut or defer\n"
+    "Leave hosted experiments out of v1; the MVP targets local CPU "
+    "verification only, and external experiments belong after the core "
+    "loop ships.\n\n"
+    "## Build order\n"
+    "Stand up the thin client and schema first, then the verifier, then "
+    "retrieval, and only then governance - each phase builds on the "
+    "previous one's tests.\n"
+)
+
+
+def test_r7_conflict_fixture_render_clean():
+    passes = {
+        "plan": "The largest memory footprint comes from the quantized LLM (6 GB).",
+        "recommendations": _REC_CONFLICT_FIXTURE,
+    }
+    assert check_r7(passes, _FACTS) == []
+
+
+def test_r7_zero_conflict_fixture_render_clean():
+    from tests.test_planning import PACK_CONTENT
+
+    assert PACK_CONTENT["recommendations"].startswith("# Recommendations")
+    assert (
+        check_r7({"recommendations": PACK_CONTENT["recommendations"]}, _FACTS)
+        == []
+    )
+
+
+def test_registry_optional_recommendations():
+    findings = run_checks({"recommendations": "ok"})
+    assert _rule(findings, RULE_REGISTRY_UNKNOWN) == []
+    missing = _rule(findings, RULE_REGISTRY_MISSING)
+    assert "recommendations" not in {f.pass_id for f in missing}
+
+
+# ---------------------------------------------------------------------------
+# Fit-table rendering and the r10 unit counter (Recommendations inputs)
+# ---------------------------------------------------------------------------
+
+
+def test_fit_table_zero_rows():
+    table = render_fit_table_md([])
+    assert table.startswith("| Component | Claim | Requires | Verdict | Source |")
+    assert "(no conflict rows)" in table
+
+
+def test_fit_table_bp5_rows_collapse_per_claim():
+    findings = check_r10({}, _FACTS, blueprint=_R10_BP5_FIXTURE)
+    table = render_fit_table_md(findings)
+    lines = table.splitlines()
+    # five findings collapse to four rows: the "0. Setup" table row trips
+    # cuda-only and remote-host on the same claim
+    assert len(lines) == 6  # header + separator + 4 rows
+    assert "CUDA requirement; remote host" in table
+    assert table.count("requires CUDA") == 2
+    assert table.count("requires rented host") == 2
+    assert "bound" in table and "claims 8 GB" in table
+    assert "blueprint" in table
+
+
+def test_fit_table_model_ram_requires_quant():
+    text = "Loads a 3B Llama via bitsandbytes on this machine."
+    findings = check_r10({"plan": text}, _FACTS)
+    table = render_fit_table_md(findings)
+    # one claim, one row: cuda-only and model RAM combine in the Component cell
+    assert "CUDA requirement; model RAM" in table
+    assert "3B × assumes fp16 (2 B/param)" in table
+    assert "does not fit" in table
+
+    stated = "Loads a 3B Llama via 8-bit bitsandbytes quantization."
+    table = render_fit_table_md(check_r10({"plan": stated}, _FACTS))
+    assert "3B × 8-bit (1 B/param)" in table
+    assert "CUDA requirement; model RAM" in table
+
+
+def test_fit_table_sanitizes_untrusted_delimiters():
+    text = f"Uses bitsandbytes {UNTRUSTED_START} injected {UNTRUSTED_END} tooling."
+    table = render_fit_table_md(check_r10({"plan": text}, _FACTS))
+    assert UNTRUSTED_START not in table
+    assert UNTRUSTED_END not in table
+    assert "injected" in table
+
+
+def test_fit_table_escapes_pipes_in_claim():
+    text = "Loads a 3B Llama | the biggest one | via bitsandbytes locally."
+    table = render_fit_table_md(check_r10({"plan": text}, _FACTS))
+    assert "\\|" in table
+    assert "Uses bitsandbytes" not in table
+
+
+def test_count_r10_units_counts_statements():
+    passes = {
+        "plan": "One sentence. Two sentences!\n| row | cell |\n",
+        "prd": "Only one.\n",
+    }
+    # two sentences + one table row + one prd sentence
+    assert count_r10_units(passes) == 4
+    assert count_r10_units(passes, blueprint=_R10_BP5_FIXTURE) > 4
+    assert count_r10_units({}) == 0
+
+
+# ---------------------------------------------------------------------------
+# run_checks stamped wiring for the content rules
+# ---------------------------------------------------------------------------
+
+
+def test_run_checks_stamped_kwarg_flows_to_content_rules():
+    passes = {"prd": _R8_BAD_PRD, "rules": _R13_BAD_RULES, "plan": "no ids here"}
+    legacy = run_checks(passes)
+    content = [f for f in legacy if f.rule_id in (RULE_R8, RULE_R9, RULE_R13)]
+    assert {f.severity for f in content} == {SEVERITY_INFO}
+    stamped = run_checks(passes, stamped=True)
+    content = [f for f in stamped if f.rule_id in (RULE_R8, RULE_R9, RULE_R13)]
+    assert {f.severity for f in content} == {SEVERITY_WARNING}
+    assert not [f for f in stamped if f.severity == SEVERITY_ERROR]
 
 
 # ---------------------------------------------------------------------------

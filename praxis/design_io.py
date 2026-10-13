@@ -17,7 +17,7 @@ from praxis.design import (
     render_tasks_md,
     target_machine_summary,
 )
-from praxis.planning import PACK_PASS_IDS
+from praxis.planning import PACK_PASS_IDS, RECOMMENDATIONS_PASS_ID
 
 DESIGNS_DIR = Path("designs")
 
@@ -149,12 +149,18 @@ def record_pick(candidate_id: int, technique: str, focus: str | None) -> None:
 
 
 def load_passes(design: Design) -> dict[str, str]:
-    """Pass outputs of a stored design (json in passes_json)."""
+    """Pass outputs of a stored design (json in passes_json).
+
+    ``_``-prefixed keys (e.g. ``_meta`` provenance) are metadata, never
+    pass outputs, and never appear in the returned dict.
+    """
     import json
 
     try:
         data = json.loads(design.passes_json or "{}")
-        return {k: str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: str(v) for k, v in data.items() if not k.startswith("_")}
     except json.JSONDecodeError:
         return {}
 
@@ -164,7 +170,8 @@ def load_passes(design: Design) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-# The six LLM pack documents and their filenames inside docs/.
+# The six LLM pack documents and their filenames inside docs/, plus the
+# optional Recommendations document (written only when its pass is stored).
 _PACK_FILENAMES = {
     "prd": "PRD.md",
     "rules": "RULES.md",
@@ -172,18 +179,39 @@ _PACK_FILENAMES = {
     "security": "SECURITY.md",
     "readme": "README.md",
     "env_example": ".env.example",
+    RECOMMENDATIONS_PASS_ID: "RECOMMENDATIONS.md",
 }
 
 # Core passes the deterministic docs derive from (beyond the pack itself).
 _DOC_CORE_PASSES = ("plan", "architecture", "hardware_fit")
 
 
-def _stamp_timestamp(generated_at: datetime | None) -> str:
-    """UTC timestamp for the generated-from stamp; naive datetimes are UTC."""
-    when = generated_at if generated_at is not None else datetime.now(UTC)
+def _as_utc(when: datetime) -> datetime:
+    """Naive datetimes are treated as UTC."""
     if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return when.replace(tzinfo=UTC)
+    return when.astimezone(UTC)
+
+
+def parse_generated_at(raw: object) -> datetime | None:
+    """Parse a stored ``_meta.generated_at`` string; unknown shapes are None."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _stamp_timestamp(generated_at: datetime | None) -> str:
+    """UTC timestamp for the generated-from stamp; no clock is read here.
+
+    A None ``generated_at`` (legacy packs with no ``_meta``) yields the
+    literal ``unstamped`` so re-renders stay byte-stable.
+    """
+    if generated_at is None:
+        return "unstamped"
+    return _as_utc(generated_at).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _write_stamped(path: Path, content: str, source: str, stamp_time: str) -> None:
@@ -227,16 +255,29 @@ def _decision_sections(passes: dict[str, str]) -> tuple[str, str]:
     return records, rejected
 
 
-def render_decisions_md(passes: dict[str, str]) -> str:
-    """DECISIONS.md: deterministic extraction (architecture + hardware_fit)."""
+def render_decisions_md(
+    passes: dict[str, str], *, generated_at: datetime | None = None
+) -> str:
+    """DECISIONS.md: deterministic extraction (architecture + hardware_fit).
+
+    The header's Date comes from the stored ``_meta.generated_at`` (passed
+    in by the caller); no clock is read at render time, so re-renders of an
+    unstamped legacy pack are byte-stable.
+    """
     records, rejected = _decision_sections(passes)
+    date = (
+        _as_utc(generated_at).strftime("%Y-%m-%d")
+        if generated_at is not None
+        else "unstamped legacy pack"
+    )
     return "\n".join(
         [
             "# Decision Records",
             "",
-            "_Deterministic extraction from the design's architecture pass "
-            "(decision records) and hardware & budget fit pass (rejected "
-            "alternatives)._",
+            f"- Date: {date}",
+            "- Status: active",
+            "- Source: architecture pass (decision records) + hardware & "
+            "budget fit pass (rejected alternatives)",
             "",
             "## Decision records",
             "",
@@ -299,6 +340,19 @@ def render_memory_md(
     score = getattr(candidate, "feasibility_score", None)
     if score is not None:
         lines.append(f"- Feasibility score: {score}")
+
+    lines += [
+        "",
+        "## Status",
+        "- Status: planning complete — implementation not started",
+        "",
+        "## Current task",
+        "- (none yet — pick TASK-001)",
+        "",
+        "## Next step",
+        "- Run the handoff loop: pick the first open task, implement it, "
+        "run the task's test, then commit.",
+    ]
 
     lines += [
         "",
@@ -375,6 +429,12 @@ def write_docs_pack(
     for pass_id, filename in _PACK_FILENAMES.items():
         if pass_id == "readme":
             continue
+        if pass_id == RECOMMENDATIONS_PASS_ID:
+            # Optional: written only when the pass is stored; the core pack
+            # (missing_pack check above) never gates on it.
+            if (passes.get(pass_id) or "").strip():
+                (out_dir / filename).write_text(passes[pass_id], encoding="utf-8")
+            continue
         (out_dir / filename).write_text(passes[pass_id], encoding="utf-8")
 
     design_md = (design.design_md or "").strip()
@@ -393,7 +453,9 @@ def write_docs_pack(
     (out_dir / "README.md").write_text(
         _promote_headings(passes["readme"]), encoding="utf-8"
     )
-    (out_dir / "DECISIONS.md").write_text(render_decisions_md(passes), encoding="utf-8")
+    (out_dir / "DECISIONS.md").write_text(
+        render_decisions_md(passes, generated_at=generated_at), encoding="utf-8"
+    )
     (out_dir / "MEMORY.md").write_text(
         render_memory_md(candidate, passes, facts=facts), encoding="utf-8"
     )

@@ -54,8 +54,10 @@ from praxis.db import (
     Design,
     clear_design_pass,
     design_usage_totals,
+    get_design_meta,
     get_session,
     save_design_pass,
+    set_design_meta,
 )
 from praxis.grounding import ground_candidate
 from praxis.llm import call_llm
@@ -65,6 +67,12 @@ logger = logging.getLogger(__name__)
 
 DESIGN_MODEL_ENV = "PRAXIS_DESIGN_MODEL"
 DEFAULT_DESIGN_MODEL = "groq/openai/gpt-oss-120b"
+
+# Provenance stamp version: written into passes_json['_meta'] by the design
+# layer (design_version) and the pack layer (pack_version). pack_version is
+# only written when design_version is already present, so rules can trust
+# pack_version == PROVENANCE_VERSION as "both layers stamped this pack".
+PROVENANCE_VERSION = "0.2"
 
 # Indirection so tests can neutralize pacing sleeps (patch praxis.design._sleep).
 _sleep = time.sleep
@@ -845,6 +853,10 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
             "contracts, a `### Interfaces` list).\n"
             "- A Mermaid `graph TD` diagram of the components in a ```mermaid "
             "fenced block.\n"
+            "- A `### Stack` list: language, key libraries, and persistence, "
+            "each with a one-line why; state explicitly what runs CPU-only.\n"
+            "- A `### Folder structure` fenced ```text block: the repo layout "
+            "this design implies (the README must not contradict it).\n"
             "- A `### Decision records` list where EVERY key choice is a "
             "decision record: `- DR-N <name> — options considered: ...; chose: "
             "...; why: ...; revisit when: ...`.\n"
@@ -890,7 +902,11 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
             "- Every phase ends with a `**Tests:**` line describing its "
             "test/eval plan.\n"
             "- End with an `### Eval plan` subsection: metrics, baselines, "
-            "and how we know the built thing matches the paper."
+            "and how we know the built thing matches the paper.\n"
+            "- After EACH task: tick its checkbox, update MEMORY.md "
+            "Status / Current task / Next step, and update any affected "
+            "docs (PRD, ARCHITECTURE, RULES, TASKS), before proposing a "
+            "commit."
         ),
     },
     "hardware_fit": {
@@ -913,6 +929,9 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
             "must be labelled UNVERIFIED: check before relying."
         ),
     },
+    # C3 note for consistency rule r8: match PRD section headings at any
+    # level (#..######) and accept both "Out of scope" and legacy
+    # "Non-goals" (older packs used the latter wording).
     "prd": {
         "title": "Product Requirements",
         "instruction": (
@@ -924,9 +943,12 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
             "- Functional requirements: numbered FR-001..., each with an "
             "acceptance criterion; every architecture component and plan "
             "task must trace to at least one requirement.\n"
+            "- MVP: a `## MVP` section listing the smallest shippable v1 "
+            "scope as bullets (the Phase 1 slice); everything else waits.\n"
             "- Success metrics: how we know v1 works, taken from the plan's "
             "eval plan where one exists.\n"
-            "- Non-goals: explicitly out of scope for v1.\n"
+            "- Out of scope: an `## Out of scope` section explicitly listing "
+            "what v1 will NOT do.\n"
             "- Open questions: what is unresolved.\n"
             "Keep paper claims cited like [source 1] and label engineering "
             "judgment as (inference)."
@@ -937,6 +959,9 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
         "instruction": (
             "Produce the ENGINEERING RULES document - the house rules a "
             "coding agent must follow when implementing this design:\n"
+            "- Structure the document under exactly these five `##` "
+            "headings, in order: General, Before coding, Security, "
+            "Testing, Git.\n"
             "- Code and structure rules derived from the architecture and "
             "data contracts above.\n"
             "- Dependency policy: pip/uv only, minimal dependencies, no "
@@ -996,7 +1021,9 @@ _PASS_SPECS: dict[str, dict[str, str]] = {
             "- Install: pip or uv commands and the Python version.\n"
             "- Usage: the run command for the Phase 1 slice, taken from the "
             "contracts above.\n"
-            "- Repo layout: mirror the design's file tree.\n"
+            "- Repo layout: copy it verbatim from the architecture pass's "
+            "`### Folder structure` block above; never invent, rename, or "
+            "rearrange entries.\n"
             "- Footprint: the target machine line from the HARD CONSTRAINTS "
             "above.\n"
             "- Status: v1 is the Phase 1 vertical slice; later phases are "
@@ -1580,9 +1607,12 @@ def render_agent_prompt(
 
 
 def _load_passes(design: Design) -> dict[str, str]:
+    """Stored pass outputs; ``_``-prefixed keys (e.g. ``_meta``) are metadata."""
     try:
         data = json.loads(design.passes_json or "{}")
-        return {k: str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: str(v) for k, v in data.items() if not k.startswith("_")}
     except json.JSONDecodeError:
         return {}
 
@@ -1718,6 +1748,12 @@ def generate_design(
         candidate_id, depth, model, focus, reuse_complete=reuse_complete
     )
     done = _load_passes(design)
+    if design.id is not None and not any((done.get(p) or "").strip() for p in PASS_IDS):
+        # Fresh design run (zero stored passes): stamp the design layer once.
+        # Resumed legacy designs (passes already stored, no stamp) stay
+        # unstamped, and an existing stamp is never rewritten.
+        if "design_version" not in get_design_meta(design.id):
+            set_design_meta(design.id, {"design_version": PROVENANCE_VERSION})
     for pass_id in rerun_passes or []:
         if pass_id not in PASS_IDS:
             raise ValueError(

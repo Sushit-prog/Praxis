@@ -251,6 +251,73 @@ def clear_design_pass(design_id: int, pass_id: str) -> None:
         session.close()
 
 
+def _passes_dict(row: Design) -> dict:
+    """Raw passes_json as a dict; corrupt/absent json reads as empty."""
+    try:
+        data = json.loads(row.passes_json or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_design_meta(design_id: int) -> dict:
+    """The design's ``_meta`` provenance block (never a pass output)."""
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        if row is None:
+            return {}
+        meta = _passes_dict(row).get("_meta")
+        return dict(meta) if isinstance(meta, dict) else {}
+    finally:
+        session.close()
+
+
+def set_design_meta(design_id: int, updates: dict) -> None:
+    """Merge ``updates`` into the design's ``_meta`` provenance block."""
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        if row is None:
+            return
+        passes = _passes_dict(row)
+        meta = passes.get("_meta")
+        meta = dict(meta) if isinstance(meta, dict) else {}
+        meta.update(updates)
+        passes["_meta"] = meta
+        row.passes_json = json.dumps(passes)
+        session.commit()
+    finally:
+        session.close()
+
+
+def clear_design_meta(design_id: int) -> None:
+    """Drop the pack-layer provenance keys; the design stamp survives.
+
+    ``_discard_partial_pack`` calls this with the pack passes so a fresh
+    ``praxis plan`` re-stamps cleanly; ``design_version`` stays (a new
+    design run replaces the whole row, which is when it should change).
+    """
+    session = get_session()
+    try:
+        row = session.get(Design, design_id)
+        if row is None:
+            return
+        passes = _passes_dict(row)
+        meta = passes.get("_meta")
+        if isinstance(meta, dict):
+            for key in ("pack_version", "generated_at"):
+                meta.pop(key, None)
+            if meta:
+                passes["_meta"] = meta
+            else:
+                passes.pop("_meta", None)
+        row.passes_json = json.dumps(passes)
+        session.commit()
+    finally:
+        session.close()
+
+
 def design_usage_totals(candidate_id: int) -> tuple[int, int, float]:
     """LLM calls, total tokens, and estimated cost for one candidate's designs.
 

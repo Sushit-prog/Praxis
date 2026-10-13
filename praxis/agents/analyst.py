@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from praxis.config import HardwareProfile
 from praxis.db import Candidate, get_session, recent_build_memory
 from praxis.llm import call_llm, invalidate_llm_cache
+from praxis.untrusted import UNTRUSTED_END, UNTRUSTED_START
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,6 @@ THRESHOLD_ENV = "PRAXIS_FEASIBILITY_THRESHOLD"
 DEFAULT_BORDERLINE_MARGIN = 1
 MARGIN_ENV = "PRAXIS_BORDERLINE_MARGIN"
 MAX_RAW_TEXT_CHARS = 6000
-
-# Delimiters marking candidate raw text as untrusted data. Anything between
-# these markers is content to be analyzed, never instructions to follow.
-UNTRUSTED_START = "<<<UNTRUSTED CANDIDATE CONTENT BEGIN>>>"
-UNTRUSTED_END = "<<<UNTRUSTED CANDIDATE CONTENT END>>>"
 
 
 @dataclass

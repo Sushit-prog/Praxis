@@ -10,6 +10,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Key-independence: LITELLM_MODE != DEV disables litellm's import-time
+# load_dotenv, so preloading it here never reads the project .env (the
+# _hide_project_dotenv fixture hides that file from praxis's _load_env too,
+# and _hermetic_model_env clears provider keys per test). The preload itself
+# keeps litellm's import cost out of the first test that needs it.
+os.environ["LITELLM_MODE"] = "PRODUCTION"
+import litellm  # noqa: E402, F401
+
 from praxis.config import HardwareProfile  # noqa: E402
 
 
@@ -45,6 +53,32 @@ def _deep_isolation(tmp_path_factory):
         )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _hide_project_dotenv():
+    """Keep the repo's own .env out of the test session.
+
+    ``_load_env`` discovers the file via ``dotenv.find_dotenv``; the guard
+    makes the project's .env resolve to "not found" so no test can pull real
+    provider keys into ``os.environ``. Any other .env (the temp fixtures the
+    loader tests write) still loads normally. The real function is restored
+    at session end.
+    """
+    import dotenv
+
+    project_env = Path(__file__).resolve().parents[1] / ".env"
+    real_find_dotenv = dotenv.find_dotenv
+
+    def _guarded_find_dotenv(*args, **kwargs):
+        path = real_find_dotenv(*args, **kwargs)
+        if path and Path(path).resolve() == project_env:
+            return ""
+        return path
+
+    dotenv.find_dotenv = _guarded_find_dotenv
+    yield
+    dotenv.find_dotenv = real_find_dotenv
+
+
 def fake_completion(**kwargs):
     """Stand-in for litellm.completion that returns a canned response."""
     return {"choices": [{"message": {"content": "fake model output"}}]}
@@ -52,17 +86,19 @@ def fake_completion(**kwargs):
 
 @pytest.fixture(autouse=True)
 def _hermetic_model_env(monkeypatch):
-    """Keep model identity out of the tests.
+    """Keep model identity and provider keys out of the tests.
 
-    litellm auto-loads the project `.env` on import, so a developer's
-    PRAXIS_MODEL/PRAXIS_FALLBACK_MODELS would otherwise leak into which model
-    id the usage ledger records. Tests inject fakes and assert explicit model
-    strings; they must not depend on local env files.
+    Tests inject fakes and assert explicit model strings and key values;
+    they must not depend on local env files or ambient shell exports. The
+    session hides the project .env from ``_load_env`` (litellm's own import
+    load is disabled via LITELLM_MODE), but a developer's exported
+    PRAXIS_MODEL/PRAXIS_FALLBACK_MODELS or provider keys must not leak into
+    which model id the usage ledger records either.
     """
     monkeypatch.delenv("PRAXIS_MODEL", raising=False)
     monkeypatch.delenv("PRAXIS_FALLBACK_MODELS", raising=False)
-    # litellm's import side-effect also loads the project .env, which leaks
-    # hardware-profile overrides and the design model chain into tests.
+    # Hardware-profile and design-chain overrides that a project .env or the
+    # shell could carry.
     for var in (
         "PRAXIS_CONFIG",
         "PRAXIS_DETECT_HW",
@@ -81,6 +117,10 @@ def _hermetic_model_env(monkeypatch):
         "PRAXIS_DESIGN_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Provider keys are never ambient: every test starts keyless and sets
+    # its own fake values when it needs them (GROQ / NVIDIA NIM / OpenRouter).
+    for key in ("GROQ_API_KEY", "NVIDIA_NIM_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
     # Host detection stays off by default so the suite is host-independent;
     # detection tests opt in via PRAXIS_DETECT_HW / detected_host= with a
     # mocked probe (see tests/test_facts.py and tests/test_hardware.py).

@@ -12,9 +12,9 @@ Scout
   -> Architect (blueprint)
   -> design engine (5 paced LLM passes: technique, architecture,
      data_contracts, plan, hardware_fit)
-  -> praxis plan (11-file docs pack: 6 LLM + 5 deterministic)
+  -> praxis plan (docs pack: 6 LLM + 5 deterministic + optional Recommendations)
   -> praxis check (deterministic zero-LLM consistency rules)
-  -> praxis handoff (allowlisted copy + secret scan + git init)
+  -> praxis handoff (allowlisted copy + agent files + secret scan + git init)
   -> coding agent builds from the exported pack
 ```
 
@@ -39,15 +39,23 @@ praxis handoff <id> ../MyProject   # no key required
 
 ## Sample output
 
-`praxis check 5` (the MemGuard design pack) — two warnings, exit 0:
+`praxis check 5` (the MemGuard design pack) — seven warnings (five from the older single-pass Architect blueprint), two info, exit 0:
 
 ```
+[WARN ] r10-stack-fit blueprint: ram-claim: states an 8 GB bound; usable headroom is 4 GB
+[WARN ] r10-stack-fit blueprint: remote-host: unit prescribes a rented/remote host but the facts sheet is local-only (local_only=True)
+[WARN ] r10-stack-fit blueprint: cuda-only: unit mentions CUDA tooling but the facts sheet is CPU-only (cpu_only=True)
+[WARN ] r10-stack-fit blueprint: remote-host: unit prescribes a rented/remote host but the facts sheet is local-only (local_only=True)
+[WARN ] r10-stack-fit blueprint: cuda-only: unit mentions CUDA tooling but the facts sheet is CPU-only (cpu_only=True)
 [WARN ] r3-dependency plan: dependency conflict: pass 'security' requires 'httpx' (http client), pass 'plan' requires 'requests'; the two passes never mention each other's package
 [WARN ] r5-metric prd: metric conflict: pass 'prd' prescribes 'cosine' for vector retrieval, but pass 'data_contracts' prescribes 'euclidean'
-0 error(s), 2 warning(s), 0 info
+[INFO ] r8-prd-sections prd: prd sections: legacy pack: missing MVP (v0.2 packs require it)
+[INFO ] r13-rules-categories rules: rules categories: legacy pack: missing General, Before coding, Security, Testing, Git (v0.2 packs require it)
+0 error(s), 7 warning(s), 2 info
+checked against: usable RAM 4 GB, cpu_only=True, local_only=True
 ```
 
-`praxis check 5 --json` returns the same two findings as a JSON list with `rule_id`, `severity`, `pass_id`, `excerpt`, and `message` fields.
+The five `r10-stack-fit` warnings come from the **older single-pass Architect blueprint** for candidate 5 (a pre-v0.2 blueprint that prescribes a VPS and bitsandbytes on a CPU-only, local-only facts sheet); its eleven stored passes score zero. Facts come from `hardware_profile.yaml` (env vars and an optional host probe can override the snapshot), so every r10 verdict is explainable against the printed line. `praxis check 5 --json` returns the same findings as a JSON list with `rule_id`, `severity`, `pass_id`, `excerpt`, and `message` fields.
 
 ## Why the checker exists
 
@@ -63,6 +71,11 @@ An LLM-written decision record in the MemGuard design pack said "2k records × 3
 | `r4-cap` | error | Component size written as a percentage or fraction of a cap that does not match the stated cap |
 | `r3-dependency` | warning | Two passes prescribing different packages for one slot (e.g. `requests` in TASKS vs `httpx` in SECURITY) |
 | `r5-metric` | warning | Two passes prescribing different retrieval metrics (e.g. Euclidean vs cosine) |
+| `r7-recommendation-claims` | warning | The optional Recommendations pass prescribing GPU/VRAM or rented hosts, or citing GB/$ numbers absent from the fit table and facts |
+| `r8-prd-sections` | warning (info on legacy packs) | PRD missing required sections (Problem, Users, Goal, Features, MVP, Out of scope, Success criteria) |
+| `r9-task-structure` | warning (info on legacy packs) | `TASK-NNN` tasks in the plan without an Acceptance marker within 3 lines; stamped packs with no task ids at all |
+| `r10-stack-fit` | warning | Prescribed models, RAM/VRAM footprints, CUDA tooling, or rented hosts that do not fit the facts sheet (stored passes + blueprint) |
+| `r13-rules-categories` | warning (info on legacy packs) | RULES missing required categories (General, Before coding, Security, Testing, Git) |
 | `registry-unknown` | warning | A pass key not in the known-pass registry |
 | `registry-missing` | info | A known pass key absent from the stored design |
 
@@ -72,15 +85,20 @@ Errors fail the command (exit 1). Warnings and info are reported but exit 0. Err
 
 `praxis handoff <id> <target>` exports a finished design's docs pack into a fresh project directory and bootstraps it for a coding agent. It makes **zero LLM calls**.
 
-**Copies (allowlist of 11 files):** `.env.example`, `ARCHITECTURE.md`, `DECISIONS.md`, `DESIGN.md`, `MEMORY.md`, `PRD.md`, `README.md`, `RULES.md`, `SECURITY.md`, `TASKS.md`, `TEST_PLAN.md`.
+**Copies (allowlist of 12 names; RECOMMENDATIONS.md only when present):** `.env.example`, `ARCHITECTURE.md`, `DECISIONS.md`, `DESIGN.md`, `MEMORY.md`, `PRD.md`, `README.md`, `RECOMMENDATIONS.md`, `RULES.md`, `SECURITY.md`, `TASKS.md`, `TEST_PLAN.md`.
 
 **Refuses:**
 - A non-empty target (unless `--force`, which overwrite-merges and never deletes extras).
 - A target inside the Praxis repo, or a repo ancestor of the target (symlink- and case-insensitive-resolved).
 - Stray files in `docs/` that are not on the allowlist (unless `--force`, which skips them rather than copying).
-- Key-like strings in the copied content (e.g. `gsk_…`, `sk-…`, `Bearer …`); documented placeholders like `…_placeholder` will be ignored. On a hit it aborts and cleans up; the matched value is never printed.
+- Key-like strings among the files handoff wrote or merged (e.g. `gsk_…`, `sk-…`, `Bearer …`); documented placeholders like `…_placeholder` will be ignored, and pre-existing user files in a `--force` target are never scanned. On a hit it aborts and cleans up; the matched value is never printed.
 
-After a clean copy it runs `git init` and writes `HANDOFF_PROMPT.md`, a plan-mode prompt that tells the agent to read the pack, obey RULES.md, propose a milestone-1 plan listing every ambiguity with `file:line`, and wait for approval before writing code.
+After a clean copy it writes the generated files and runs `git init`:
+
+- **`HANDOFF_PROMPT.md`** — a plan-mode prompt that tells the agent to read the pack, obey RULES.md, propose a milestone-1 plan listing every ambiguity with `file:line`, and wait for approval; after approval it runs the task-by-task implement loop (test the task, tick TASKS.md, update MEMORY.md, propose a commit, stop).
+- **`AGENTS.md`** — a Praxis header, a short Workflow section (derived from the files actually copied), and RULES.md verbatim; a pre-existing user file without the header is kept, never overwritten.
+- **`.gitignore`** — universal safety lines plus blocks for the stack the pack describes (ARCHITECTURE.md `### Stack` markers, union for mixed stacks; SQLite mentions add `*.db`/`*.sqlite3`; nothing detected means universal lines only). Existing files are merge-appended, never replaced.
+- **`.cursor/rules/praxis.mdc`** — only with `--cursor`; same body as AGENTS.md behind Cursor frontmatter.
 
 ## Worked example: MemGuard
 
@@ -197,6 +215,7 @@ praxis check 42 --json
 praxis handoff 42 ../MyProject
 praxis handoff 42 ../MyProject --force
 praxis handoff 42 ../MyProject --skip-check
+praxis handoff 42 ../MyProject --cursor
 ```
 
 ## Design engine (multi-pass DESIGN.md)
@@ -225,7 +244,7 @@ Output is saved to the DB and written to `designs/<NNN>-<slug>/`: `DESIGN.md`, `
 
 ### Planning docs pack (praxis plan)
 
-`praxis plan <id>` turns a finished design into the hand-off bundle a coding agent implements from: eleven files under `designs/<NNN>-<slug>/docs/` — `PRD.md`, `ARCHITECTURE.md`, `DESIGN.md`, `RULES.md`, `TASKS.md`, `TEST_PLAN.md`, `SECURITY.md`, `DECISIONS.md`, `MEMORY.md`, `README.md`, and `.env.example`. Six of them are paced LLM passes in their own `plan` stage (PRD, rules, test plan, security, README, env example); the other five are rendered deterministically from the stored design passes.
+`praxis plan <id>` turns a finished design into the hand-off bundle a coding agent implements from: eleven files under `designs/<NNN>-<slug>/docs/` — `PRD.md`, `ARCHITECTURE.md`, `DESIGN.md`, `RULES.md`, `TASKS.md`, `TEST_PLAN.md`, `SECURITY.md`, `DECISIONS.md`, `MEMORY.md`, `README.md`, and `.env.example` — plus an optional twelfth, `RECOMMENDATIONS.md`. Six of the eleven are paced LLM passes in their own `plan` stage (PRD, rules, test plan, security, README, env example); the other five are rendered deterministically from the stored design passes. The Recommendations pass is generated automatically for stamped v0.2 packs (or on demand with `--recommend` on legacy packs): a hardware-fit summary driven by a deterministic fit table over the stored passes and blueprint, policed by the `r7-recommendation-claims` rule.
 
 The pack critic is off by default (`--critic` opts in). `MEMORY.md` is seed-only: Praxis writes it once and the coding agent maintains it from then on.
 

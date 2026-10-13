@@ -2,7 +2,8 @@
 
 For arXiv candidates the full text is fetched (arXiv HTML rendering first,
 PDF text via pypdf as fallback); for GitHub candidates the README and file
-tree are used. Everything fetched from the network is UNTRUSTED data: chunks
+tree are used; for idea candidates the user's brief stored at intake is used
+verbatim (no network). Everything fetched from the network is UNTRUSTED data: chunks
 are wrapped in the same delimiters the Analyst uses, stripped of control
 characters and of any embedded delimiter look-alikes, sized so design passes
 receive a bounded, relevant context (heading-aware chunks, total-size cap,
@@ -53,7 +54,7 @@ class Grounding:
 
     chunks: list[str] = field(default_factory=list)
     provenance: list[str] = field(default_factory=list)  # where each chunk came from
-    source_kind: str = "none"  # arxiv | github | none
+    source_kind: str = "none"  # arxiv | github | idea | none
 
     @property
     def text(self) -> str:
@@ -392,6 +393,17 @@ def ground_candidate(candidate) -> Grounding:
     """
     source = (getattr(candidate, "source", "") or "").lower()
     url = getattr(candidate, "url", "") or ""
+
+    if source == "idea":
+        # User-authored brief: stored raw at intake, so no fetch or cache.
+        brief = _sanitize(getattr(candidate, "raw_text", "") or "")
+        if brief:
+            return Grounding(
+                chunks=_chunk_text(brief),
+                provenance=["user brief (idea)"],
+                source_kind="idea",
+            )
+        return Grounding(source_kind="none")
 
     if source == "arxiv" or extract_arxiv_id(url):
         arxiv_id = extract_arxiv_id(url)

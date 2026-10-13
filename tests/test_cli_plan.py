@@ -10,7 +10,7 @@ from praxis.cli import build_parser, main
 from praxis.db import LLMUsage, get_session
 from praxis.planning import PACK_PASS_IDS
 from tests.test_design import GOOD_PASSES
-from tests.test_docs_pack import ALL_FILES
+from tests.test_docs_pack import ALL_FILES, ALL_FILES_FULL
 from tests.test_planning import PACK_CONTENT, _pack_completion, _seed_design
 
 # ---------------------------------------------------------------------------
@@ -26,6 +26,7 @@ def test_plan_parser_defaults():
     assert args.rerun_pass is None
     assert args.resume is False
     assert args.run_critic is False
+    assert args.recommend is False
 
 
 def test_plan_parser_critic_and_resume_flags():
@@ -34,6 +35,7 @@ def test_plan_parser_critic_and_resume_flags():
     assert build_parser().parse_args([*base, "--critic"]).run_critic is True
     assert build_parser().parse_args([*base, "--no-critic"]).run_critic is False
     assert build_parser().parse_args([*base, "--resume"]).resume is True
+    assert build_parser().parse_args([*base, "--recommend"]).recommend is True
 
 
 def test_plan_parser_pass_choices():
@@ -331,3 +333,128 @@ def test_plan_failure_prints_resume_hint(plan_env, monkeypatch, capsys):
     )
     assert "completed pack passes: prd" in err
     assert "re-run the same command with --resume to continue" in err
+
+
+# ---------------------------------------------------------------------------
+# Provenance stamps via the CLI (v0.2)
+# ---------------------------------------------------------------------------
+
+
+def _design_id(candidate_id):
+    from praxis.db import latest_design
+
+    return latest_design(candidate_id).id
+
+
+def test_cli_plan_fresh_on_legacy_design_stays_unstamped(
+    plan_env, monkeypatch, capsys
+):
+    """Legacy design + fresh `praxis plan` -> no pack_version stamp."""
+    from praxis.db import get_design_meta
+
+    rc, _ = _run(plan_env["full"], monkeypatch)
+    capsys.readouterr()
+
+    assert rc == 0
+    assert get_design_meta(_design_id(plan_env["full"])) == {}
+
+
+def test_cli_plan_fresh_on_stamped_design_stamps_pack(plan_env, monkeypatch, capsys):
+    """Stamped design + fresh plan -> pack_version + generated_at written."""
+    from praxis.db import get_design_meta, set_design_meta
+
+    design_id = _design_id(plan_env["full"])
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    rc, _ = _run(plan_env["full"], monkeypatch)
+    capsys.readouterr()
+
+    assert rc == 0
+    meta = get_design_meta(design_id)
+    assert meta["design_version"] == "0.2"
+    assert meta["pack_version"] == "0.2"
+    assert meta["generated_at"] is not None
+
+
+def test_cli_plan_resume_legacy_pack_stays_unstamped(
+    plan_env, monkeypatch, capsys, tmp_path
+):
+    """plan --resume on a complete legacy pack: zero calls, no stamp."""
+    from praxis.db import get_design_meta
+
+    _add_pack_passes(plan_env["full"], *PACK_PASS_IDS)
+    design_id = _design_id(plan_env["full"])
+
+    rc, fake = _run(plan_env["full"], monkeypatch, "--resume")
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert fake.calls == []
+    assert "LLM usage: 0 calls" in out
+    assert get_design_meta(design_id) == {}
+    # Docs re-rendered deterministically: legacy packs stamp "unstamped".
+    tasks = tmp_path / "designs" / "001-cpu-fine-tune" / "docs" / "TASKS.md"
+    assert "unstamped" in tasks.read_text(encoding="utf-8")
+
+
+def test_cli_plan_stamped_docs_carry_generated_at(plan_env, monkeypatch, tmp_path):
+    """A stamped pack's docs stamp the stored generated_at, not a fresh clock."""
+    from praxis.db import set_design_meta
+
+    design_id = _design_id(plan_env["full"])
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    rc, _ = _run(plan_env["full"], monkeypatch)
+    assert rc == 0
+
+    from praxis.db import get_design_meta
+
+    meta = get_design_meta(design_id)
+    stamp_date = meta["generated_at"][:10]
+    tasks = tmp_path / "designs" / "001-cpu-fine-tune" / "docs" / "TASKS.md"
+    text = tasks.read_text(encoding="utf-8")
+    assert text.startswith("<!-- generated-from: plan pass · ")
+    assert stamp_date in text.split("-->", 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# Optional Recommendations pass via the CLI (v0.2)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_plan_recommend_on_legacy_pack(plan_env, monkeypatch, capsys, tmp_path):
+    """plan --recommend on a complete legacy pack: one call, 12 docs, no stamp."""
+    from praxis.db import get_design_meta
+
+    _add_pack_passes(plan_env["full"], *PACK_PASS_IDS)
+    design_id = _design_id(plan_env["full"])
+
+    rc, fake = _run(plan_env["full"], monkeypatch, "--recommend")
+    capsys.readouterr()
+
+    assert rc == 0
+    assert len(fake.calls) == 1
+    assert "'# Recommendations'" in fake.calls[0][1]
+    assert get_design_meta(design_id) == {}
+    docs = tmp_path / "designs" / "001-cpu-fine-tune" / "docs"
+    assert sorted(p.name for p in docs.iterdir()) == sorted(ALL_FILES_FULL)
+    assert "## Fit summary" in (docs / "RECOMMENDATIONS.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_cli_plan_stamped_fresh_includes_recommendations(
+    plan_env, monkeypatch, tmp_path
+):
+    """Stamped design + fresh plan: 7 calls and RECOMMENDATIONS.md in docs."""
+    from praxis.db import set_design_meta
+
+    design_id = _design_id(plan_env["full"])
+    set_design_meta(design_id, {"design_version": "0.2"})
+
+    rc, fake = _run(plan_env["full"], monkeypatch)
+    assert rc == 0
+    assert len(fake.calls) == 7
+    docs = tmp_path / "designs" / "001-cpu-fine-tune" / "docs"
+    assert (docs / "RECOMMENDATIONS.md").is_file()
+    assert sorted(p.name for p in docs.iterdir()) == sorted(ALL_FILES_FULL)
